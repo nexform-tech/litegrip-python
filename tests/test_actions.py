@@ -43,10 +43,32 @@ class TestLimitTarget(unittest.TestCase):
         self.assertAlmostEqual(target, POS_OPEN_RAD + 0.05 * travel)
         self.assertAlmostEqual(limit, POS_OPEN_RAD)
 
-    def test_inverted_convention_raises(self):
+    def test_reverse_mount_mirrors_the_margin(self):
+        """反装合法：余量朝另一侧留，目标仍然落在限位内侧。"""
+        g, _ = make_gripper(reverse=True)
+        travel = TRAVEL_RAD
+
+        target, limit, margin_rad, _ = limit_target(g.config, "close", 0.05)
+        self.assertAlmostEqual(limit, POS_OPEN_RAD)        # 反装时闭合在数值小的一侧
+        self.assertAlmostEqual(margin_rad, 0.05 * travel)
+        self.assertAlmostEqual(target, POS_OPEN_RAD + 0.05 * travel)
+        # 比限位更靠近行程内侧
+        self.assertGreater(target, limit)
+
+        target, limit, _, _ = limit_target(g.config, "open", 0.05)
+        self.assertAlmostEqual(limit, POS_CLOSED_RAD)
+        self.assertAlmostEqual(target, POS_CLOSED_RAD - 0.05 * travel)
+
+    def test_uncalibrated_raises(self):
+        """没标定的配置里所有方向都是猜的 —— 拦住。"""
         g, _ = make_gripper()
-        g.config.pos_open_rad, g.config.pos_closed_rad = (
-            POS_CLOSED_RAD, POS_OPEN_RAD)          # 反过来
+        g.config.calibrated = False
+        with self.assertRaises(CommandError):
+            limit_target(g.config, "close", 0.05)
+
+    def test_zero_travel_raises(self):
+        g, _ = make_gripper()
+        g.config.pos_open_rad = g.config.pos_closed_rad
         with self.assertRaises(CommandError):
             limit_target(g.config, "close", 0.05)
 
@@ -69,10 +91,19 @@ class TestPressTarget(unittest.TestCase):
         self.assertAlmostEqual(limit, POS_OPEN_RAD)
         self.assertLess(target, limit)
 
-    def test_inverted_convention_raises(self):
+    def test_reverse_mount_overshoots_the_other_way(self):
+        g, _ = make_gripper(reverse=True)
+
+        target, limit, over_rad, travel = press_target(g.config, "close", 0.05)
+        self.assertAlmostEqual(limit, POS_OPEN_RAD)
+        self.assertAlmostEqual(travel, TRAVEL_RAD)
+        self.assertAlmostEqual(over_rad, 0.05 * TRAVEL_RAD)
+        self.assertLess(target, limit)          # 反装时越位朝数值更小的一侧
+        self.assertAlmostEqual(limit - target, 0.05 * TRAVEL_RAD)
+
+    def test_uncalibrated_raises(self):
         g, _ = make_gripper()
-        g.config.pos_open_rad, g.config.pos_closed_rad = (
-            POS_CLOSED_RAD, POS_OPEN_RAD)
+        g.config.calibrated = False
         with self.assertRaises(CommandError):
             press_target(g.config, "close", 0.05)
 
@@ -124,6 +155,70 @@ class TestRamp(unittest.TestCase):
             self.assertEqual(f.dq, 0.0)
 
 
+class TestReverseMount(unittest.TestCase):
+    """反装（``pos_closed_rad < pos_open_rad``）：同一个动作走相反方向。"""
+
+    def test_close_presses_onto_the_low_rad_stop(self):
+        g, fake = make_gripper(reverse=True, stops=True)
+        res = g.close(SPEED_MM_S)
+
+        self.assertTrue(res.ok, res)
+        self.assertTrue(res.stalled, res)
+        self.assertAlmostEqual(res.limit_rad, POS_OPEN_RAD)   # 闭合在数值小的一侧
+        self.assertLess(abs(res.state.position_rad - POS_OPEN_RAD),
+                        g.motion_config.stop_tol)
+        self.assertAlmostEqual(fake.frames[0].dq, -SPEED_RAD_S)  # 闭合 = -rad
+
+    def test_open_presses_onto_the_high_rad_stop(self):
+        g, fake = make_gripper(reverse=True, stops=True)
+        res = g.open(SPEED_MM_S)
+
+        self.assertTrue(res.ok, res)
+        self.assertAlmostEqual(res.limit_rad, POS_CLOSED_RAD)
+        self.assertLess(abs(res.state.position_rad - POS_CLOSED_RAD),
+                        g.motion_config.stop_tol)
+        self.assertAlmostEqual(fake.frames[0].dq, SPEED_RAD_S)   # 张开 = +rad
+
+    def test_position_mm_reads_zero_closed_full_stroke_open(self):
+        g, fake = make_gripper(reverse=True)
+        s = g.config.close_sign
+        self.assertAlmostEqual(s, -1.0)
+
+        fake.motor.pos = g.config.pos_closed_rad
+        self.assertAlmostEqual(g.get_state().position_mm, 0.0, places=6)
+
+        fake.motor.pos = g.config.pos_open_rad
+        self.assertAlmostEqual(g.get_state().position_mm,
+                               TRAVEL_RAD * RAD_TO_MM, places=4)
+
+    def test_a_squeeze_reports_positive_force_on_both_mounts(self):
+        """夹紧时反装的力矩符号相反，但换算出来的力都该是正的。"""
+        g, fake = make_gripper()
+        fake.motor.tau = +0.5                 # 正装：夹紧 = +力矩
+        self.assertAlmostEqual(g.get_state().force_n, +5.0, places=9)
+
+        g, fake = make_gripper(reverse=True)
+        fake.motor.tau = -0.5                 # 反装：夹紧 = -力矩
+        self.assertAlmostEqual(g.get_state().force_n, +5.0, places=9)
+
+    def test_goto_rad_clamps_between_the_two_limits(self):
+        g, fake = make_gripper(reverse=True)
+        lo, hi = POS_OPEN_RAD, POS_CLOSED_RAD
+        seen = []
+        fake.control_mit_stream = lambda q_target, **kw: seen.append(q_target) or True
+
+        g.goto_rad(hi + 5.0)
+        g.goto_rad(lo - 5.0)
+        self.assertAlmostEqual(seen[0], hi)
+        self.assertAlmostEqual(seen[1], lo)
+
+    def test_close_sign_follows_the_ordering(self):
+        g, _ = make_gripper()
+        self.assertAlmostEqual(g.config.close_sign, 1.0)
+        g.config.pos_closed_rad, g.config.pos_open_rad = POS_OPEN_RAD, POS_CLOSED_RAD
+        self.assertAlmostEqual(g.config.close_sign, -1.0)
+
+
 class TestLeadCapAndStall(unittest.TestCase):
     """6 / 7：被挡住时指令有界、力矩有界，并判到堵转。"""
 
@@ -172,6 +267,20 @@ class TestPressZone(unittest.TestCase):
         self.assertAlmostEqual(max_tau, g.config.kp * stop_cap, places=4)
         self.assertLess(max_tau, 3.0)                 # DM4310 额定 3 Nm
         self.assertTrue(res.ok, res)
+
+    def test_default_press_force_is_the_gentle_tier(self):
+        """默认 0.7 mm 压紧：力矩 ≈ kp × 0.7 / rad_to_mm ≈ 0.94 Nm。"""
+        g, fake = make_gripper(stops=True)
+        g.close(SPEED_MM_S)
+
+        self.assertAlmostEqual(g.motion_config.stop_lead_mm, 0.7)
+        expected = g.config.kp * 0.7 / g.config.rad_to_mm
+        max_tau = max(abs(f.tau_nm) for f in fake.frames)
+        self.assertAlmostEqual(max_tau, expected, places=4)
+        self.assertLess(max_tau, 1.2)                 # 「不太猛」的量化断言
+        # 没跌到一帧位移的地板（speed × frame_interval = 0.25 mm）以下
+        floor_mm = SPEED_MM_S * g.motion_config.frame_interval
+        self.assertGreater(g.motion_config.stop_lead_mm, floor_mm)
 
     def test_travel_phase_uses_the_wider_cap(self):
         # 同一个默认配置：半路被挡 → max_lead_mm；顶到限位 → stop_lead_mm

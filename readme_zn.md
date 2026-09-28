@@ -59,6 +59,32 @@ with LiteGrip(channel="can0", can_id=0x08) as gripper:
 使能，传 `LiteGrip(..., disable_on_disconnect=False)`，或设
 `gripper.disable_on_disconnect = False`。
 
+## 反装，以及一台电脑带两台
+
+夹爪闭合时电机往哪个方向数，不是固定的：电机反着装的夹爪就是**反装**，对它来说闭合是 rad
+减小。SDK 两种都不预设 —— 方向由两个标定限位的**数值顺序**推出来（见
+`GripperConfig.close_sign`），所以两种装法都能用。SDK 不肯做的是**猜**：没加载标定之前，
+运动接口一律抛 `CommandError`。
+
+方向靠加载对应的模板来声明。两份模板都随包发布，都只是**标称**值 —— 它们的用处是声明方向、
+给一个像样的行程，随后 `zero()` 会把行程换成实测值：
+
+```python
+from litegrip import CALIB_TEMPLATES, LiteGrip
+
+with LiteGrip("can1") as gripper:
+    gripper.load_calibration(CALIB_TEMPLATES["reverse"])   # 或 "normal"
+    gripper.enable()
+    gripper.zero()          # 可选：实测真实行程并存盘
+```
+
+判断是哪一种只需要看一眼：让夹爪走一小段，看指爪往哪边动。选错模板不是无声的 —— 加载时会
+把推导出的方向打进日志，第一次 `close()` 也会朝错的方向走。
+
+所有 LiteGrip 共用同一个 CAN ID（`0x08`），所以一台电脑上放两台时，**通道是唯一的身份键**：
+一个挂 `can0`、一个挂 `can1`，各自指向正确的文件。文件里的 `channel` 与本实例不一致时
+`load_calibration` 会告警。两份模板刻意都不带 `channel`，所以不会触发这个告警。
+
 ## 六个动作接口
 
 要让夹爪动起来就用这六个。每一个都会自己校验结果再报成功，所以调用方不必再重写斜坡和
@@ -69,7 +95,7 @@ with LiteGrip(channel="can0", can_id=0x08) as gripper:
 | `open(speed_mm_s=None)` | 按斜坡**越过**标定的张开侧限位，由机械限位结束这趟运动。 | `MoveResult` |
 | `close(speed_mm_s=None)` | 同上，朝闭合侧。 | `MoveResult` |
 | `grasp(force_n=None, hold_s=0.0)` | 闭合到堵转（即夹住），然后持续输出 `force_n`。`hold_s=0` 表示不限时长。 | `GraspResult` |
-| `zero()` | 完整标定：探测两端机械限位，算出行程与 `rad_to_mm`，并存盘。 | `CalibrationData` |
+| `zero()` | 完整标定：探测两端机械限位，算出行程与 `rad_to_mm`，并存盘。它沿用已加载标定声明的方向 —— 堵转分不出撞到的是哪一端。 | `CalibrationData` |
 | `enable(retries=None)` | 下发使能并回读状态帧，反复重试直到回读到 `err == 1`。 | `EnableResult` |
 | `disable()` | 失能电机（零力矩，可用手推动）。 | `bool` |
 
@@ -123,7 +149,7 @@ with LiteGrip("can0") as gripper:
 | `max_lead_mm` | `4.0` | 行进段指令最多领先实测位置多少 |
 | `press_overshoot` | `0.05` | `open` / `close` 的目标**越过**限位的行程比例 |
 | `press_zone_mm` | `2.0` | 距限位这么近，领先上限就降到 `stop_lead_mm` |
-| `stop_lead_mm` | `1.0` | 压紧段的领先上限，压紧力矩约 `kp × stop_lead_mm` |
+| `stop_lead_mm` | `0.7` | 压紧段的领先上限，压紧力矩约 `kp × stop_lead_mm` |
 | `stop_tol` | `0.02` | 停稳位置距标定限位多近才算顶到位 rad |
 | `force_n` | `20.0` | `grasp` 默认夹持力 |
 | `hold_interval` | `0.2` | 保力的分片时长 s |
@@ -201,13 +227,17 @@ with LiteGrip("can0") as gripper:
   标定过的测量值。
 - **DM4310 的限制**：额定 3 Nm、峰值 7 Nm、协议/固件上限 10 Nm。默认 20 N（前馈 `2.0 Nm`）
   在额定值以内。
-- **方向约定是数据，不是开关。** SDK 假定 rad 增大即闭合，两端极限都存在标定文件里。如果
-  `pos_open_rad >= pos_closed_rad`，配置会被拒绝并抛 `CommandError`，因为此时 SDK 的
-  clamp 是错的。
+- **方向约定是数据，不是开关。** 两端极限都存在标定文件里，**哪个数值更大**就说明闭合往哪个
+  方向走（`GripperConfig.close_sign`）。所以反装是一份完全正常的配置，不是错误。真正会被
+  `CommandError` 拒绝的是「从没标定过」（`GripperConfig.calibrated` 仍为 `False`）和「两个
+  限位相等」，因为那时方向全是猜的。
 - **压紧力矩是有界的。** 行进段的 `max_lead_mm` 上限约 5 Nm；压紧段的 `stop_lead_mm` 上限
-  约 `kp × stop_lead_mm / rad_to_mm` —— 默认（`kp=100`、`stop_lead_mm=1.0`、`rad_to_mm≈73.7`）
-  约 `1.4 Nm`，远在额定 3 Nm 以内。压不实就往上调 `stop_lead_mm`，调到能稳定压住、又听不到
-  撞击声为止；默认值只是算术结果，不是真机实测值，必须在真机上确认。
+  约 `kp × stop_lead_mm / rad_to_mm` —— 默认（`kp=100`、`stop_lead_mm=0.7`、`rad_to_mm≈74`）
+  约 `0.94 Nm`，约为额定 3 Nm 的三分之一。上限再往下调没有意义：低于一帧的位移
+  （`speed_mm_s × frame_interval`，默认 0.25 mm）就会把斜坡自己那一格切掉。压不实就往上调
+  `stop_lead_mm`（表现为夹爪冲进来后压不住、停稳位置超出 `stop_tol`，于是 `open`/`close`
+  报 `ok=False`），调到能稳定压住、又听不到撞击声为止；默认值只是算术结果，不是真机实测值，
+  必须在真机上确认。
 - **持续压紧会让线圈发热。** `open` 和 `close` 现在每次都顶着限位走完保压段，连续跑要留意
   线圈温度。
 - **`open`、`close`、`grasp`、`zero` 会主动撞向机械限位或持续施力。** 除非就是要夹它，
@@ -229,6 +259,8 @@ with LiteGrip("can0") as gripper:
 | `disable() -> bool` | `disable() -> bool`（不变） |
 | 每次调用传增益，如 `close(kp=150.0)` | 增益归 `GripperConfig`，运动可调量归 `MotionConfig` |
 | — | `zero()`、`gripper.actions`、`gripper.motion_config`、`disable_on_disconnect` 都是新增 |
+| 假定闭合 = rad 增大 | 两种顺序都行 —— `close_sign` 自动推导，装法由 `CALIB_TEMPLATES` 声明 |
+| `pos_open_rad >= pos_closed_rad` 抛 `CommandError` | 这个顺序就是反装；改为拒绝「从没标定过」（`GripperConfig.calibrated`） |
 
 除了签名，还有三处行为变化要注意：
 
@@ -240,6 +272,11 @@ with LiteGrip("can0") as gripper:
 - `MoveResult.__bool__` 以前是 `reached and not stalled`，现在是 `ok`。对 `grasp` 闭合段
   两者一致；对 `open` 和 `close` 恰好相反 —— 成功顶到限位是 `stalled=True,
   reached=False`，所以 `if gripper.close():` 的含义变了，尽管类型没变。
+- 运动接口现在拒绝在「从没标定过」的配置上运行。以前依赖 `GripperConfig` 占位默认值就能动
+  夹爪的代码，现在会抛 `CommandError`，必须先 `load_calibration()`。那两个默认值本身也对调了，
+  现在读起来是正装而不是反装。
+- 压紧段的领先上限 `stop_lead_mm` 从 `1.0` 降到 `0.7` mm，所以 `open` / `close` 顶限位的力矩
+  从约额定值的一半降到约三分之一。哪台压不实就把它调回去。
 
 ## 开发
 

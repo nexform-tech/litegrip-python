@@ -60,7 +60,7 @@ _log = logging.getLogger("litegrip")
 _log.addHandler(logging.NullHandler())
 
 # ── High-level API ──────────────────────────────────────────────────────
-from .gripper import LiteGrip, DEFAULT_CALIB
+from .gripper import LiteGrip, DEFAULT_CALIB, CALIB_TEMPLATES
 
 # ── Motion actions ──────────────────────────────────────────────────────
 from .actions import (
@@ -114,6 +114,7 @@ __all__ = [
     # High-level
     "LiteGrip",
     "DEFAULT_CALIB",
+    "CALIB_TEMPLATES",
     # Motion actions
     "MotionConfig",
     "MoveProgress",

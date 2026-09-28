@@ -30,9 +30,11 @@ class GripperParams:
     MOTOR_TYPE: Final = MotorType.DM4310
     CONTROL_MODE: Final = Control_Mode.MIT_MODE
 
-    # Position limits (rad) — closed > open numerically
-    POS_CLOSED_RAD: Final = 0.0
-    POS_OPEN_RAD: Final = 1.14
+    # Position limits (rad) — nominal placeholders only.  The real limits come
+    # from the calibration; do not treat these as a direction convention, since
+    # a reverse-mounted motor has them the other way round.
+    POS_CLOSED_RAD: Final = 1.14
+    POS_OPEN_RAD: Final = 0.0
 
     # MIT quantization limits (DM4310)
     Q_MAX: Final = 12.5      # rad

@@ -14,10 +14,14 @@ from typing import List, Optional
 import _sdkpath  # noqa: F401  (把 src/ 插进 sys.path)
 from litegrip import LiteGrip, MotionConfig
 
-# 用户真机上跑出来的标定值
+# 用户真机上跑出来的标定值（正装：rad 增大 = 闭合）
 POS_CLOSED_RAD = 0.104334
 POS_OPEN_RAD = -1.513123
 RAD_TO_MM = 74.19
+
+# 两端机械限位在**物理上**是固定的一对，换个装法只是把哪个数值叫「闭合」换过来。
+LIMIT_LO_RAD = POS_OPEN_RAD      # 数值小的一端
+LIMIT_HI_RAD = POS_CLOSED_RAD    # 数值大的一端
 
 # 假 CAN 一帧的时间步长（引擎的 --frame-interval 默认值）
 DT = 0.005
@@ -137,6 +141,16 @@ class FakeLiteGripCAN:
         self.holding = tau_feedforward != 0.0
         return True
 
+    def control_mit_stream(self, q_target, kp, kd, duration_s=0.5,
+                           interval_s=0.005, dq_target=0.0,
+                           tau_feedforward=0.0) -> bool:
+        """把 ``control_mit`` 连发一“段平台”，和真 CAN 层同名同形。"""
+        if interval_s <= 0:
+            return True
+        for _ in range(max(1, int(duration_s / interval_s))):
+            self.control_mit(q_target, kp, kd, dq_target, tau_feedforward)
+        return True
+
     # ── 状态 ───────────────────────────────────────────────────────────
     def poll(self, timeout_s: float = 0.0) -> bool:
         return True
@@ -191,36 +205,48 @@ class FakeLiteGripCAN:
 
 
 def make_gripper(
-    start_rad: float = POS_OPEN_RAD,
+    start_rad: Optional[float] = None,
     block_rad: Optional[float] = None,
     sticky_rad: float = 0.0,
     err: int = 1,
     motion: Optional[MotionConfig] = None,
     initialize_results: Optional[List[bool]] = None,
     stops: bool = False,
+    reverse: bool = False,
 ):
-    """造一个「已连接、已使能」的 LiteGrip，底层换成 :class:`FakeLiteGripCAN`。
+    """造一个「已连接、已使能、已标定」的 LiteGrip，底层换成 :class:`FakeLiteGripCAN`。
 
     默认用用户真机标定值（``POS_CLOSED_RAD`` / ``POS_OPEN_RAD`` / ``RAD_TO_MM``），
     ``sleep_fn`` 置空 —— 整条斜坡瞬间跑完。
 
-    ``stops=True`` 在标定出的两端装机械限位 —— 真夹爪本来就有，而
-    ``open``/``close`` 现在靠撞它来结束运动，所以这类用例必须开。
+    ``reverse=True`` 把两个限位数值对调（反装）。物理限位是同一对，换的只是
+    「哪个数值叫闭合」。
+
+    ``stops=True`` 在两端装机械限位 —— 真夹爪本来就有，而 ``open``/``close``
+    现在靠撞它来结束运动，所以这类用例必须开。
+
+    ``start_rad`` 默认停在张开侧（两种装法各自的那一端）。
 
     Returns:
         ``(gripper, fake_can)``
     """
     g = LiteGrip("vcan0", can_id=0x08)
     cfg = g.config
-    cfg.pos_closed_rad = POS_CLOSED_RAD
-    cfg.pos_open_rad = POS_OPEN_RAD
+    if reverse:
+        cfg.pos_closed_rad, cfg.pos_open_rad = POS_OPEN_RAD, POS_CLOSED_RAD
+    else:
+        cfg.pos_closed_rad, cfg.pos_open_rad = POS_CLOSED_RAD, POS_OPEN_RAD
     cfg.rad_to_mm = RAD_TO_MM
+    cfg.calibrated = True
+
+    if start_rad is None:
+        start_rad = cfg.pos_open_rad        # 张开侧
 
     fake = FakeLiteGripCAN(pos=start_rad, block_rad=block_rad,
                            sticky_rad=sticky_rad, err=err,
                            initialize_results=initialize_results,
-                           limit_lo=POS_OPEN_RAD if stops else None,
-                           limit_hi=POS_CLOSED_RAD if stops else None)
+                           limit_lo=LIMIT_LO_RAD if stops else None,
+                           limit_hi=LIMIT_HI_RAD if stops else None)
     g._can = fake
     g._connected = True
     g._enabled = True
