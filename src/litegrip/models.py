@@ -117,6 +117,22 @@ class GripperConfig:
         """
         return 1.0 if self.pos_closed_rad >= self.pos_open_rad else -1.0
 
+    @property
+    def mount(self) -> Optional[str]:
+        """``"normal"`` / ``"reverse"`` — the name the limits spell out.
+
+        ``None`` while :attr:`calibrated` is False: the placeholder defaults
+        also happen to order close above open, so reporting ``"normal"``
+        before a calibration has been loaded would be a claim, not a reading.
+        Handy for a caller that has to show the operator which way this unit
+        is mounted.  Compare with the ``mount=`` argument of
+        :class:`~litegrip.LiteGrip`, which *declares* a mount by loading a
+        template rather than reading one back.
+        """
+        if not self.calibrated:
+            return None
+        return "normal" if self.close_sign > 0 else "reverse"
+
 
 @dataclass
 class GripperInfo:

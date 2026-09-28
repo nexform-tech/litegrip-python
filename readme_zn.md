@@ -46,7 +46,7 @@ sudo ip link set can0 up
 from litegrip import LiteGrip
 
 with LiteGrip(channel="can0", can_id=0x08) as gripper:
-    gripper.load_calibration()   # 现场标定，没有就回退出厂标定
+    gripper.load_calibration()   # 本通道自己的标定文件，没有就回退出厂标定
     gripper.enable()             # 反复重试，直到状态帧回读到 err == 1
 
     gripper.open()                                     # 50 mm/s 走到张开侧
@@ -66,24 +66,37 @@ with LiteGrip(channel="can0", can_id=0x08) as gripper:
 `GripperConfig.close_sign`），所以两种装法都能用。SDK 不肯做的是**猜**：没加载标定之前，
 运动接口一律抛 `CommandError`。
 
-方向靠加载对应的模板来声明。两份模板都随包发布，都只是**标称**值 —— 它们的用处是声明方向、
-给一个像样的行程，随后 `zero()` 会把行程换成实测值：
+方向靠**名字**声明。`list_templates()` 按顺序给出可选名字，给 UI 做下拉框用；选中后
+用 `mount=` 加载：
 
 ```python
-from litegrip import CALIB_TEMPLATES, LiteGrip
+from litegrip import LiteGrip, list_templates
 
-with LiteGrip("can1") as gripper:
-    gripper.load_calibration(CALIB_TEMPLATES["reverse"])   # 或 "normal"
+list_templates()                       # ["normal", "reverse"] —— 给 UI 用
+
+with LiteGrip("can1", mount="reverse") as gripper:
+    print(gripper.mount)               # "reverse" —— 从限位数值读回
     gripper.enable()
-    gripper.zero()          # 可选：实测真实行程并存盘
+    gripper.zero()                     # 可选：实测真实行程并存盘
 ```
 
-判断是哪一种只需要看一眼：让夹爪走一小段，看指爪往哪边动。选错模板不是无声的 —— 加载时会
-把推导出的方向打进日志，第一次 `close()` 也会朝错的方向走。
+同一个选择有四个入口：`LiteGrip(..., mount="reverse")`、`gripper.load_template("reverse")`、
+`gripper.load_calibration(template="reverse")`，以及已有路径时的
+`load_calibration(CALIB_TEMPLATES["reverse"])`；四者加载的是同一个文件。两份模板都只是
+**标称**值：用处是声明方向、给一个像样的行程，随后 `zero()` 会把行程换成实测值。名字不在
+`list_templates()` 里会抛 `CommandError` 并列出合法名字；模板读不出来时**直接抛**、不回退 ——
+出厂文件是正装，拿它回答「反装」的请求，正是这个按名字选的入口要防的失败。
 
-所有 LiteGrip 共用同一个 CAN ID（`0x08`），所以一台电脑上放两台时，**通道是唯一的身份键**：
-一个挂 `can0`、一个挂 `can1`，各自指向正确的文件。文件里的 `channel` 与本实例不一致时
-`load_calibration` 会告警。两份模板刻意都不带 `channel`，所以不会触发这个告警。
+判断是哪一种只需要看一眼：让夹爪走一小段，看指爪往哪边动。选错装法不是无声的 —— 加载时会
+把推导出的方向打进日志，第一次 `close()` 也会朝错的方向走。随时可以用 `gripper.mount` 读回来
+（`"normal"` / `"reverse"`，未标定时是 `None`）。
+
+所有 LiteGrip 共用同一个 CAN ID（`0x08`），所以一台电脑上放两台时，**通道是唯一的身份键**。
+标定**按通道各存各的**：`~/.litegrip/<channel>_calibration.json`，两台互不覆盖。无参
+`load_calibration()` 先读本通道这一份，再读旧的单文件位置，最后才读出厂标定；自动链里凡是
+声明了**别的**通道的候选文件一律跳过 —— 所以 `can1` 自己没有标定时会**大声失败**（返回
+`False`，随后运动接口抛 `CommandError`），而不是悄悄采纳 `can0` 的方向。想让所有通道共用一个
+显式路径，设 `LITEGRIP_CALIB`。
 
 ## 六个动作接口
 
@@ -262,7 +275,7 @@ with LiteGrip("can0") as gripper:
 | 假定闭合 = rad 增大 | 两种顺序都行 —— `close_sign` 自动推导，装法由 `CALIB_TEMPLATES` 声明 |
 | `pos_open_rad >= pos_closed_rad` 抛 `CommandError` | 这个顺序就是反装；改为拒绝「从没标定过」（`GripperConfig.calibrated`） |
 
-除了签名，还有三处行为变化要注意：
+除了签名，还有这些行为变化要注意：
 
 - `enable()` 现在会如实报失败。以前只要状态帧是 `0` 或 `1` 它就返回 `True`，于是「根本没
   使能」的电机看起来是使能的。那些忽略返回值继续往下跑的代码，现在会在启动时看到
@@ -277,6 +290,15 @@ with LiteGrip("can0") as gripper:
   现在读起来是正装而不是反装。
 - 压紧段的领先上限 `stop_lead_mm` 从 `1.0` 降到 `0.7` mm，所以 `open` / `close` 顶限位的力矩
   从约额定值的一半降到约三分之一。哪台压不实就把它调回去。
+- `save_calibration()` / `load_calibration()` 的默认路径改成**按通道**：
+  `~/.litegrip/<channel>_calibration.json`，不再是单个 `litegrip_calibration.json`。旧文件仍
+  作为回退读取，`LITEGRIP_CALIB` 仍覆盖一切，但 `can0` 的标定不再回答 `can1` 的加载。
+- 自动加载链会跳过声明了**别的**通道的候选文件。`can1` 自己没有标定时，以前会悄悄加载
+  `can0` 的，现在返回 `False`、运动接口抛 `CommandError`。大声失败好过朝错的方向走。
+- 按名字加载（`mount=` / `load_template`）**绝不**回退出厂文件。模板读不出来就抛
+  `CommandError`：出厂文件是正装，回退等于拿「正装」回答「反装」的请求。
+- 两份模板现在只带方向与几何（限位、`rad_to_mm`、电机型号），不带 `can_id` / `mst_id` / 增益。
+  加载装法不会再改写你传的 CAN ID 或调好的 `kp`/`kd`。`CALIB_TEMPLATES` 及其键名不变。
 
 ## 开发
 
