@@ -60,6 +60,38 @@ with LiteGrip(channel="can0", can_id=0x08) as gripper:
 the gripper energised after the block, pass `LiteGrip(..., disable_on_disconnect=False)`
 or set `gripper.disable_on_disconnect = False`.
 
+## Reverse mounts and two grippers on one machine
+
+Which way the motor counts when the jaws close is not fixed: a gripper whose motor
+is mounted the other way round is a *reverse mount*, and there closing means
+decreasing radians. The SDK does not assume either; it derives the direction from
+the ordering of the two calibrated limits, so both mounting work (see
+`GripperConfig.close_sign`). What it *does* refuse to do is guess: until a
+calibration is loaded, the motion actions raise `CommandError`.
+
+Declare the direction by loading the matching template. Both ship with the
+package, and both are nominal — they label the direction and give a plausible
+stroke, which `zero()` then replaces with the measurement:
+
+```python
+from litegrip import CALIB_TEMPLATES, LiteGrip
+
+with LiteGrip("can1") as gripper:
+    gripper.load_calibration(CALIB_TEMPLATES["reverse"])   # or "normal"
+    gripper.enable()
+    gripper.zero()          # optional: measure the real travel, save it
+```
+
+Deciding which is which takes one look: with the jaws visible, run a small move
+and see which way they travel. Choosing the wrong template is not silent — the
+derived direction is logged on load, and the first `close()` heads the wrong way.
+
+Every LiteGrip shares the same CAN ID (`0x08`), so **the channel is the only
+identity key** when two sit on one machine: put them on `can0` and `can1` and
+point each at the right file. `load_calibration` warns if a file names a
+different channel than the instance. The templates deliberately carry no channel,
+so they never trip that warning.
+
 ## The six actions
 
 These are the supported entry points for moving the gripper. Each one verifies its own
@@ -70,7 +102,7 @@ outcome before reporting success, so callers do not re-implement ramps or stall 
 | `open(speed_mm_s=None)` | Ramps *past* the calibrated open-side stop and lets the mechanical stop end the move. | `MoveResult` |
 | `close(speed_mm_s=None)` | Same, toward the closed side. | `MoveResult` |
 | `grasp(force_n=None, hold_s=0.0)` | Closes until it stalls (i.e. grips), then holds `force_n`. `hold_s=0` holds forever. | `GraspResult` |
-| `zero()` | Full calibration: probes both mechanical stops, derives travel and `rad_to_mm`, saves to disk. | `CalibrationData` |
+| `zero()` | Full calibration: probes both mechanical stops, derives travel and `rad_to_mm`, saves to disk. It preserves the direction already declared by the loaded calibration; a stall cannot tell one stop from the other. | `CalibrationData` |
 | `enable(retries=None)` | Sends enable and re-reads the status frame, retrying until it reports `err == 1`. | `EnableResult` |
 | `disable()` | Disables the motor (zero torque, back-drivable by hand). | `bool` |
 
@@ -125,7 +157,7 @@ with LiteGrip("can0") as gripper:
 | `max_lead_mm` | `4.0` | travel-phase cap on how far the command may lead the measured position |
 | `press_overshoot` | `0.05` | fraction of travel the `open` / `close` command aims *past* the stop |
 | `press_zone_mm` | `2.0` | within this distance of the stop, the lead cap drops to `stop_lead_mm` |
-| `stop_lead_mm` | `1.0` | lead cap while pressing, so pressing torque is about `kp × stop_lead_mm` |
+| `stop_lead_mm` | `0.7` | lead cap while pressing, so pressing torque is about `kp × stop_lead_mm` |
 | `stop_tol` | `0.02` | how close to the calibrated stop the jaw must park to count as pressed home, radians |
 | `force_n` | `20.0` | default `grasp` force |
 | `hold_interval` | `0.2` | force-hold slice length, seconds |
@@ -213,13 +245,19 @@ Worth reading if a gripper is behaving oddly.
   repeatable setting, not a calibrated measurement.
 - **DM4310 limits** are a 3 Nm rating, a 7 Nm peak, and a 10 Nm protocol/firmware ceiling. The
   default 20 N (`2.0 Nm` feed-forward) sits inside the rating.
-- **Direction is data, not a switch.** The SDK assumes increasing radians means closing, and
-  stores both extremes in the calibration file. If `pos_open_rad >= pos_closed_rad` the
-  configuration is rejected with `CommandError`, because the SDK's clamping would be wrong.
+- **Direction is data, not a switch.** Both extreme positions live in the calibration file, and
+  which of the two is numerically larger is what says which way closing runs
+  (`GripperConfig.close_sign`). A reverse-mounted gripper is therefore a perfectly ordinary
+  configuration, not an error. What is rejected — with `CommandError` — is a configuration that
+  has never been calibrated (`GripperConfig.calibrated` still `False`) or whose two limits are
+  equal, because then every direction would be a guess.
 - **Pressing torque is bounded by design.** The travel-phase cap of `max_lead_mm` is about 5 Nm,
   and the pressing cap of `stop_lead_mm` is about `kp × stop_lead_mm / rad_to_mm` — roughly
-  `1.4 Nm` at the defaults (`kp=100`, `stop_lead_mm=1.0`, `rad_to_mm≈73.7`), comfortably under the
-  3 Nm rating. If it does not press home reliably, raise `stop_lead_mm` until it does without
+  `0.94 Nm` at the defaults (`kp=100`, `stop_lead_mm=0.7`, `rad_to_mm≈74`), about a third of the
+  3 Nm rating. The cap cannot usefully go below one frame of travel
+  (`speed_mm_s × frame_interval`, `0.25 mm` at the defaults), otherwise the ramp's own step gets
+  clipped. If it does not press home reliably — the jaw coasts in and settles further than
+  `stop_tol`, so `open`/`close` report `ok=False` — raise `stop_lead_mm` until it does without
   audible impact; the default is arithmetic, not a hardware measurement, and needs confirming on
   the real unit.
 - **Sustained pressing heats the coil.** `open` and `close` now hold against the stop for the
@@ -246,6 +284,8 @@ instead of bare `bool`s; `__bool__` preserves truthiness, but old positional cal
 | `disable() -> bool` | `disable() -> bool` (unchanged) |
 | gains passed per call, e.g. `close(kp=150.0)` | gains belong to `GripperConfig`; motion tunables to `MotionConfig` |
 | — | `zero()`, `gripper.actions`, `gripper.motion_config`, `disable_on_disconnect` are new |
+| closing assumed to increase radians | either ordering works — `close_sign` is derived; `CALIB_TEMPLATES` declares the mount |
+| `pos_open_rad >= pos_closed_rad` raised `CommandError` | that ordering is a reverse mount; a *never-calibrated* config raises instead (`GripperConfig.calibrated`) |
 
 Two behaviour changes matter beyond the signatures:
 
@@ -258,6 +298,13 @@ Two behaviour changes matter beyond the signatures:
   closing phase the two agree. For `open` and `close` they are opposite: a successful press onto
   the stop is `stalled=True, reached=False`, so `if gripper.close():` means something different
   from before even though the type never changed.
+- The motion actions now refuse to run on a configuration that was never calibrated. Code that
+  relied on the placeholder defaults in `GripperConfig` moving the jaws will now raise
+  `CommandError` and has to `load_calibration()` first. Those defaults also swapped round, so
+  they read as a normal mount rather than a reverse one.
+- The pressing lead cap `stop_lead_mm` dropped from `1.0` to `0.7` mm, so `open` and `close` press
+  onto the stop with roughly a third of the rated torque instead of half. Raise it back if a unit
+  fails to press home.
 
 ## Development
 

@@ -45,6 +45,19 @@ from .actions import (
 # Path to built-in factory calibration (ships with the package, read-only fallback).
 _FACTORY_CALIB = _os.path.join(_os.path.dirname(__file__), "factory_calibration.json")
 
+# Pre-made calibration templates shipped with the package.  Each is a pair of
+# nominal limits whose *ordering* declares the mounting direction: "normal"
+# closes at the larger rad value, "reverse" at the smaller one.  They are a
+# labelling seed, not a per-unit calibration — the limits are nominal, so run
+# zero() to measure the real travel.  Pick one by eye after watching which way
+# the jaws move::
+#
+#     gripper.load_calibration(CALIB_TEMPLATES["reverse"])
+CALIB_TEMPLATES = {
+    "normal": _os.path.join(_os.path.dirname(__file__), "calibration_normal.json"),
+    "reverse": _os.path.join(_os.path.dirname(__file__), "calibration_reverse.json"),
+}
+
 # Default user calibration path — a stable absolute location so that a
 # calibration saved without an explicit path is picked up on the next load
 # without an explicit path, regardless of the process working directory.
@@ -435,8 +448,10 @@ class LiteGrip:
         """Calibrate by manually moving the gripper in zero-gravity mode.
 
         The motor enters zero-torque mode so you can freely push/pull the
-        gripper jaws through their full range.  The SDK records the minimum
-        (closed limit) and maximum (open limit) positions reached.
+        gripper jaws through their full range.  The SDK records the two
+        extremes reached — which one is "closed" depends on the mounting
+        direction declared by the current configuration (see
+        :attr:`GripperConfig.close_sign`), not on which is numerically larger.
 
         Usage::
 
@@ -483,11 +498,19 @@ class LiteGrip:
         print("=" * 60)
         print()
 
-        # min_pos = most negative rad value seen  → OPEN  position (largest mm)
-        # max_pos = most positive rad value seen  → CLOSED position (0 mm)
-        open_rad = float("+inf")   # most negative → open
-        close_rad = float("-inf")  # most positive → close
+        # Track the two extremes; the mounting direction (close_sign) decides
+        # which of them is the closed limit.  A normal mount closes at the
+        # larger rad value, a reverse mount at the smaller one.
+        s = self._config.close_sign
+        lo_rad = float("+inf")     # most negative rad seen
+        hi_rad = float("-inf")     # most positive rad seen
         sample_count = 0
+
+        def _label(rad: float) -> str:
+            at_lo = rad <= lo_rad
+            if s > 0:
+                return "张开极限" if at_lo else "闭合极限"
+            return "闭合极限" if at_lo else "张开极限"
 
         deadline = time.monotonic() + duration
 
@@ -503,18 +526,18 @@ class LiteGrip:
                 # Only count positions that look like real feedback
                 if abs(pos) < 50.0:
                     sample_count += 1
-                    if pos < open_rad:
-                        open_rad = pos
-                        print(f"  ★ 新张开极限: {open_rad:.6f} rad")
-                    if pos > close_rad:
-                        close_rad = pos
-                        print(f"  ★ 新闭合极限: {close_rad:.6f} rad")
+                    if pos < lo_rad:
+                        lo_rad = pos
+                        print(f"  ★ 新{_label(pos)}: {pos:.6f} rad")
+                    elif pos > hi_rad:
+                        hi_rad = pos
+                        print(f"  ★ 新{_label(pos)}: {pos:.6f} rad")
 
                 # Progress indicator (every ~1 second)
                 remaining = deadline - time.monotonic()
                 if sample_count % 100 == 0 and sample_count > 0:
                     print(f"  ... 剩余 {remaining:.0f}s  |  当前 pos={pos:.4f} rad  "
-                          f"|  open={open_rad:.4f}  close={close_rad:.4f}")
+                          f"|  lo={lo_rad:.4f}  hi={hi_rad:.4f}")
 
                 time.sleep(sample_interval)
 
@@ -528,10 +551,8 @@ class LiteGrip:
             self._can.control_mit(q_target=0, kp=0, kd=0, tau_feedforward=0)
             self._can.poll(timeout_s=0.0)
             pos = self._can.get_position()
-            if pos < open_rad:
-                open_rad = pos
-            if pos > close_rad:
-                close_rad = pos
+            lo_rad = min(lo_rad, pos)
+            hi_rad = max(hi_rad, pos)
             time.sleep(sample_interval)
 
         # ── Exit zero-gravity ───────────────────────────────────────────
@@ -539,13 +560,15 @@ class LiteGrip:
         time.sleep(0.1)
 
         # ── Validate ────────────────────────────────────────────────────
-        if open_rad >= close_rad or open_rad == float("+inf"):
+        if lo_rad == float("+inf"):
             raise RuntimeError(
                 "标定失败：未能捕获有效的位置范围。"
                 "请确保夹爪使能正常且有反馈。"
             )
 
-        travel = close_rad - open_rad  # positive: close(0mm) - open(full travel)
+        close_rad, open_rad = (hi_rad, lo_rad) if s > 0 else (lo_rad, hi_rad)
+
+        travel = abs(close_rad - open_rad)
         if travel <= 0:
             raise RuntimeError(
                 f"标定失败：行程异常 ({travel:.6f} rad)。"
@@ -565,10 +588,13 @@ class LiteGrip:
             calibration_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
 
-        # Update config: pos_closed_rad = close (more positive), pos_open_rad = open (more negative)
+        # Update config.  The ordering the two values end up in is the
+        # direction declaration: close on the close_sign side, open on the
+        # other, whatever the mount.
         self._config.pos_closed_rad = result.zero_position
         self._config.pos_open_rad = result.max_position
         self._config.rad_to_mm = result.rad_to_mm
+        self._config.calibrated = True
 
         print(f"\n{'=' * 60}")
         print(f"  标定完成")
@@ -631,6 +657,9 @@ class LiteGrip:
         print("=" * 60)
         print()
         print("  夹爪将自动缓慢移动。到达极限时按 Enter 确认。")
+
+        s = self._config.close_sign
+        print(f"  方向：{'正向' if s > 0 else '反装'}（由当前配置的限位顺序推出）")
         print()
 
         def _step_to_limit(direction: str, sign: float, label: str) -> float:
@@ -685,11 +714,11 @@ class LiteGrip:
         print("━" * 60)
         print("  第 1 步：张开")
         print("━" * 60)
-        open_rad = _step_to_limit("open", sign=-1.0, label="张开极限")
+        open_rad = _step_to_limit("open", sign=-s, label="张开极限")
 
-        # Small back-off
+        # Small back-off, away from the open stop toward the close side
         print(f"\n  回退一小段...")
-        self._can.control_mit_stream(open_rad - 0.15, kp=80, kd=kd,
+        self._can.control_mit_stream(open_rad + s * 0.15, kp=80, kd=kd,
                                      duration_s=0.5, interval_s=0.005)
         time.sleep(0.1)
 
@@ -697,14 +726,14 @@ class LiteGrip:
         print(f"\n{'━' * 60}")
         print("  第 2 步：闭合")
         print("━" * 60)
-        close_rad = _step_to_limit("close", sign=+1.0, label="闭合极限")
+        close_rad = _step_to_limit("close", sign=+s, label="闭合极限")
 
         # ── Compute ──────────────────────────────────────────────────────
-        travel = close_rad - open_rad  # close > open (rad value)
+        travel = abs(close_rad - open_rad)
         if travel <= 0:
-            raise RuntimeError(f"行程异常: close={close_rad:.4f} <= open={open_rad:.4f}")
+            raise RuntimeError(f"行程异常: close={close_rad:.4f} == open={open_rad:.4f}")
 
-        rad_to_mm = 120.0 / travel
+        rad_to_mm = self._config.max_stroke_mm / travel
 
         result = CalibrationData(
             zero_position=round(close_rad, 6),
@@ -721,12 +750,14 @@ class LiteGrip:
         self._config.pos_closed_rad = result.zero_position
         self._config.pos_open_rad = result.max_position
         self._config.rad_to_mm = result.rad_to_mm
+        self._config.calibrated = True
 
         print(f"\n{'=' * 60}")
         print(f"  标定完成")
         print(f"{'=' * 60}")
-        print(f"  闭合(0mm):  {result.zero_position:.6f} rad")
-        print(f"  张开(120mm): {result.max_position:.6f} rad")
+        print(f"  闭合(0mm):   {result.zero_position:.6f} rad")
+        print(f"  张开({self._config.max_stroke_mm:.0f}mm): "
+              f"{result.max_position:.6f} rad")
         print(f"  行程:        {result.travel_range:.6f} rad  "
               f"({result.travel_mm:.1f} mm)")
         print(f"  转换系数:    {result.rad_to_mm:.1f} mm/rad")
@@ -760,6 +791,9 @@ class LiteGrip:
             "can_id": self._can_id,
             "mst_id": self._mst_id or 0,
             "canfd_mode": self._canfd_mode or False,
+            "calibrated": True,
+            # Which of zero/max is numerically larger is what carries the
+            # mounting direction; there is no separate field for it.
             "zero_position_rad": self._config.pos_closed_rad,
             "max_position_rad": self._config.pos_open_rad,
             "travel_range_rad": abs(self._config.pos_open_rad - self._config.pos_closed_rad),
@@ -785,6 +819,14 @@ class LiteGrip:
         factory calibration shipped with the SDK.
 
         Call this after :meth:`connect` but before :meth:`enable`.
+
+        The limits in the file decide the direction: whichever of the two is
+        numerically larger is the closed side.  Loading a
+        :data:`CALIB_TEMPLATES` entry is how a reverse-mounted gripper is
+        declared.  The direction the file implies is logged, and a warning is
+        raised if the file names a different CAN channel than this instance —
+        with every gripper sharing the same CAN ID, the channel is what tells
+        two of them apart.
 
         Args:
             path: JSON file path. When omitted, reads the default user
@@ -834,15 +876,31 @@ class LiteGrip:
             if key in data:
                 setattr(self._config, attr, data[key])
 
+        # Older calibration files predate the flag and always came from a real
+        # calibration run, so absence means calibrated.
+        self._config.calibrated = bool(data.get("calibrated", True))
+
+        # The channel is the only thing that tells two grippers apart when both
+        # sit at CAN ID 0x08, so a file that names another channel is worth
+        # flagging — but it is not fatal, since older files may omit the key.
+        file_channel = data.get("channel")
+        if file_channel and self._channel and file_channel != self._channel:
+            log.warning("标定文件的 channel=%s 与本实例的 %s 不一致 —— "
+                        "同一台电脑上多台夹爪共用 CAN ID 时，通道是唯一身份键，"
+                        "确认没有指错文件。", file_channel, self._channel)
+
         # Also update instance-level IDs if present
         if "can_id" in data:
             self._can_id = int(data["can_id"])
         if "mst_id" in data:
             self._mst_id = int(data["mst_id"])
 
-        log.info("Calibration loaded from %s: range=%.1f mm",
+        s = self._config.close_sign
+        log.info("Calibration loaded from %s: range=%.1f mm，方向=%s",
                  loaded_from,
-                 abs(self._config.pos_open_rad - self._config.pos_closed_rad) * self._config.rad_to_mm)
+                 abs(self._config.pos_open_rad - self._config.pos_closed_rad)
+                 * self._config.rad_to_mm,
+                 "正向（rad 增大 = 闭合）" if s > 0 else "反装（rad 减小 = 闭合）")
         return True
 
     # ═══════════════════════════════════════════════════════════════════
@@ -850,10 +908,14 @@ class LiteGrip:
     # ═══════════════════════════════════════════════════════════════════
 
     def home(self) -> bool:
-        """Move to the closed (zero) position."""
+        """Move to the closed (zero) position.
+
+        Uses this instance's calibrated closed limit, so a reverse-mounted
+        gripper homes to the correct end.
+        """
         self._check_connected()
         self._check_enabled()
-        return self.move_to(GripperParams.POS_CLOSED_RAD, duration=1.0)
+        return self.move_to(self._config.pos_closed_rad, duration=1.0)
 
     def open(
         self,
@@ -962,8 +1024,11 @@ class LiteGrip:
         """Move to an absolute position in millimetres."""
         self._check_connected()
         self._check_enabled()
-        # Motor rad decreases toward open → target_rad = close_rad - mm / scale
-        position_rad = self._config.pos_closed_rad - position_mm / self._config.rad_to_mm
+        # Opening may increase or decrease the motor rad count depending on the
+        # mount; close_sign carries that, so this works for both.
+        position_rad = (self._config.pos_closed_rad
+                        - self._config.close_sign * position_mm
+                        / self._config.rad_to_mm)
         return self.goto_rad(position_rad, kp=kp, kd=kd, duration=duration)
 
     def goto_rad(
@@ -984,9 +1049,11 @@ class LiteGrip:
         kp = kp if kp is not None else self._config.kp
         kd = kd if kd is not None else self._config.kd
 
-        # Clamp: open_rad (more negative) ≤ pos ≤ closed_rad (more positive)
-        position_rad = max(self._config.pos_open_rad,
-                          min(self._config.pos_closed_rad, position_rad))
+        # Clamp between the two calibrated limits, whichever is numerically
+        # larger (the ordering flips on a reverse mount).
+        lo = min(self._config.pos_closed_rad, self._config.pos_open_rad)
+        hi = max(self._config.pos_closed_rad, self._config.pos_open_rad)
+        position_rad = max(lo, min(hi, position_rad))
 
         try:
             return self._can.control_mit_stream(
@@ -1026,7 +1093,9 @@ class LiteGrip:
         if self._can is None:
             return False
 
-        tau_nm = force_n * UnitConversion.N_TO_NM
+        # Squeezing may mean increasing or decreasing rad depending on the
+        # mount; close_sign carries that.
+        tau_nm = self._config.close_sign * force_n * UnitConversion.N_TO_NM
         current_pos = self._can.get_position()
 
         try:
@@ -1073,9 +1142,12 @@ class LiteGrip:
             return True
 
         duration_s = distance_mm / speed_mm_s
-        # Convert to rad
-        current_rad = self._config.pos_closed_rad - current_mm / self._config.rad_to_mm
-        target_rad = self._config.pos_closed_rad - target_mm / self._config.rad_to_mm
+        # Convert to rad (close_sign handles the reverse mount)
+        s = self._config.close_sign
+        current_rad = (self._config.pos_closed_rad
+                       - s * current_mm / self._config.rad_to_mm)
+        target_rad = (self._config.pos_closed_rad
+                      - s * target_mm / self._config.rad_to_mm)
         speed_rad_s = speed_mm_s / self._config.rad_to_mm
 
         return self._move_at_speed_rad(
@@ -1185,6 +1257,11 @@ class LiteGrip:
         4. Step toward open direction until stall → max_position
         5. Compute travel_range and update internal conversion factors
 
+        A stall only says "something stopped me", never *which* end was hit —
+        both ends are hard stops.  So the direction is not discovered here: it
+        comes from :attr:`GripperConfig.close_sign` (load a calibration
+        template first for a reverse mount), and this routine preserves it.
+
         Args:
             kp: Probing stiffness (low = gentle).
             kd: Probing damping.
@@ -1202,13 +1279,15 @@ class LiteGrip:
         if self._can is None:
             raise NotInitializedError("未连接")
 
+        s = self._config.close_sign
         init_pos = self._can.get_position()
         self._can.update_state(timeout_s=0.1)
         init_pos = self._can.get_position()
-        print(f"标定开始  初始位置: {init_pos:.4f} rad")
+        print(f"标定开始  初始位置: {init_pos:.4f} rad  "
+              f"（方向：{'正向' if s > 0 else '反装'}）")
 
         def _find_limit(direction: str) -> float:
-            sign = +1.0 if direction == "close" else -1.0
+            sign = s if direction == "close" else -s
             label = "闭合限位" if direction == "close" else "张开限位"
             print(f"  寻找{label}...")
 
@@ -1241,25 +1320,27 @@ class LiteGrip:
             print(f"    → 安全停止（达到最大步数 {max_iter}）: {current:.4f} rad")
             return current
 
-        # 1. Safe back-off
+        # 1. Safe back-off (a nudge toward the close side, as before, flipped
+        #    with the mount)
         print("  安全回退...")
-        self.goto_rad(init_pos + 0.2, kp=80, kd=kd, duration=0.5)
+        self.goto_rad(init_pos + s * 0.2, kp=80, kd=kd, duration=0.5)
         self._can.update_state(timeout_s=0.1)
 
         # 2. Find zero (close direction)
         zero_pos = _find_limit("close")
 
-        # 3. Back off
+        # 3. Back off, away from the close stop toward the open side
         print("  回退...")
-        self.goto_rad(zero_pos + 0.3, kp=80, kd=kd, duration=0.5)
+        self.goto_rad(zero_pos - s * 0.3, kp=80, kd=kd, duration=0.5)
         self._can.update_state(timeout_s=0.1)
 
         # 4. Find max (open direction)
         max_pos = _find_limit("open")
 
         # 5. Compute results
-        # zero_pos = close (more positive rad), max_pos = open (more negative rad)
-        travel = zero_pos - max_pos  # positive rad value
+        # zero_pos = close limit, max_pos = open limit; which is numerically
+        # larger depends on the mount, so take the magnitude.
+        travel = abs(zero_pos - max_pos)
         rad_to_mm = self._config.max_stroke_mm / travel if travel > 0 else 105.26
 
         result = CalibrationData(
@@ -1277,6 +1358,7 @@ class LiteGrip:
         self._config.pos_closed_rad = result.zero_position
         self._config.pos_open_rad = result.max_position
         self._config.rad_to_mm = result.rad_to_mm
+        self._config.calibrated = True
 
         print(f"\n  标定结果:")
         print(f"    闭合(0mm): {result.zero_position:.6f} rad")
@@ -1317,10 +1399,15 @@ class LiteGrip:
         error_code = self._can.get_error()
         t_mos, t_coil = self._can.get_temperature()
 
-        # pos_closed_rad=closed(0mm), pos_open_rad=open(max_mm).
-        # Motor rad decreases when opening → mm = (close_rad - current_rad) * scale
-        position_mm = (self._config.pos_closed_rad - position_rad) * self._config.rad_to_mm
-        force_n = torque_nm * UnitConversion.NM_TO_N
+        # pos_closed_rad = closed (0 mm), pos_open_rad = open (max mm).  Which
+        # way the rad count runs depends on the mount, so close_sign sets the
+        # sign; the result is 0 mm at the closed limit and +stroke at the open
+        # limit for both mountings.
+        s = self._config.close_sign
+        position_mm = ((self._config.pos_closed_rad - position_rad)
+                       * s * self._config.rad_to_mm)
+        # Squeeze is positive force: the sign flips with the mount too.
+        force_n = s * torque_nm * UnitConversion.NM_TO_N
 
         return GripperState(
             position_rad=position_rad,

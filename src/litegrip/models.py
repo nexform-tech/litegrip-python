@@ -83,11 +83,18 @@ class GripperConfig:
     kp: float = 100.0                      # position stiffness [0, 500]
     kd: float = 2.0                        # velocity damping [0, 5]
 
-    # Position limits (rad) — updated by calibrate()
-    # closed (0 mm) → numerically larger rad value
-    pos_closed_rad: float = 0.0
-    # open (full stroke) → numerically smaller rad value
-    pos_open_rad: float = 1.14
+    # Position limits (rad) — updated by calibrate() / load_calibration().
+    # Which of the two is numerically larger is NOT assumed: a gripper whose
+    # motor is mounted the other way round (a "reverse mount") simply has
+    # pos_closed_rad < pos_open_rad.  See :attr:`close_sign`.
+    pos_closed_rad: float = 1.14           # closed → 0 mm
+    pos_open_rad: float = 0.0              # open  → full stroke
+
+    # True once the limits above come from a real calibration (or from a
+    # calibration template) rather than from the placeholder defaults.  The
+    # motion actions refuse to run while this is False, because with the
+    # defaults still in place every direction is a guess.
+    calibrated: bool = False
 
     # Mechanical stroke (mm) — set to match your gripper's physical travel
     max_stroke_mm: float = 120.0
@@ -98,6 +105,17 @@ class GripperConfig:
 
     # Grasp detection
     grasp_torque_threshold: float = 0.5    # Nm
+
+    @property
+    def close_sign(self) -> float:
+        """Which way the motor counts when the jaws close.
+
+        ``+1.0`` when closing means increasing radians (the usual mounting),
+        ``-1.0`` for a reverse mount.  Derived from the ordering of the two
+        calibrated limits, so direction is data, not a separate switch — and
+        it is only meaningful once :attr:`calibrated` is True.
+        """
+        return 1.0 if self.pos_closed_rad >= self.pos_open_rad else -1.0
 
 
 @dataclass
@@ -116,9 +134,9 @@ class GripperInfo:
 class CalibrationData:
     """Result of a gripper calibration run."""
 
-    zero_position: float = 0.0             # closed limit (rad)
-    max_position: float = 1.14             # open limit (rad)
-    travel_range: float = 1.14             # max - zero (rad)
+    zero_position: float = 1.14            # closed limit (rad)
+    max_position: float = 0.0              # open limit (rad)
+    travel_range: float = 1.14             # |max - zero| (rad)
     rad_to_mm: float = 105.26              # calibrated conversion
     motor_type: str = "DM4310"
     can_id: int = 0x08

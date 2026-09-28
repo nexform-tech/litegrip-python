@@ -82,7 +82,7 @@ class MotionConfig:
     # ── open/close 顶限位压紧 ──────────────────────────────────────────
     press_overshoot: float = 0.05       # 指令越过标定限位的行程比例
     press_zone_mm: float = 2.0          # 距限位这么近就切到 stop_lead_mm
-    stop_lead_mm: float = 1.0           # 压紧段领先上限 mm（≈ kp × 上限）
+    stop_lead_mm: float = 0.7           # 压紧段领先上限 mm（≈ kp × 上限）
     stop_tol: float = 0.02              # 停稳位置距限位多近算「顶在限位上」rad
 
     # ── 堵转判据 ───────────────────────────────────────────────────────
@@ -197,6 +197,24 @@ class EnableResult:
 # 目标位置
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _check_calibrated(config: GripperConfig) -> None:
+    """确认配置真的带上了标定，并有一段非零行程。
+
+    两种限位顺序都合法（``pos_closed_rad`` 可以小于 ``pos_open_rad``，那就是
+    反装），所以这里**不**看谁大谁小 —— 只看有没有标定过的实数。没标定的
+    配置里所有方向都是猜的，必须拦住。
+    """
+    if not config.calibrated:
+        raise CommandError(
+            "配置尚未标定：pos_closed_rad / pos_open_rad 还是占位默认值，"
+            "无法判断方向。先 load_calibration()（可选 "
+            "CALIB_TEMPLATES[\"reverse\"]）或跑一次 zero()。")
+    if abs(config.pos_closed_rad - config.pos_open_rad) <= 1e-6:
+        raise CommandError(
+            f"行程为零：pos_closed_rad={config.pos_closed_rad} 与 "
+            f"pos_open_rad={config.pos_open_rad} 相同，重新标定。")
+
+
 def limit_target(
     config: GripperConfig,
     toward: str,
@@ -205,6 +223,9 @@ def limit_target(
     """算出一端的目标位置：标定限位往行程内侧退 ``margin`` 比例的余量。
 
     不让夹爪真顶到机械限位（那里 kp=100 会压出 ~4 Nm），而是停在限位内侧。
+
+    方向来自 :attr:`GripperConfig.close_sign`，所以反装的机器（
+    ``pos_closed_rad < pos_open_rad``）同样成立。
 
     Args:
         config: 夹爪配置（用 ``pos_closed_rad`` / ``pos_open_rad``）。
@@ -215,22 +236,19 @@ def limit_target(
         ``(目标位置, 标定限位, 余量 rad, 行程 rad)``
 
     Raises:
-        CommandError: 位置约定不成立（``pos_open_rad >= pos_closed_rad``）。
+        CommandError: 配置还没标定（``calibrated=False``），或行程为零。
             这多半是没加载标定，用了 :class:`GripperConfig` 的默认值。
     """
-    if config.pos_open_rad >= config.pos_closed_rad:
-        raise CommandError(
-            f"位置约定不成立：pos_open_rad={config.pos_open_rad} 应小于 "
-            f"pos_closed_rad={config.pos_closed_rad}（全开在数值更小的一侧）。"
-            f"多为没加载标定 —— 先 load_calibration() 或跑一次 zero()。")
+    _check_calibrated(config)
 
+    s = config.close_sign
     travel = abs(config.pos_closed_rad - config.pos_open_rad)
     margin_rad = margin * travel
     if toward == "close":
         limit = config.pos_closed_rad
-        return limit - margin_rad, limit, margin_rad, travel
+        return limit - s * margin_rad, limit, margin_rad, travel
     limit = config.pos_open_rad
-    return limit + margin_rad, limit, margin_rad, travel
+    return limit + s * margin_rad, limit, margin_rad, travel
 
 
 def press_target(
@@ -245,6 +263,8 @@ def press_target(
     :attr:`MotionConfig.stop_lead_mm` 收窄，所以压紧力矩 ≈
     ``kp × stop_lead_mm / rad_to_mm``，不会一路顶到 ``kp × 越位量``。
 
+    方向来自 :attr:`GripperConfig.close_sign`，正向与反装都成立。
+
     Args:
         config: 夹爪配置（用 ``pos_closed_rad`` / ``pos_open_rad``）。
         toward: ``"close"`` 或 ``"open"``。
@@ -254,21 +274,18 @@ def press_target(
         ``(越过限位的目标, 标定限位, 越位 rad, 行程 rad)``
 
     Raises:
-        CommandError: 位置约定不成立（``pos_open_rad >= pos_closed_rad``）。
+        CommandError: 配置还没标定（``calibrated=False``），或行程为零。
     """
-    if config.pos_open_rad >= config.pos_closed_rad:
-        raise CommandError(
-            f"位置约定不成立：pos_open_rad={config.pos_open_rad} 应小于 "
-            f"pos_closed_rad={config.pos_closed_rad}（全开在数值更小的一侧）。"
-            f"多为没加载标定 —— 先 load_calibration() 或跑一次 zero()。")
+    _check_calibrated(config)
 
+    s = config.close_sign
     travel = abs(config.pos_closed_rad - config.pos_open_rad)
     over_rad = overshoot * travel
     if toward == "close":
         limit = config.pos_closed_rad
-        return limit + over_rad, limit, over_rad, travel
+        return limit + s * over_rad, limit, over_rad, travel
     limit = config.pos_open_rad
-    return limit - over_rad, limit, over_rad, travel
+    return limit - s * over_rad, limit, over_rad, travel
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -606,7 +623,9 @@ class GripperActions:
         """
         cfg = self.config
         g = self._g
-        tau_nm = force_n * UnitConversion.N_TO_NM
+        # 夹紧方向的力矩符号随安装方向翻转：正装时 rad 增大是闭合，
+        # 反装时反过来。力矩大小不变，只是要让前馈往「夹」而不是「撑」。
+        tau_nm = g.config.close_sign * force_n * UnitConversion.N_TO_NM
 
         deadline = None if hold_s <= 0 else cfg.monotonic_fn() + hold_s
         frames_per_slice = max(1, int(round(cfg.hold_interval

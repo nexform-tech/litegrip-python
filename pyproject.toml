@@ -58,6 +58,7 @@ Issues = "https://github.com/nexform-tech/litegrip-python/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-# py.typed tells type checkers the annotations are real; the factory calibration
-# is the read-only fallback used when a unit has never been calibrated on site.
-litegrip = ["py.typed", "factory_calibration.json"]
+# py.typed tells type checkers the annotations are real. The JSON files are the
+# read-only fallback used when a unit has never been calibrated on site: the
+# factory one, plus the normal/reverse direction templates.
+litegrip = ["py.typed", "*.json"]
