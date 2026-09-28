@@ -66,7 +66,7 @@ with LiteGrip(channel="can0", can_id=0x08) as gripper:
 
 | 方法 | 行为 | 返回 |
 | --- | --- | --- |
-| `open(speed_mm_s=None)` | 按斜坡走到标定的张开侧限位，内侧留出 `margin`。 | `MoveResult` |
+| `open(speed_mm_s=None)` | 按斜坡**越过**标定的张开侧限位，由机械限位结束这趟运动。 | `MoveResult` |
 | `close(speed_mm_s=None)` | 同上，朝闭合侧。 | `MoveResult` |
 | `grasp(force_n=None, hold_s=0.0)` | 闭合到堵转（即夹住），然后持续输出 `force_n`。`hold_s=0` 表示不限时长。 | `GraspResult` |
 | `zero()` | 完整标定：探测两端机械限位，算出行程与 `rad_to_mm`，并存盘。 | `CalibrationData` |
@@ -112,7 +112,7 @@ with LiteGrip("can0") as gripper:
 | --- | --- | --- |
 | `speed_mm_s` | `50.0` | `open` / `close` 的开口速度 |
 | `grasp_speed_mm_s` | `50.0` | `grasp` 闭合段速度 |
-| `margin` | `0.05` | 距每端限位保留的行程比例 |
+| `margin` | `0.05` | 距限位保留的行程比例，只有 `grasp` 用 |
 | `frame_interval` | `0.005` | 斜坡帧间隔 s（200 Hz） |
 | `sample_interval` | `0.05` | 堵转采样间隔 s（20 Hz） |
 | `settle_s` | `0.3` | 斜坡走完后原地保目标的时长（这段不判堵转） |
@@ -120,7 +120,11 @@ with LiteGrip("can0") as gripper:
 | `stall_cycles` | `5` | 堵转窗口的采样点数 |
 | `stall_ratio` | `0.2` | 窗口位移低于「本该走的距离」的这个比例即为堵转 |
 | `stall_delta` | `0.0015` | 堵转阈值下限 rad |
-| `max_lead_mm` | `4.0` | 指令最多领先实测位置多少 |
+| `max_lead_mm` | `4.0` | 行进段指令最多领先实测位置多少 |
+| `press_overshoot` | `0.05` | `open` / `close` 的目标**越过**限位的行程比例 |
+| `press_zone_mm` | `2.0` | 距限位这么近，领先上限就降到 `stop_lead_mm` |
+| `stop_lead_mm` | `1.0` | 压紧段的领先上限，压紧力矩约 `kp × stop_lead_mm` |
+| `stop_tol` | `0.02` | 停稳位置距标定限位多近才算顶到位 rad |
 | `force_n` | `20.0` | `grasp` 默认夹持力 |
 | `hold_interval` | `0.2` | 保力的分片时长 s |
 | `hold_kp` / `hold_kd` | `150.0` / `2.0` | 保力时用的刚度 / 阻尼 |
@@ -136,20 +140,33 @@ with LiteGrip("can0") as gripper:
 
 ## 结果类型
 
-结果类型都是 dataclass，同时实现了 `__bool__`，所以老的 `if gripper.open():` 写法继续可用。
+结果类型都是 dataclass，同时实现了 `__bool__`，所以老的 `if gripper.open():` 写法仍然能编译。
+但 `open` 和 `close` 的**含义**变了 —— 见下。
 
 | 类型 | 字段 | `bool()` 等于 |
 | --- | --- | --- |
-| `MoveResult` | `reached`、`stalled`、`state`、`target_rad`、`final_cmd_rad`、`steps` | `reached and not stalled` |
+| `MoveResult` | `ok`、`reached`、`stalled`、`state`、`target_rad`、`limit_rad`、`final_cmd_rad`、`steps` | `ok` |
 | `GraspResult` | `ok`、`reached`、`stalled`、`state`、`target_rad`、`force_n`、`cycles` | `ok` |
 | `EnableResult` | `ok`、`state`、`tries` | `ok` |
 
-有两种组合看着吓人，其实是对的：
+`MoveResult.ok` 的含义随谁产生的而变：
+
+- `open()` / `close()` 来的：成功就是**顶到机械限位**，所以成功时
+  `ok=True`、`stalled=True`、`reached=False` —— 目标故意越过限位，夹爪永远走不到那儿。
+  这两个接口的 `reached` 基本恒为 `False`，读 `ok`。堵转点离限位很远说明行程被挡住，
+  这时 `ok=False`。
+- `grasp()` 闭合段来的：成功 = `reached and not stalled`，与以前完全一致 —— 夹住工件
+  本来就到不了空载目标位置。
+
+有三种组合看着吓人，其实是对的：
 
 - **`grasp` 夹到真实工件**会返回 `stalled=True, reached=False`，而 `ok=True`。夹住东西
   本来就到不了空载目标位置，所以要读 `ok`，别读 `reached`。
-- **`close` 空载**可能报 `reached=True`，但夹爪实际停在目标前约 `0.010 rad` 处。这是闭合
-  侧的粘滑死区，也正是 `reach_tol` 默认取 `0.02` 的原因 —— 容差再紧一点就会误报失败。
+- **`close` 空载**报 `ok=True, stalled=True, reached=False` —— 夹爪已经停在机械限位上。
+  改之前同样这一下报的是 `reached=True, stalled=False`。
+- **`grasp` 闭合段空载**可能报 `reached=True`，但夹爪实际停在 `target_rad` 前约
+  `0.010 rad` 处。这是闭合侧的粘滑死区，也正是 `reach_tol` 默认取 `0.02` 的原因 ——
+  容差再紧一点就会误报失败。
 
 ## 运动逻辑
 
@@ -158,10 +175,17 @@ with LiteGrip("can0") as gripper:
 - **连续斜坡，不用 `goto_rad`。** `goto_rad` 在整段时长里反复下发同一个目标，伺服几十
   毫秒就贴上去、剩下时间空转 —— 慢速时表现为一顿一停。这六个接口按 `frame_interval`
   推进一条线性斜坡，并给关节速度前馈，和 SDK 自己的 `move_at_speed` 是同一套做法。
-- **指令领先量有上限。** 指令是一条绝对斜坡，但领先实测位置的部分被 `max_lead_mm` 封顶。
-  不封顶的话，被挡住时误差会一直累积、力矩顶到危险值；封顶后静摩擦仍靠满额力矩破，而
-  力矩本身始终有界，约为 `kp × 领先上限`，默认下约 5 Nm。也不能改成「相对实测位置加一块」：
-  那样一旦夹住，指令就跟着实测冻结，误差永远涨不上去，堵转判据会误判。
+- **指令领先量有上限，分两档。** 指令是一条绝对斜坡，但领先实测位置的部分被封顶：行进段
+  用 `max_lead_mm`，足够破静摩擦；距限位 `press_zone_mm` 之内收到 `stop_lead_mm`，压紧力矩
+  就停在 `kp × stop_lead_mm` 附近，不会一路涨到 `kp × press_overshoot`。保压段也要切 ——
+  那时指令停在限位外侧，不切的话领先会顶到约 8 Nm。不封顶的话，被挡住时误差会一直累积、
+  力矩顶到危险值；封顶后力矩始终有界，约为 `kp × 领先上限`。反过来也不能全局调小：领先量
+  太小破不了静摩擦，夹爪会在半路报假堵转。更不能改成「相对实测位置加一块」：那样一旦夹住，
+  指令就跟着实测冻结，误差永远涨不上去，堵转判据会误判。
+- **`open` 和 `close` 的目标在限位外侧。** 目标是标定限位再加 `press_overshoot` 比例的行程，
+  由堵转判据在机械限位上结束这趟运动。于是标定出来的极限值只决定**往哪个方向走**和 mm 显示
+  读多少 —— 标定偏一点不再影响终点位置。顺带也不再依赖 `margin` 猜得准，不用再跟闭合侧
+  那点粘滑死区较劲。`grasp` 不一样：它必须停在**工件**上，闭合段仍旧瞄限位内侧的 `margin`。
 - **堵转判据是软件侧的窗口逻辑。** DM4310 本身没有堵转保护，所以引擎每 `sample_interval`
   采一次位置，当连续 `stall_cycles` 次采样的净位移低于
   `max(stall_delta, stall_ratio × 本该走的距离)` 时判堵转。只看单点会被闭合侧的粘滑死区
@@ -180,6 +204,12 @@ with LiteGrip("can0") as gripper:
 - **方向约定是数据，不是开关。** SDK 假定 rad 增大即闭合，两端极限都存在标定文件里。如果
   `pos_open_rad >= pos_closed_rad`，配置会被拒绝并抛 `CommandError`，因为此时 SDK 的
   clamp 是错的。
+- **压紧力矩是有界的。** 行进段的 `max_lead_mm` 上限约 5 Nm；压紧段的 `stop_lead_mm` 上限
+  约 `kp × stop_lead_mm / rad_to_mm` —— 默认（`kp=100`、`stop_lead_mm=1.0`、`rad_to_mm≈73.7`）
+  约 `1.4 Nm`，远在额定 3 Nm 以内。压不实就往上调 `stop_lead_mm`，调到能稳定压住、又听不到
+  撞击声为止；默认值只是算术结果，不是真机实测值，必须在真机上确认。
+- **持续压紧会让线圈发热。** `open` 和 `close` 现在每次都顶着限位走完保压段，连续跑要留意
+  线圈温度。
 - **`open`、`close`、`grasp`、`zero` 会主动撞向机械限位或持续施力。** 除非就是要夹它，
   否则手和物体别留在行程里；跑 `zero()` 前先把夹爪托住。
 - **断连默认会失能**，所以进程崩了不会留下电机一直顶着力。只有在别的东西还在管着夹爪时，
@@ -200,13 +230,16 @@ with LiteGrip("can0") as gripper:
 | 每次调用传增益，如 `close(kp=150.0)` | 增益归 `GripperConfig`，运动可调量归 `MotionConfig` |
 | — | `zero()`、`gripper.actions`、`gripper.motion_config`、`disable_on_disconnect` 都是新增 |
 
-除了签名，还有两处行为变化要注意：
+除了签名，还有三处行为变化要注意：
 
 - `enable()` 现在会如实报失败。以前只要状态帧是 `0` 或 `1` 它就返回 `True`，于是「根本没
   使能」的电机看起来是使能的。那些忽略返回值继续往下跑的代码，现在会在启动时看到
   `HardwareError`。
 - `zero()` 不等于 `calibrate()`。它按 `MotionConfig.calib_*` 的参数探测并保存结果，而
   `calibrate()` 保留着自己那套更旧的默认值，而且不存盘。
+- `MoveResult.__bool__` 以前是 `reached and not stalled`，现在是 `ok`。对 `grasp` 闭合段
+  两者一致；对 `open` 和 `close` 恰好相反 —— 成功顶到限位是 `stalled=True,
+  reached=False`，所以 `if gripper.close():` 的含义变了，尽管类型没变。
 
 ## 开发
 

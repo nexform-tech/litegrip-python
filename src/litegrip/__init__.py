@@ -71,6 +71,7 @@ from .actions import (
     EnableResult,
     GripperActions,
     limit_target,
+    press_target,
 )
 
 # ── Data models ─────────────────────────────────────────────────────────
@@ -121,6 +122,7 @@ __all__ = [
     "EnableResult",
     "GripperActions",
     "limit_target",
+    "press_target",
     # Models
     "GripperState",
     "GripperConfig",

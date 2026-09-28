@@ -5,7 +5,8 @@ from __future__ import annotations
 import unittest
 
 import _sdkpath  # noqa: F401
-from litegrip import CommandError, GraspResult, MotionConfig, limit_target
+from litegrip import (CommandError, GraspResult, MotionConfig, limit_target,
+                      press_target)
 from litegrip.actions import GripperActions
 
 from fake_can import (DT, POS_CLOSED_RAD, POS_OPEN_RAD, RAD_TO_MM,
@@ -13,6 +14,15 @@ from fake_can import (DT, POS_CLOSED_RAD, POS_OPEN_RAD, RAD_TO_MM,
 
 SPEED_MM_S = 50.0
 SPEED_RAD_S = SPEED_MM_S / RAD_TO_MM          # ≈ 0.674 rad/s
+TRAVEL_RAD = abs(POS_CLOSED_RAD - POS_OPEN_RAD)
+
+
+def press_caps(g):
+    """引擎算出来的 ``(行进段领先上限, 压紧段领先上限)`` rad。"""
+    cfg = g.motion_config
+    min_cap = SPEED_RAD_S * cfg.frame_interval
+    return (max(cfg.max_lead_mm / RAD_TO_MM, min_cap),
+            max(cfg.stop_lead_mm / RAD_TO_MM, min_cap))
 
 
 class TestLimitTarget(unittest.TestCase):
@@ -20,7 +30,7 @@ class TestLimitTarget(unittest.TestCase):
 
     def test_margin_on_both_ends(self):
         g, _ = make_gripper()
-        travel = abs(POS_CLOSED_RAD - POS_OPEN_RAD)
+        travel = TRAVEL_RAD
 
         target, limit, margin_rad, got_travel = limit_target(
             g.config, "close", 0.05)
@@ -41,43 +51,77 @@ class TestLimitTarget(unittest.TestCase):
             limit_target(g.config, "close", 0.05)
 
 
-class TestRamp(unittest.TestCase):
-    """3 / 4 / 5：空载斜坡的形状。"""
+class TestPressTarget(unittest.TestCase):
+    """open/close 的目标在标定限位**外侧**，不是内侧。"""
 
-    def test_close_reaches_target(self):
-        g, fake = make_gripper()
+    def test_target_overshoots_the_limit(self):
+        g, _ = make_gripper()
+
+        target, limit, over_rad, travel = press_target(g.config, "close", 0.05)
+        self.assertAlmostEqual(limit, POS_CLOSED_RAD)
+        self.assertAlmostEqual(travel, TRAVEL_RAD)
+        self.assertAlmostEqual(over_rad, 0.05 * TRAVEL_RAD)
+        # 越过去，而不是退回来 —— 与 limit_target 方向相反
+        self.assertGreater(target, limit)
+        self.assertAlmostEqual(target - limit, 0.05 * TRAVEL_RAD)
+
+        target, limit, _, _ = press_target(g.config, "open", 0.05)
+        self.assertAlmostEqual(limit, POS_OPEN_RAD)
+        self.assertLess(target, limit)
+
+    def test_inverted_convention_raises(self):
+        g, _ = make_gripper()
+        g.config.pos_open_rad, g.config.pos_closed_rad = (
+            POS_CLOSED_RAD, POS_OPEN_RAD)
+        with self.assertRaises(CommandError):
+            press_target(g.config, "close", 0.05)
+
+
+class TestRamp(unittest.TestCase):
+    """3 / 4 / 5：空载斜坡的形状（顶限位）。"""
+
+    def test_close_presses_onto_the_stop(self):
+        g, fake = make_gripper(stops=True)
         self.assertIsInstance(g.actions, GripperActions)
         res = g.close(SPEED_MM_S)
-        self.assertTrue(res.reached, res)
-        self.assertFalse(res.stalled, res)
-        self.assertLess(abs(fake.motor.pos - res.target_rad), 0.02)
 
-    def test_frame_count_matches_ramp_plus_settle(self):
-        g, fake = make_gripper()
-        target, ramp_steps, settle_steps, total = planned_steps(g, SPEED_MM_S)
+        self.assertTrue(res.ok, res)
+        self.assertTrue(res.stalled, res)             # 成功 = 撞到限位
+        self.assertFalse(res.reached, res)            # 目标在限位外侧，到不了
+        self.assertAlmostEqual(res.limit_rad, POS_CLOSED_RAD)
+        self.assertLess(abs(res.state.position_rad - POS_CLOSED_RAD),
+                        g.motion_config.stop_tol)
+
+    def test_open_presses_onto_the_other_stop(self):
+        g, fake = make_gripper(start_rad=POS_CLOSED_RAD, stops=True)
+        res = g.open(SPEED_MM_S)
+
+        self.assertTrue(res.ok, res)
+        self.assertAlmostEqual(res.limit_rad, POS_OPEN_RAD)
+        self.assertLess(abs(res.state.position_rad - POS_OPEN_RAD),
+                        g.motion_config.stop_tol)
+        self.assertAlmostEqual(
+            res.target_rad, POS_OPEN_RAD - 0.05 * TRAVEL_RAD)
+        self.assertAlmostEqual(fake.frames[0].dq, -SPEED_RAD_S)  # 张开 = -rad
+
+    def test_stall_ends_the_move_before_the_settle_is_over(self):
+        g, fake = make_gripper(stops=True)
+        _, ramp_steps, _, total = planned_steps(g, SPEED_MM_S, press=True)
         res = g.close(SPEED_MM_S)
-        self.assertEqual(res.steps, total)
-        self.assertEqual(len(fake.frames), total)
-        self.assertGreater(settle_steps, 1)          # 保压段确实存在
+
+        self.assertEqual(res.steps, len(fake.frames))
+        self.assertGreaterEqual(res.steps, ramp_steps)   # 没在半路停
+        self.assertLess(res.steps, total)                # 也没白跑完保压段
 
     def test_velocity_feedforward_only_during_ramp(self):
-        g, fake = make_gripper()
-        _, ramp_steps, _, total = planned_steps(g, SPEED_MM_S)
+        g, fake = make_gripper(stops=True)
+        _, ramp_steps, _, _ = planned_steps(g, SPEED_MM_S, press=True)
         g.close(SPEED_MM_S)
 
         self.assertAlmostEqual(fake.frames[0].dq, SPEED_RAD_S)   # 闭合 = +rad
         self.assertAlmostEqual(fake.frames[ramp_steps - 1].dq, SPEED_RAD_S)
         for f in fake.frames[ramp_steps:]:
             self.assertEqual(f.dq, 0.0)
-        self.assertEqual(len(fake.frames), total)
-
-    def test_open_runs_the_other_way(self):
-        g, fake = make_gripper(start_rad=POS_CLOSED_RAD)
-        res = g.open(SPEED_MM_S)
-        self.assertTrue(res.reached, res)
-        self.assertAlmostEqual(res.target_rad,
-                               POS_OPEN_RAD + 0.05 * abs(POS_CLOSED_RAD - POS_OPEN_RAD))
-        self.assertAlmostEqual(fake.frames[0].dq, -SPEED_RAD_S)  # 张开 = -rad
 
 
 class TestLeadCapAndStall(unittest.TestCase):
@@ -89,45 +133,89 @@ class TestLeadCapAndStall(unittest.TestCase):
         g, fake = make_gripper(block_rad=block)
         res = g.close(SPEED_MM_S)
 
-        cfg = g.motion_config
-        lead_cap_rad = max(cfg.max_lead_mm / RAD_TO_MM, SPEED_RAD_S * DT)
+        travel_cap, _ = press_caps(g)
         leads = [abs(f.q - f.pos_after) for f in fake.frames]
-        self.assertLessEqual(max(leads), lead_cap_rad + 1e-9)
-        self.assertAlmostEqual(max(leads), lead_cap_rad, places=6)
+        self.assertLessEqual(max(leads), travel_cap + 1e-9)
+        self.assertAlmostEqual(max(leads), travel_cap, places=6)
 
         # 被挡住后力矩正好是 kp × 领先上限，且远小于协议上限 10 Nm
         max_tau = max(abs(f.tau_nm) for f in fake.frames)
-        self.assertAlmostEqual(max_tau, g.config.kp * lead_cap_rad, places=4)
+        self.assertAlmostEqual(max_tau, g.config.kp * travel_cap, places=4)
         self.assertLess(max_tau, 10.0)
 
         self.assertTrue(res.stalled, res)
         self.assertFalse(res.reached, res)
+        # 堵在离限位很远的地方 = 半路被挡，不算「顶到限位」
+        self.assertFalse(res.ok, res)
 
     def test_mid_ramp_stall_stops_early(self):
         block = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2
         g, fake = make_gripper(block_rad=block)
-        _, _, _, total = planned_steps(g, SPEED_MM_S)
+        _, _, _, total = planned_steps(g, SPEED_MM_S, press=True)
         res = g.close(SPEED_MM_S)
 
         self.assertTrue(res.stalled, res)
+        self.assertFalse(res.ok, res)
         self.assertLess(res.steps, total)
         self.assertAlmostEqual(fake.motor.pos, block, places=6)
 
 
-class TestStallFalsePositives(unittest.TestCase):
-    """8 / 9：粘滑和保压段都不能误判堵转。"""
+class TestPressZone(unittest.TestCase):
+    """顶限位的力矩是**有界**的：压紧段收窄到 stop_lead_mm。"""
 
-    def test_sticky_dead_band_is_not_a_stall(self):
-        # 闭合侧实测约 0.0103 rad 一跳的粘滑；窗口净位移仍远大于阈值
-        g, _ = make_gripper(sticky_rad=0.0103)
+    def test_pressing_torque_is_under_the_rating(self):
+        g, fake = make_gripper(stops=True)
         res = g.close(SPEED_MM_S)
-        self.assertFalse(res.stalled, res)
-        self.assertTrue(res.reached, res)
+        _, stop_cap = press_caps(g)
 
-    def test_settle_phase_is_not_a_stall(self):
+        max_tau = max(abs(f.tau_nm) for f in fake.frames)
+        self.assertAlmostEqual(max_tau, g.config.kp * stop_cap, places=4)
+        self.assertLess(max_tau, 3.0)                 # DM4310 额定 3 Nm
+        self.assertTrue(res.ok, res)
+
+    def test_travel_phase_uses_the_wider_cap(self):
+        # 同一个默认配置：半路被挡 → max_lead_mm；顶到限位 → stop_lead_mm
+        g_stop, fake_stop = make_gripper(stops=True)
+        g_stop.close(SPEED_MM_S)
+        tau_press = max(abs(f.tau_nm) for f in fake_stop.frames)
+
+        g_block, fake_block = make_gripper(block_rad=POS_OPEN_RAD + 0.01)
+        g_block.close(SPEED_MM_S)
+        tau_travel = max(abs(f.tau_nm) for f in fake_block.frames)
+
+        self.assertLess(tau_press, tau_travel)
+
+    def test_settle_phase_command_is_capped_too(self):
+        # 保压段的指令在限位外侧：不切上限的话领先会涨到 kp × 越位量
+        g, fake = make_gripper(stops=True)
+        _, ramp_steps, _, _ = planned_steps(g, SPEED_MM_S, press=True)
+        g.close(SPEED_MM_S)
+
+        _, stop_cap = press_caps(g)
+        tail = fake.frames[ramp_steps:]
+        self.assertTrue(tail)                          # 确实进了保压段
+        self.assertLessEqual(
+            max(abs(f.q - f.pos_after) for f in tail), stop_cap + 1e-9)
+
+
+class TestStallFalsePositives(unittest.TestCase):
+    """8 / 9：粘滑不能误判堵转；非顶限位路径的保压段不算堵转。"""
+
+    def test_sticky_dead_band_does_not_stall_mid_travel(self):
+        # 闭合侧实测约 0.0103 rad 一跳的粘滑；窗口净位移仍远大于阈值
+        g, _ = make_gripper(sticky_rad=0.0103, stops=True)
+        _, ramp_steps, _, _ = planned_steps(g, SPEED_MM_S, press=True)
+        res = g.close(SPEED_MM_S)
+
+        self.assertGreaterEqual(res.steps, ramp_steps)  # 一路走到限位才停
+        self.assertTrue(res.ok, res)
+
+    def test_settle_phase_is_not_a_stall_without_press(self):
+        # grasp 的闭合段（press=False）停在限位内侧，保压段不该判堵转
         g, fake = make_gripper()
         _, ramp_steps, settle_steps, total = planned_steps(g, SPEED_MM_S)
-        res = g.close(SPEED_MM_S)
+        res = g.actions._move_to_limit("close", SPEED_MM_S)
+
         self.assertFalse(res.stalled, res)
         self.assertEqual(res.steps, total)           # 跑满，没提前退
 
@@ -143,18 +231,36 @@ class TestReachTolerance(unittest.TestCase):
 
     def _close_short(self, reach_tol):
         g, fake = make_gripper()
-        target, _, _, _ = planned_steps(g, SPEED_MM_S)
+        target, _, _, _ = planned_steps(g, SPEED_MM_S)     # 非顶限位目标
         # 挡在目标前 0.0103 rad（实测闭合侧的机械死区）
         fake.motor.set_block(target - 0.0103)
         g.motion_config = MotionConfig(
             sleep_fn=lambda _: None, reach_tol=reach_tol)
-        return g.close(SPEED_MM_S)
+        return g.actions._move_to_limit("close", SPEED_MM_S)
 
     def test_default_tolerance_accepts(self):
         self.assertTrue(self._close_short(0.02).reached)
 
     def test_tight_tolerance_rejects(self):
         self.assertFalse(self._close_short(0.01).reached)
+
+
+class TestMoveResultBool(unittest.TestCase):
+    """``bool(MoveResult)`` 是 ``ok``，不是旧的 ``reached and not stalled``。"""
+
+    def test_press_success_is_truthy_though_it_stalled(self):
+        g, _ = make_gripper(stops=True)
+        res = g.close(SPEED_MM_S)
+        self.assertTrue(res.stalled)
+        self.assertFalse(res.reached)
+        self.assertEqual(bool(res), res.ok)
+        self.assertTrue(bool(res))
+
+    def test_blocked_halfway_is_falsy(self):
+        g, _ = make_gripper(block_rad=POS_OPEN_RAD + 0.01)
+        res = g.close(SPEED_MM_S)
+        self.assertEqual(bool(res), res.ok)
+        self.assertFalse(bool(res))
 
 
 class TestGrasp(unittest.TestCase):
