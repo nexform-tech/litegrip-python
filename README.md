@@ -47,7 +47,7 @@ sudo ip link set can0 up
 from litegrip import LiteGrip
 
 with LiteGrip(channel="can0", can_id=0x08) as gripper:
-    gripper.load_calibration()   # site calibration, falling back to the factory one
+    gripper.load_calibration()   # this channel's own file, then the factory one
     gripper.enable()             # retries until the status frame reports err == 1
 
     gripper.open()                                     # 50 mm/s to the open-side stop
@@ -69,28 +69,45 @@ the ordering of the two calibrated limits, so both mounting work (see
 `GripperConfig.close_sign`). What it *does* refuse to do is guess: until a
 calibration is loaded, the motion actions raise `CommandError`.
 
-Declare the direction by loading the matching template. Both ship with the
-package, and both are nominal — they label the direction and give a plausible
-stroke, which `zero()` then replaces with the measurement:
+Declare the direction by name. `list_templates()` returns the choices, in order,
+for a UI to offer; `mount=` loads the picked one:
 
 ```python
-from litegrip import CALIB_TEMPLATES, LiteGrip
+from litegrip import LiteGrip, list_templates
 
-with LiteGrip("can1") as gripper:
-    gripper.load_calibration(CALIB_TEMPLATES["reverse"])   # or "normal"
+list_templates()                       # ["normal", "reverse"] — for a UI
+
+with LiteGrip("can1", mount="reverse") as gripper:
+    print(gripper.mount)               # "reverse" — read back from the limits
     gripper.enable()
-    gripper.zero()          # optional: measure the real travel, save it
+    gripper.zero()                     # optional: measure the real travel, save it
 ```
 
+The same selection is reachable four ways: `LiteGrip(..., mount="reverse")`,
+`gripper.load_template("reverse")`, `gripper.load_calibration(template="reverse")`,
+and — if you already hold the path — `load_calibration(CALIB_TEMPLATES["reverse"])`.
+All four load the identical file. Both templates are nominal: they label the
+direction and give a plausible stroke, which `zero()` then replaces with the
+measurement. A name outside `list_templates()` raises `CommandError` listing the
+valid ones, and a template that cannot be read raises rather than falling back —
+the fallback would be the factory file, and that is a *normal* mount, so answering
+a request for reverse with normal is the one failure the name exists to prevent.
+
 Deciding which is which takes one look: with the jaws visible, run a small move
-and see which way they travel. Choosing the wrong template is not silent — the
+and see which way they travel. Choosing the wrong mount is not silent — the
 derived direction is logged on load, and the first `close()` heads the wrong way.
+Read it back any time from `gripper.mount` (`"normal"` / `"reverse"`, or `None`
+until calibrated).
 
 Every LiteGrip shares the same CAN ID (`0x08`), so **the channel is the only
-identity key** when two sit on one machine: put them on `can0` and `can1` and
-point each at the right file. `load_calibration` warns if a file names a
-different channel than the instance. The templates deliberately carry no channel,
-so they never trip that warning.
+identity key** when two sit on one machine. Calibrations are stored one file per
+channel — `~/.litegrip/<channel>_calibration.json` — so the two never overwrite
+each other, and a no-argument `load_calibration()` reads this channel's own file,
+then the legacy single-file location, then the factory one. A candidate that names
+a *different* channel is skipped there, so a `can1` unit with no calibration of
+its own fails loudly (`False`, then `CommandError` from the motions) instead of
+silently adopting `can0`'s direction. Set `LITEGRIP_CALIB` to pin one explicit
+path for every channel instead.
 
 ## The six actions
 
@@ -287,7 +304,7 @@ instead of bare `bool`s; `__bool__` preserves truthiness, but old positional cal
 | closing assumed to increase radians | either ordering works — `close_sign` is derived; `CALIB_TEMPLATES` declares the mount |
 | `pos_open_rad >= pos_closed_rad` raised `CommandError` | that ordering is a reverse mount; a *never-calibrated* config raises instead (`GripperConfig.calibrated`) |
 
-Two behaviour changes matter beyond the signatures:
+These behaviour changes matter beyond the signatures:
 
 - `enable()` now reports failure honestly. It used to return `True` whenever the status frame
   held `0` or `1`, so a motor that never energised looked enabled. Code that ignored the return
@@ -305,6 +322,19 @@ Two behaviour changes matter beyond the signatures:
 - The pressing lead cap `stop_lead_mm` dropped from `1.0` to `0.7` mm, so `open` and `close` press
   onto the stop with roughly a third of the rated torque instead of half. Raise it back if a unit
   fails to press home.
+- Default `save_calibration()` / `load_calibration()` paths are now per channel —
+  `~/.litegrip/<channel>_calibration.json`, not the single `litegrip_calibration.json`. That old
+  file is still read as a fallback and `LITEGRIP_CALIB` still overrides everything, but a `can0`
+  calibration no longer answers a `can1` load.
+- The automatic load chain skips a candidate whose `channel` names another interface. A `can1`
+  unit with no calibration of its own used to load `can0`'s silently; it now returns `False` and
+  the motions raise `CommandError`. Failing loudly beats moving the wrong way.
+- Loading by name (`mount=` / `load_template`) never falls back to the factory file. An unreadable
+  template raises `CommandError`, because the factory file is a normal mount and falling back
+  would answer "reverse" with "normal".
+- The two templates now carry only direction and geometry (limits, `rad_to_mm`, motor type), not
+  `can_id` / `mst_id` / gains. Loading a mount can no longer rewrite the CAN IDs you passed or a
+  tuned `kp`/`kd`. `CALIB_TEMPLATES` and its keys are unchanged.
 
 ## Development
 

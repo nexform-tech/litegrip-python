@@ -7,11 +7,15 @@ import io
 import json
 import logging
 import os
+import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import _sdkpath  # noqa: F401
-from litegrip import CALIB_TEMPLATES, LiteGrip
+import litegrip.gripper as gripper_mod
+from litegrip import (CALIB_TEMPLATES, LiteGrip, CommandError, GripperConfig,
+                      default_calib_path, list_templates)
 from litegrip.gripper import _FACTORY_CALIB
 
 from fake_can import POS_CLOSED_RAD, POS_OPEN_RAD, make_gripper
@@ -40,6 +44,21 @@ def _write_json(data, directory):
     with open(path, "w") as f:
         json.dump(data, f)
     return path
+
+
+@contextlib.contextmanager
+def _patched_calib_env(home, legacy=None):
+    """把 ``HOME`` 与 ``DEFAULT_CALIB`` 都指到临时目录，屏蔽真机标定。
+
+    ``LITEGRIP_CALIB`` 优先于 ``HOME``，所以一律清掉；``DEFAULT_CALIB`` 是
+    导入期算好的常量，必须 patch 模块属性而不是环境变量。``patch.dict`` 会
+    整份快照环境，退出时把清掉的那把键也一并还原。
+    """
+    target = legacy if legacy is not None else os.path.join(home, "missing.json")
+    with mock.patch.dict(os.environ, {"HOME": home}, clear=False):
+        os.environ.pop("LITEGRIP_CALIB", None)
+        with mock.patch.object(gripper_mod, "DEFAULT_CALIB", target):
+            yield
 
 
 class TestDirectionTemplates(unittest.TestCase):
@@ -184,6 +203,155 @@ class TestHomeDirection(unittest.TestCase):
         g, target = self._home_target(reverse=True)
         self.assertAlmostEqual(target, POS_OPEN_RAD)
         self.assertAlmostEqual(target, g.config.pos_closed_rad)
+
+
+class TestTemplateSelection(unittest.TestCase):
+    """按名字选模板：四个入口互相同义，装法读得回来。"""
+
+    def test_list_templates_names_and_order(self):
+        self.assertEqual(list_templates(), ["normal", "reverse"])
+
+    def test_load_template_equals_load_calibration_kwarg(self):
+        by_method = LiteGrip("can0")
+        by_method.load_template("reverse")
+        by_kwarg = LiteGrip("can0")
+        by_kwarg.load_calibration(template="reverse")
+        self.assertAlmostEqual(by_method.config.close_sign, -1.0)
+        self.assertAlmostEqual(by_kwarg.config.close_sign, -1.0)
+
+    def test_constructor_declares_the_mount(self):
+        g = LiteGrip("can1", mount="reverse")
+        self.assertEqual(g.mount, "reverse")
+        self.assertEqual(g.config.mount, "reverse")
+
+    def test_mount_is_none_until_calibrated(self):
+        g = LiteGrip("can0")
+        self.assertIsNone(g.mount)
+        self.assertIsNone(g.config.mount)
+
+    def test_mount_reads_back_each_template(self):
+        normal, reverse = LiteGrip("can0"), LiteGrip("can0")
+        normal.load_template("normal")
+        reverse.load_template("reverse")
+        self.assertEqual(normal.config.mount, "normal")
+        self.assertEqual(reverse.config.mount, "reverse")
+
+    def test_unknown_name_lists_the_valid_ones(self):
+        with self.assertRaises(CommandError) as ctx:
+            LiteGrip("can0").load_template("sideways")
+        msg = str(ctx.exception)
+        self.assertIn("normal", msg)
+        self.assertIn("reverse", msg)
+
+    def test_path_and_template_are_mutually_exclusive(self):
+        with self.assertRaises(CommandError):
+            LiteGrip("can0").load_calibration("/tmp/x.json", template="reverse")
+
+
+class TestTemplateDoesNotClobber(unittest.TestCase):
+    """模板只带方向与几何 —— 声明装法不能改写身份或调好的增益。"""
+
+    def test_explicit_can_id_survives(self):
+        self.assertEqual(LiteGrip("can1", can_id=0x0A, mount="reverse").can_id,
+                         0x0A)
+
+    def test_auto_master_id_is_not_pinned(self):
+        """``mst_id=None`` 仍走自动探测；模板里没有这个键就不该被写死。"""
+        self.assertIsNone(LiteGrip("can1", mount="reverse").mst_id)
+
+    def test_tuned_gains_survive(self):
+        cfg = GripperConfig()
+        cfg.kp, cfg.kd = 321.0, 4.5
+        g = LiteGrip("can1", config=cfg, mount="reverse")
+        self.assertAlmostEqual(g.config.kp, 321.0)
+        self.assertAlmostEqual(g.config.kd, 4.5)
+
+    def test_unreadable_template_is_strict(self):
+        """模板读不出来时**不得**回退到正装的出厂文件。"""
+        with mock.patch.dict(CALIB_TEMPLATES,
+                             {"reverse": os.path.join("no", "such.json")}):
+            g = LiteGrip("can0")
+            with self.assertRaises(CommandError):
+                g.load_template("reverse")
+        self.assertFalse(g.config.calibrated)
+
+
+class TestPerChannelPaths(unittest.TestCase):
+    """一台电脑两台夹爪：标定各存各的，自动加载按通道认领。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def _seed(self, name, data):
+        path = os.path.join(self.dir, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f)
+        return path
+
+    def test_default_path_is_per_channel(self):
+        with _patched_calib_env(self.dir):
+            self.assertTrue(default_calib_path("can1").endswith(
+                os.path.join(".litegrip", "can1_calibration.json")))
+
+    def test_env_override_wins_over_the_channel_file(self):
+        with _patched_calib_env(self.dir):
+            with mock.patch.dict(os.environ, {"LITEGRIP_CALIB": "/tmp/x.json"}):
+                self.assertEqual(default_calib_path("can1"), "/tmp/x.json")
+
+    def test_no_arg_save_lands_in_the_channel_file(self):
+        with _patched_calib_env(self.dir):
+            g = LiteGrip("can1")
+            g.load_template("reverse")
+            written = g.save_calibration()
+            self.assertTrue(written.endswith("can1_calibration.json"))
+            self.assertTrue(os.path.exists(written))
+
+    def test_auto_load_prefers_the_channel_file_over_the_legacy_one(self):
+        legacy = self._seed("legacy.json", {
+            "channel": "can1", "calibrated": True,
+            "zero_position_rad": 0.114, "max_position_rad": -1.491,
+            "rad_to_mm": 74.8})
+        with _patched_calib_env(self.dir, legacy=legacy):
+            self._seed(os.path.join(".litegrip", "can1_calibration.json"), {
+                "channel": "can1", "calibrated": True,
+                "zero_position_rad": -1.491, "max_position_rad": 0.114,
+                "rad_to_mm": 74.8})
+            g = LiteGrip("can1")
+            self.assertTrue(g.load_calibration())
+            self.assertAlmostEqual(g.config.close_sign, -1.0)
+
+    def test_auto_load_skips_another_channels_file(self):
+        can0_file = self._seed("legacy.json", {
+            "channel": "can0", "calibrated": True,
+            "zero_position_rad": 0.114, "max_position_rad": -1.491,
+            "rad_to_mm": 74.8})
+        with _patched_calib_env(self.dir, legacy=can0_file):
+            self.assertFalse(LiteGrip("can1").load_calibration())
+
+    def test_isolated_home_finds_nothing_and_says_so(self):
+        # ~/.litegrip/litegrip_calibration.json 在真机上真实存在，这条确保
+        # 测试不会悄悄读到它。
+        with _patched_calib_env(self.dir):
+            g = LiteGrip("can1")
+            warnings = _capture_warnings(lambda: g.load_calibration())
+            self.assertTrue(any("No calibration found" in m for m in warnings),
+                            warnings)
+            self.assertFalse(g.config.calibrated)
+
+    def test_explicit_mismatch_still_warns_and_loads(self):
+        """显式指定文件是调用方的主动覆盖，语义仍是「警告但加载」。"""
+        path = self._seed("other.json", {
+            "channel": "can1", "calibrated": True,
+            "zero_position_rad": 0.1, "max_position_rad": -1.5,
+            "rad_to_mm": 74.8})
+        with _patched_calib_env(self.dir):
+            g = LiteGrip("can0")
+            warnings = _capture_warnings(lambda: g.load_calibration(path))
+            self.assertTrue(any("channel" in m for m in warnings), warnings)
+            self.assertTrue(g.config.calibrated)
+            self.assertAlmostEqual(g.config.close_sign, 1.0)
 
 
 if __name__ == "__main__":

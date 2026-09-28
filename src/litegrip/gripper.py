@@ -29,7 +29,7 @@ import select as _select_mod
 import sys
 import time
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 from .can.motor import MotorType
 from .protocols.can_bus import LiteGripCAN
@@ -52,20 +52,32 @@ _FACTORY_CALIB = _os.path.join(_os.path.dirname(__file__), "factory_calibration.
 # zero() to measure the real travel.  Pick one by eye after watching which way
 # the jaws move::
 #
-#     gripper.load_calibration(CALIB_TEMPLATES["reverse"])
+#     gripper.load_calibration(CALIB_TEMPLATES["reverse"])   # by path
+#     gripper.load_template("reverse")                       # or by name
+#
+# They deliberately carry no `channel`, `can_id`, `mst_id` or gain values: a
+# template declares a *direction*, and adopting a device identity or a tuned
+# kp/kd from it would silently rewrite what the caller set.  Use
+# :func:`list_templates` to enumerate the names for a UI.
 CALIB_TEMPLATES = {
     "normal": _os.path.join(_os.path.dirname(__file__), "calibration_normal.json"),
     "reverse": _os.path.join(_os.path.dirname(__file__), "calibration_reverse.json"),
 }
 
+# The pre-per-channel location, kept so a calibration saved by an older
+# version still loads.  DEFAULT_CALIB keeps its historical value (env override
+# included); it is now the *legacy* entry of the automatic load chain rather
+# than the primary one.
+_LEGACY_CALIB_PATH = _os.path.join(
+    _os.path.expanduser("~"), ".litegrip", "litegrip_calibration.json")
+
 # Default user calibration path — a stable absolute location so that a
 # calibration saved without an explicit path is picked up on the next load
 # without an explicit path, regardless of the process working directory.
 # Override with the LITEGRIP_CALIB env var if desired.
-DEFAULT_CALIB = _os.environ.get(
-    "LITEGRIP_CALIB",
-    _os.path.join(_os.path.expanduser("~"), ".litegrip", "litegrip_calibration.json"),
-)
+DEFAULT_CALIB = _os.environ.get("LITEGRIP_CALIB", _LEGACY_CALIB_PATH)
+
+
 from .models import (
     GripperState,
     GripperConfig,
@@ -80,11 +92,62 @@ from .constants import (
     describe_error,
 )
 from .exceptions import (
+    CommandError,
     ConnectError,
     CommError,
     HardwareError,
     NotInitializedError,
 )
+
+
+def default_calib_path(channel: str = DefaultParams.CAN_CHANNEL) -> str:
+    """Where a calibration for *channel* is saved and read back by default.
+
+    One gripper per channel, one file per channel —
+    ``~/.litegrip/<channel>_calibration.json``.  A single shared file let two
+    grippers on one machine (``can0`` / ``can1``, both at CAN ID 0x08)
+    overwrite each other's direction and travel.
+
+    ``LITEGRIP_CALIB``, when set, overrides this with one explicit path for
+    every channel.  ``HOME`` and the env var are read per call, so a caller
+    (or a test) can redirect them.
+    """
+    env = _os.environ.get("LITEGRIP_CALIB")
+    if env:
+        return env
+    return _os.path.join(_os.path.expanduser("~"), ".litegrip",
+                         f"{channel}_calibration.json")
+
+
+def list_templates() -> List[str]:
+    """The calibration template names, in declaration order (normal first).
+
+    For a UI that has to offer the mount as a choice.
+    """
+    return list(CALIB_TEMPLATES)
+
+
+def _resolve_template(name: str) -> str:
+    """Template *name* → path.  Unknown names are a hard error."""
+    try:
+        return CALIB_TEMPLATES[name]
+    except KeyError:
+        raise CommandError(
+            f"未知的标定模板 {name!r}；可用的是 "
+            f"{', '.join(repr(n) for n in CALIB_TEMPLATES)}"
+            f"（也可以直接给文件路径）。") from None
+
+
+def _dedupe(paths: List[str]) -> List[str]:
+    """Drop repeats, keep order — ``LITEGRIP_CALIB`` can alias several entries."""
+    seen = set()
+    out: List[str] = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
 
 log = logging.getLogger("litegrip")
 
@@ -114,6 +177,14 @@ class LiteGrip:
         ``True`` (default) → :meth:`disconnect` sends a disable command first,
         so the gripper goes limp when the object is released.  Set ``False``
         to leave the motor enabled after disconnecting.
+    mount:
+        Template name declaring which way this unit is mounted —
+        ``"normal"`` or ``"reverse"`` (see :data:`CALIB_TEMPLATES` and
+        :func:`list_templates`).  Loads that template immediately, so
+        ``LiteGrip("can1", mount="reverse")`` is all a two-gripper setup
+        needs.  ``None`` (default) loads nothing; call
+        :meth:`load_calibration` yourself.  This *declares* the mount; read
+        the resulting direction back from :attr:`GripperConfig.mount`.
 
     The gripper works as a context manager::
 
@@ -132,6 +203,7 @@ class LiteGrip:
         config: Optional[GripperConfig] = None,
         motion_config: Optional[MotionConfig] = None,
         disable_on_disconnect: bool = True,
+        mount: Optional[str] = None,
     ):
         cfg = config or GripperConfig()
         self._channel = channel if channel != DefaultParams.CAN_CHANNEL or config is None else cfg.can_channel
@@ -147,6 +219,13 @@ class LiteGrip:
         self._connected = False
         self._status_flags = GripperStatus.NONE
         self._actions = GripperActions(self, motion_config)
+
+        # Declaring the mount is just loading the matching template, so it
+        # costs no CAN traffic and is safe this early.  The template carries
+        # only a direction and geometry, so it cannot clobber the identity
+        # arguments above or a tuned config.
+        if mount is not None:
+            self.load_template(mount)
 
     # ═══════════════════════════════════════════════════════════════════
     # Properties
@@ -175,6 +254,17 @@ class LiteGrip:
     @property
     def config(self) -> GripperConfig:
         return self._config
+
+    @property
+    def mount(self) -> Optional[str]:
+        """``"normal"`` / ``"reverse"``, or ``None`` while uncalibrated.
+
+        Read back from the loaded limits (see
+        :attr:`~litegrip.GripperConfig.mount`) — not necessarily the name
+        that was *declared*, since a calibration run keeps the direction but
+        rewrites the travel.
+        """
+        return self._config.mount
 
     @property
     def actions(self) -> GripperActions:
@@ -773,19 +863,22 @@ class LiteGrip:
         """Save current calibration and settings to a JSON file.
 
         Args:
-            path: Destination file. When omitted, saves to the default user
-                  calibration path (:data:`DEFAULT_CALIB`), which is the same
-                  location :meth:`load_calibration` reads by default — so a
-                  calibration saved here is picked up automatically next run.
-                  The factory calibration shipped with the SDK is never
-                  overwritten; back it up separately if needed.
+            path: Destination file. When omitted, saves to this channel's own
+                  path (:func:`default_calib_path`, i.e.
+                  ``~/.litegrip/<channel>_calibration.json``) — the file
+                  :meth:`load_calibration` reads by default, so a calibration
+                  saved here is picked up automatically next run.  One file
+                  per channel is what keeps two grippers on one machine from
+                  overwriting each other.  The factory calibration shipped
+                  with the SDK is never overwritten; back it up separately if
+                  needed.
 
         Returns:
             The absolute path the calibration was written to.
         """
         import json
         if path is None:
-            path = DEFAULT_CALIB
+            path = default_calib_path(self._channel)
         data = {
             "channel": self._channel,
             "can_id": self._can_id,
@@ -811,53 +904,95 @@ class LiteGrip:
         log.info("Calibration saved to %s", path)
         return path
 
-    def load_calibration(self, path: Optional[str] = None) -> bool:
+    def load_calibration(self, path: Optional[str] = None,
+                         template: Optional[str] = None) -> bool:
         """Load calibration from a JSON file into :attr:`config`.
 
-        Tries *path* first (typically a user calibration from a previous
-        run).  If that file does not exist, falls back to the built-in
-        factory calibration shipped with the SDK.
+        Three ways to say which file, and they are mutually exclusive:
+
+        * ``template="reverse"`` — a name from :data:`CALIB_TEMPLATES`
+          (:func:`list_templates`).  Strict: if that template cannot be read
+          this raises instead of falling back, because the fallback would be
+          the factory file, and that file is a *normal* mount — answering a
+          request for reverse with normal is the one failure the name exists
+          to prevent.
+        * ``path=...`` — an explicit file, which may be anywhere (including a
+          template's path).  Falls back to the built-in factory calibration
+          if it cannot be read.
+        * neither — this channel's own file (:func:`default_calib_path`),
+          then the legacy single-file location (:data:`DEFAULT_CALIB`), then
+          the factory one.  A candidate whose ``channel`` names a different
+          interface is *skipped*, so a ``can1`` unit with no calibration of
+          its own fails loudly rather than silently adopting ``can0``'s.
 
         Call this after :meth:`connect` but before :meth:`enable`.
 
         The limits in the file decide the direction: whichever of the two is
-        numerically larger is the closed side.  Loading a
-        :data:`CALIB_TEMPLATES` entry is how a reverse-mounted gripper is
-        declared.  The direction the file implies is logged, and a warning is
-        raised if the file names a different CAN channel than this instance —
-        with every gripper sharing the same CAN ID, the channel is what tells
-        two of them apart.
+        numerically larger is the closed side.  Loading a template is how a
+        reverse-mounted gripper is declared, and the direction a file implies
+        is logged.
 
         Args:
-            path: JSON file path. When omitted, reads the default user
-                  calibration path (:data:`DEFAULT_CALIB`) — the same location
-                  :meth:`save_calibration` writes to by default. Falls back to
-                  the read-only factory calibration if neither exists.
+            path: JSON file path.
+            template: Template name (``"normal"`` / ``"reverse"``).
 
         Returns:
-            True if loaded successfully (from either source).
+            True if loaded successfully.
+
+        Raises:
+            CommandError: both *path* and *template* given, an unknown
+                template name, or a readable-but-missing template file.
         """
         import json
 
-        if path is None:
-            path = DEFAULT_CALIB
+        if path is not None and template is not None:
+            raise CommandError(
+                "load_calibration() 的 path 与 template 只能给一个：path 是显式"
+                "文件，template 是 CALIB_TEMPLATES 里的名字。")
 
-        # Try user file first, then factory fallback
-        sources = [path, _FACTORY_CALIB]
+        if template is not None:
+            sources = [_resolve_template(template)]
+            strict = True
+            skip_other_channels = False
+        elif path is not None:
+            sources = [path, _FACTORY_CALIB]
+            strict = False
+            skip_other_channels = False
+        else:
+            sources = _dedupe([default_calib_path(self._channel),
+                               DEFAULT_CALIB, _FACTORY_CALIB])
+            strict = False
+            skip_other_channels = True
+
+        data = None
         loaded_from: str = ""
         for src in sources:
             try:
                 with open(src, "r") as f:
-                    data = json.load(f)
-                log.info("Calibration loaded from %s", src)
-                loaded_from = src
-                break
+                    candidate = json.load(f)
             except (FileNotFoundError, json.JSONDecodeError):
                 continue
-        if not loaded_from:
+            if skip_other_channels:
+                file_channel = candidate.get("channel")
+                if file_channel and self._channel and file_channel != self._channel:
+                    log.info("跳过 %s：它声明的 channel=%s 不是本实例的 %s",
+                             src, file_channel, self._channel)
+                    continue
+            data = candidate
+            loaded_from = src
+            break
+
+        if data is None:
+            if strict:
+                raise CommandError(
+                    f"标定模板 {template!r} 读不出来（{sources[0]}）。不作出厂"
+                    f"回退 —— 出厂文件是正装，用它会静默把方向换成正装。")
             log.warning("No calibration found (tried: %s). "
-                        "Run calibrate_manual.py first.", ", ".join(sources))
+                        "Run zero() first, or load a template.",
+                        ", ".join(sources))
             return False
+
+        log.info("Calibration loaded from %s", loaded_from)
 
         self._config.pos_closed_rad = float(data["zero_position_rad"])
         self._config.pos_open_rad = float(data["max_position_rad"])
@@ -902,6 +1037,25 @@ class LiteGrip:
                  * self._config.rad_to_mm,
                  "正向（rad 增大 = 闭合）" if s > 0 else "反装（rad 减小 = 闭合）")
         return True
+
+    def load_template(self, name: str) -> bool:
+        """Load a pre-made calibration template by name, declaring the mount.
+
+        Names come from :func:`list_templates` (``"normal"`` / ``"reverse"``).
+        Thin wrapper over ``load_calibration(template=name)`` so the name is
+        resolved in one place; see that method for why a template never falls
+        back to the factory file.
+
+        Args:
+            name: Template name.
+
+        Returns:
+            True once loaded.
+
+        Raises:
+            CommandError: unknown name, or the template file is unreadable.
+        """
+        return self.load_calibration(template=name)
 
     # ═══════════════════════════════════════════════════════════════════
     # Motion — high-level
