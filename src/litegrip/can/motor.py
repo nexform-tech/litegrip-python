@@ -7,6 +7,7 @@ arrive on the motor's mst_id.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 
@@ -132,6 +133,28 @@ class MotorState:
     @property
     def last_update(self) -> float:
         return self._last_update
+
+    @property
+    def has_data(self) -> bool:
+        """True once at least one status frame has been decoded.
+
+        A disabled DM motor does not stream status frames on its own, so
+        before the first enable (or after a disable, once the RX buffer
+        drains) there is nothing to read and every value here is still the
+        constructor default — position 0.0 with temperatures 0/0.
+        """
+        return self.rx_count > 0
+
+    @property
+    def data_age_s(self) -> float:
+        """Seconds since the last decoded status frame.
+
+        Returns ``inf`` when no frame has ever arrived, so comparisons like
+        ``data_age_s > threshold`` work without a separate has-data check.
+        """
+        if self.rx_count == 0:
+            return float("inf")
+        return max(0.0, time.monotonic() - self._last_update)
 
     # ── control mode management ─────────────────────────────────────────
 

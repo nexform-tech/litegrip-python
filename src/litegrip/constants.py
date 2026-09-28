@@ -72,19 +72,25 @@ class ErrorCode:
     """Damiao motor error codes (extracted from status frame data[0] >> 4)."""
     DISABLED: Final = 0
     ENABLED: Final = 1
+    OV_FAULT: Final = 0x8
     UV_FAULT: Final = 0x9
     OC_FAULT: Final = 0xA
     MOS_OT: Final = 0xB
     COIL_OT: Final = 0xC
+    COMM_LOSS: Final = 0xD
+    OVERLOAD: Final = 0xE
 
 
 ERROR_DESCRIPTIONS = {
     0x0: "已失能",
     0x1: "已使能",
+    0x8: "过压故障 (OV)",
     0x9: "欠压故障 (UV)",
     0xA: "过流故障 (OC)",
     0xB: "MOS 过温故障",
     0xC: "线圈过温故障",
+    0xD: "通讯丢失 (CAN 超时)",
+    0xE: "过载故障",
 }
 
 

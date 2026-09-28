@@ -54,6 +54,7 @@ DEFAULT_CALIB = _os.environ.get(
     _os.path.join(_os.path.expanduser("~"), ".litegrip", "litegrip_calibration.json"),
 )
 from .models import (
+    STALE_AFTER_S,
     GripperState,
     GripperConfig,
     GripperInfo,
@@ -1294,6 +1295,12 @@ class LiteGrip:
     def get_state(self, wait: bool = True) -> GripperState:
         """Return the current gripper state.
 
+        A disabled motor does not stream status frames on its own, so when no
+        fresh frame arrives the returned snapshot is the last decoded one — or
+        constructor defaults (position 0.0, temperatures 0/0) if none ever
+        arrived.  Check :attr:`GripperState.is_stale` / ``data_age_s`` before
+        trusting the readings, or send a refresh frame first.
+
         Args:
             wait: If True (default), waits up to 50 ms for a fresh status
                   frame.  If False, returns immediately with the last cached
@@ -1310,6 +1317,16 @@ class LiteGrip:
             self._can.update_state(timeout_s=0.05)
         else:
             self._can.poll(timeout_s=0.0)
+
+        motor = self._can.motor
+        data_age_s = motor.data_age_s if motor is not None else float("inf")
+        if wait and data_age_s > STALE_AFTER_S:
+            log.warning(
+                "get_state(): 未收到新状态帧（%s）——返回的是缓存/默认值，"
+                "不是当前测量。失能状态的电机不主动发状态帧。",
+                "从未收到" if data_age_s == float("inf")
+                else f"最近一帧 {data_age_s:.2f}s 前",
+            )
 
         position_rad = self._can.get_position()
         velocity_rad_s = self._can.get_velocity()
@@ -1330,9 +1347,27 @@ class LiteGrip:
             temperature_coil=t_coil,
             error_code=error_code,
             timestamp=time.time(),
+            data_age_s=data_age_s,
             position_mm=position_mm,
             force_n=force_n,
         )
+
+    def refresh_status(self, timeout_s: float = 0.5) -> bool:
+        """Request a status frame from the motor, even while disabled.
+
+        A disabled motor does not stream status frames, so :meth:`get_state`
+        keeps returning cached values (or zeros, before the first enable).
+        This sends the 0xCC refresh command — which the motor answers
+        regardless of enable state — and waits for the reply.  Useful for
+        reading the position before enabling.  No motion, no output change.
+
+        Returns:
+            True if a fresh status frame arrived.
+        """
+        self._check_connected()
+        if self._can is None:
+            return False
+        return self._can.refresh_status(timeout_s=timeout_s)
 
     def get_position(self) -> float:
         """Current position in mm."""

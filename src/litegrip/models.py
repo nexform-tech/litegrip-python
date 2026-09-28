@@ -7,6 +7,11 @@ from enum import IntEnum, IntFlag
 import time
 from typing import Optional
 
+# A status frame older than this is treated as no longer representing the
+# present.  DM motors emit status at ~10 Hz while enabled, so 0.5 s is ~5
+# missed frames; the motor's own CAN-timeout fault trips at ~0.9 s.
+STALE_AFTER_S = 0.5
+
 
 class GripperMode(IntEnum):
     """Gripper control mode."""
@@ -41,9 +46,25 @@ class GripperState:
     error_code: int = 0
     timestamp: float = field(default_factory=time.time)
 
+    # Age of the status frame these values came from; inf = never received.
+    # A disabled motor does not stream status frames, so a state read before
+    # the first enable (or after a disable) holds constructor defaults, not
+    # measurements — check this before trusting position/force/temperature.
+    data_age_s: float = float("inf")
+
     # Convenience — computed from raw values with unit conversion
     position_mm: float = 0.0
     force_n: float = 0.0
+
+    @property
+    def has_data(self) -> bool:
+        """True if at least one status frame has been decoded."""
+        return self.data_age_s != float("inf")
+
+    @property
+    def is_stale(self) -> bool:
+        """True if the snapshot is not backed by a recent status frame."""
+        return self.data_age_s > STALE_AFTER_S
 
     @property
     def is_enabled(self) -> bool:

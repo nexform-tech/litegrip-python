@@ -76,6 +76,10 @@ class FakeMotor:
         self._block_dir = 0.0
         if block_rad is not None:
             self._block_dir = 1.0 if block_rad > pos else -1.0
+        # 状态帧的年龄。假电机一直在线上，所以取 0（= 新鲜）；要模拟
+        # 「失能电机不发状态帧」的用例，把这个值调大即可（见
+        # ``GripperState.is_stale`` / ``STALE_AFTER_S``）。
+        self.data_age_s = 0.0
 
     def reported_pos(self) -> float:
         """上报位置（可量化 —— 模拟闭合侧约 0.0103 rad 的粘滑死区）。"""

@@ -139,11 +139,108 @@ class LiteGripCAN:
             raise CommError(f"注册夹爪电机失败: {e}")
 
     # ═══════════════════════════════════════════════════════════════════
+    # Enable window
+    # ═══════════════════════════════════════════════════════════════════
+    #
+    # In MIT mode the motor continuously executes the last target frame it
+    # received: τ = kp·(q_target − q) + kd·(dq_target − dq) + tau_ff, with
+    # every one of those five values coming from that frame.  The 0xFC enable
+    # command carries no target of its own and does not clear the target
+    # registers — it only re-engages the control loop.  So the instant enable
+    # takes effect, a motor left over from a previous session would resume
+    # driving toward *that* session's target (e.g. you Ctrl+C'd mid-close()
+    # and the register still holds q=closed, kp=100).
+    #
+    # These two helpers close that window: stream zero-gain frames over it,
+    # then leave the motor holding wherever it actually is.
+
+    def _hold_at_current(self, kp: float, kd: float,
+                         duration_s: float = 0.05) -> bool:
+        """Stream hold-position frames at the motor's current position.
+
+        Call this only after a fresh status frame has been decoded — the
+        MotorState default position is 0.0, and holding at 0.0 with a real
+        gain would drive the gripper to a bogus target.
+
+        Leaving "hold where you are" as the last target also makes the *next*
+        enable inherently safe, since that is what the motor resumes from.
+
+        Returns:
+            True if the hold frames were streamed.
+        """
+        if self._controller is None or self._motor is None:
+            return False
+        if self._motor.rx_count == 0:
+            log.warning("Refusing to hold position: no status frame decoded yet")
+            return False
+        return self.control_mit_stream(
+            q_target=self._motor.position, kp=kp, kd=kd,
+            duration_s=duration_s)
+
+    def _enable_and_hold(self, kp: float, kd: float,
+                         timeout_s: float = DefaultParams.INIT_TIMEOUT_S
+                         ) -> Optional[int]:
+        """Enable the motor and leave it holding its current position.
+
+        Sequence: 0xFC enable → streamed zero-gain frames → wait for a fresh
+        status frame → hold at the freshly-read position with *kp*/*kd*.
+
+        Returns:
+            The error code from the first fresh status frame, or None if no
+            feedback arrived within *timeout_s*.
+        """
+        if self._controller is None or self._motor is None:
+            return None
+
+        ctrl = self._controller
+        m = self._motor
+        prev_rx = m.rx_count
+
+        ctrl.enable(m)
+
+        # Zero-gain cover.  Streamed rather than a single frame: everything
+        # else in this SDK streams for the same reason, and here one lost
+        # frame means the motor keeps running the stale target indefinitely
+        # rather than for ~10 ms.
+        self.control_mit_stream(q_target=0.0, kp=0.0, kd=0.0,
+                                duration_s=0.05, interval_s=0.005)
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            # Keep feeding the motor while we wait.  It is ENABLED from the
+            # 0xFC above, and an enabled motor that hears nothing for ~900 ms
+            # latches the 0xD comm-loss fault (measured on hardware) — which
+            # is exactly the fault this wait is supposed to detect, so silence
+            # here manufactures the failure it is looking for.  The 0.05 s
+            # burst before the loop is not long enough to cover a 2 s wait.
+            ctrl.control_mit(m, kp=0, kd=0, q=0, dq=0, tau=0)
+            ctrl.poll(timeout_s=0.01)
+            if m.rx_count > prev_rx:
+                break
+            time.sleep(0.005)
+        else:
+            return None
+
+        # rx_count only advances on a decoded status frame, so m.position is a
+        # real reading from here on.
+        self._hold_at_current(kp, kd)
+        return m.error
+
+    # ═══════════════════════════════════════════════════════════════════
     # Initialization / enable / disable
     # ═══════════════════════════════════════════════════════════════════
 
-    def initialize(self) -> bool:
+    def initialize(self, kp: Optional[float] = None,
+                   kd: Optional[float] = None) -> bool:
         """Full initialization: disable → switch to MIT → enable → verify feedback.
+
+        Once enabled, the motor is left holding its current position (see
+        :meth:`_enable_and_hold`) rather than outputting zero torque, so it
+        cannot jump toward whatever target the previous session left behind.
+
+        Args:
+            kp: Stiffness used for the post-enable hold (default DEFAULT_KP).
+            kd: Damping used for the post-enable hold (default DEFAULT_KD).
 
         Returns:
             True if the motor reports ``err == 1`` (enabled).  ``err == 0``
@@ -159,6 +256,8 @@ class LiteGripCAN:
 
         ctrl = self._controller
         m = self._motor
+        kp = kp if kp is not None else GripperParams.DEFAULT_KP
+        kd = kd if kd is not None else GripperParams.DEFAULT_KD
         last_err = -1
 
         for attempt in range(GripperParams.FAULT_CLEAR_RETRIES):
@@ -172,37 +271,28 @@ class LiteGripCAN:
                     log.warning("switchControlMode verification failed; proceeding anyway")
                 time.sleep(0.05)
 
-                # 3. Enable
-                ctrl.enable(m)
+                # 3+4. Enable, cover the window, verify feedback, then hold
+                #      at the freshly-read position.
+                err = self._enable_and_hold(kp, kd)
 
-                # 4. Send zero-torque MIT frame and poll for feedback
-                prev_rx = m.rx_count
-                ctrl.control_mit(m, kp=0, kd=0, q=0, dq=0, tau=0)
-
-                deadline = time.monotonic() + DefaultParams.INIT_TIMEOUT_S
-                while time.monotonic() < deadline:
-                    ctrl.poll(timeout_s=0.01)
-                    if m.rx_count > prev_rx:
-                        err = m.error
-                        if err == 1:
-                            self._initialized = True
-                            return True
-                        # err == 0 → the enable frame was lost; retry.
-                        # anything else → a real fault; retry after clearing.
-                        last_err = err
-                        break
-                    time.sleep(0.005)
-                else:
+                if err is None:
                     last_err = -2  # timeout, no feedback
+                elif err == 1:
+                    self._initialized = True
+                    return True
+                else:
+                    # err == 0 → the enable frame was lost; retry.
+                    # anything else → a real fault; retry after clearing.
+                    last_err = err
 
             except Exception:
                 last_err = -3
 
-            # Retry: clear fault before next attempt
+            # Retry: clear the fault before the next attempt.  No bare
+            # enable() here — the next iteration disables immediately, and an
+            # uncovered enable is exactly the window this method avoids.
             if attempt < GripperParams.FAULT_CLEAR_RETRIES - 1:
                 ctrl.clear_fault(m)
-                time.sleep(0.005)
-                ctrl.enable(m)
                 time.sleep(0.01)
 
         # All retries exhausted → raise
@@ -222,15 +312,21 @@ class LiteGripCAN:
         else:
             raise HardwareError("初始化失败：所有重试耗尽")
 
-    def enable(self) -> bool:
-        """Send enable command only (no full init). Prefer initialize()."""
+    def enable(self, kp: Optional[float] = None,
+               kd: Optional[float] = None) -> bool:
+        """Send enable command only (no full init). Prefer initialize().
+
+        The motor is left holding its current position once enabled — see
+        :meth:`_enable_and_hold`.
+        """
         if self._controller is None or self._motor is None:
             return False
+        kp = kp if kp is not None else GripperParams.DEFAULT_KP
+        kd = kd if kd is not None else GripperParams.DEFAULT_KD
         try:
-            self._controller.enable(self._motor)
-            self._controller.control_mit(self._motor, kp=0, kd=0, q=0)
-            self._controller.poll(timeout_s=0.05)
-            return self._motor.error in (0, 1)
+            # None (no feedback) fails the membership test, so a silent motor
+            # is no longer reported as a successful enable.
+            return self._enable_and_hold(kp, kd) in (0, 1)
         except Exception:
             return False
 
@@ -253,33 +349,32 @@ class LiteGripCAN:
         """[Deprecated] Use :meth:`clear_fault` instead."""
         return self.clear_fault()
 
-    def clear_fault(self) -> bool:
+    def clear_fault(self, kp: Optional[float] = None,
+                    kd: Optional[float] = None) -> bool:
         """Clear latched fault and re-enable the motor.
 
         Tries two strategies:
         1. Direct clear (0xFB) + enable (0xFC) — works for UV/OC/OT faults
            where the motor is already effectively disabled.
         2. Full disable → clear → enable cycle.
+
+        Both re-enable through :meth:`_enable_and_hold`, so the motor ends up
+        holding its current position instead of resuming a stale target, and a
+        motor that never answers counts as a failure rather than a success.
         """
         if self._controller is None or self._motor is None:
             return False
 
         ctrl = self._controller
         m = self._motor
+        kp = kp if kp is not None else GripperParams.DEFAULT_KP
+        kd = kd if kd is not None else GripperParams.DEFAULT_KD
 
         for _ in range(GripperParams.FAULT_CLEAR_RETRIES):
             # Strategy 1: Direct clear + enable (proven for UV_FAULT)
             ctrl.clear_fault(m)
             time.sleep(0.005)
-            ctrl.enable(m)
-            time.sleep(0.01)
-
-            # Verify
-            ctrl.control_mit(m, kp=0, kd=0, q=0)
-            for _ in range(20):
-                ctrl.poll(timeout_s=0.01)
-                time.sleep(0.003)
-            if m.error in (0, 1):
+            if self._enable_and_hold(kp, kd) in (0, 1):
                 return True
 
             # Strategy 2: Full disable → clear → enable
@@ -287,14 +382,7 @@ class LiteGripCAN:
             time.sleep(0.01)
             ctrl.clear_fault(m)
             time.sleep(0.01)
-            ctrl.enable(m)
-            time.sleep(0.01)
-
-            ctrl.control_mit(m, kp=0, kd=0, q=0)
-            for _ in range(20):
-                ctrl.poll(timeout_s=0.01)
-                time.sleep(0.003)
-            if m.error in (0, 1):
+            if self._enable_and_hold(kp, kd) in (0, 1):
                 return True
 
         return False
@@ -370,6 +458,31 @@ class LiteGripCAN:
         if self._controller is None or self._motor is None:
             return False
         return self._controller.poll_until(self._motor, timeout_s=timeout_s)
+
+    def refresh_status(self, timeout_s: float = 0.5) -> bool:
+        """Request a status frame and wait for it (0xCC refresh command).
+
+        A disabled motor does not stream status frames on its own, so
+        :meth:`update_state` finds nothing and callers read stale/default
+        values.  The refresh command is answered regardless of enable state,
+        which makes the position readable before the first enable.  Sends no
+        motion command and changes no motor output.
+
+        Returns:
+            True if a fresh status frame arrived within *timeout_s*.
+        """
+        if self._controller is None or self._motor is None:
+            return False
+        m = self._motor
+        prev_rx = m.rx_count
+        self._controller.refresh_status(m)
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            self._controller.poll(timeout_s=0.01)
+            if m.rx_count > prev_rx:
+                return True
+            time.sleep(0.005)
+        return False
 
     def get_position(self) -> float:
         """Current position in rad."""

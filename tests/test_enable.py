@@ -15,12 +15,18 @@ from litegrip.protocols.can_bus import LiteGripCAN
 
 
 class FakeMotorState:
-    """``MotorState`` 的最小替身（initialize 只碰这三个字段）。"""
+    """``MotorState`` 的最小替身。
+
+    ``initialize`` 使能后会把电机保持在**实测位置**上（见
+    ``can_bus._enable_and_hold``），所以除了判定的三个字段，还要给出
+    ``position`` —— 真 ``MotorState`` 一直都有。
+    """
 
     def __init__(self):
         self.rx_count = 0
         self.error = 0
         self.mst_id = 0x18
+        self.position = 0.0
 
 
 class FakeController:
@@ -45,6 +51,10 @@ class FakeController:
 
     def enable(self, motor):
         self.calls.append("enable")
+        # 错误码按 **enable 次数** 推进，而不是按 poll 次数：脚本描述的正是
+        # 「第几次使能有没有生效」。_enable_and_hold 使能后会先流一小段零增益
+        # 帧、期间 poll 多次，按 poll 推进会让脚本在那段覆盖里就被吃光。
+        self.motor.error = self._next_err()
 
     def clear_fault(self, motor):
         self.calls.append("clear_fault")
@@ -57,8 +67,8 @@ class FakeController:
         self.calls.append("control_mit")
 
     def poll(self, timeout_s=0.0):
+        # 一次 poll 解出一帧状态；错误码由 enable 决定（见上）。
         self.motor.rx_count += 1
-        self.motor.error = self._next_err()
         return self.motor
 
     def close(self):
