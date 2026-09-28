@@ -864,8 +864,11 @@ class LiteGrip:
         """Open the gripper fully.
 
         A continuous ramp (velocity feed-forward, one frame per
-        :attr:`MotionConfig.frame_interval`) to the open limit minus
-        :attr:`MotionConfig.margin`, with stall detection along the way.
+        :attr:`MotionConfig.frame_interval`) that drives *past* the calibrated
+        open limit and lets the mechanical stop end the move. The command lead
+        is narrowed to :attr:`MotionConfig.stop_lead_mm` inside
+        :attr:`MotionConfig.press_zone_mm` of the limit, so the pressing
+        torque stays around ``kp × stop_lead_mm``.
 
         Args:
             speed_mm_s: Opening speed; ``None`` = ``MotionConfig.speed_mm_s``.
@@ -873,8 +876,10 @@ class LiteGrip:
                 :class:`~litegrip.actions.MoveProgress` per sample.
 
         Returns:
-            :class:`~litegrip.actions.MoveResult` — truthy when it arrived
-            without stalling.
+            :class:`~litegrip.actions.MoveResult` — truthy when it pressed
+            onto the stop (``stalled`` and parked within
+            :attr:`MotionConfig.stop_tol` of the limit).  Stalling far from
+            the limit means something blocked the travel, and is falsy.
         """
         self._check_connected()
         return self._actions.open(speed_mm_s, progress=progress)
@@ -887,9 +892,9 @@ class LiteGrip:
     ) -> MoveResult:
         """Close the gripper.
 
-        Same ramp as :meth:`open`, toward the closed limit minus
-        :attr:`MotionConfig.margin`.  Use :meth:`grasp` for a power grasp
-        (closing onto an object and squeezing).
+        Same ramp as :meth:`open`, pressing onto the closed-side mechanical
+        stop.  Use :meth:`grasp` for a power grasp (closing onto an object and
+        squeezing) — that one stops on the object, not on the empty stop.
 
         Args:
             speed_mm_s: Closing speed; ``None`` = ``MotionConfig.speed_mm_s``.
