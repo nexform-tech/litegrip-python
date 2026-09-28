@@ -1,0 +1,149 @@
+"""LiteGrip SDK — self-contained gripper library for the LiteGrip adaptive
+two-finger hand.
+
+Built on the Damiao motor MIT protocol over SocketCAN.  Zero dependencies
+outside Python's standard library + Linux SocketCAN — no damiao_socketcan
+or robot-arm libraries required.
+
+Quick start::
+
+    from litegrip import LiteGrip
+
+    with LiteGrip(channel="can0", can_id=0x08) as gripper:
+        gripper.enable()          # retries until the status frame says err == 1
+        gripper.open()
+        gripper.grasp(force_n=20.0, hold_s=3.0)
+        state = gripper.get_state()
+        print(state)
+
+Subpackages
+-----------
+- ``litegrip.can`` — Raw SocketCAN transport + DM motor protocol codec.
+  Use directly if you need fine-grained control or multi-motor setups.
+"""
+
+import logging
+
+# Version of a package that is on disk but not installed as a distribution — a
+# source checkout, a vendored copy, or the files dropped in by a system package.
+# The ``+`` local segment keeps it valid PEP 440 and makes it obvious in a bug
+# report that nobody is looking at an official build.
+_VERSION_SOURCE_TREE = "0.0.0+source"
+
+
+def _detect_version(dist_name: str = "litegrip") -> str:
+    """Report the installed distribution's version, or a marker for a raw checkout.
+
+    The repository never commits a version back (AGENTS.md §3): semantic-release
+    derives it from the commit prefixes and writes it only into the publish
+    workspace, so the git tag is the single source of truth. A literal
+    ``__version__`` in this file would therefore be a second, permanently stale
+    copy of that number. Reading the installed metadata instead keeps whatever the
+    user actually installed in one place.
+
+    Returns:
+        The installed distribution version, or ``"0.0.0+source"`` when this module
+        was imported from loose files rather than an installed distribution.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version(dist_name)
+    except PackageNotFoundError:
+        return _VERSION_SOURCE_TREE
+
+
+__version__ = _detect_version()
+
+# Ensure log messages are visible even if the user hasn't configured logging.
+_log = logging.getLogger("litegrip")
+_log.addHandler(logging.NullHandler())
+
+# ── High-level API ──────────────────────────────────────────────────────
+from .gripper import LiteGrip, DEFAULT_CALIB
+
+# ── Motion actions ──────────────────────────────────────────────────────
+from .actions import (
+    MotionConfig,
+    MoveProgress,
+    MoveResult,
+    GraspResult,
+    EnableResult,
+    GripperActions,
+    limit_target,
+)
+
+# ── Data models ─────────────────────────────────────────────────────────
+from .models import (
+    GripperState,
+    GripperConfig,
+    GripperInfo,
+    GripperStatus,
+    GripperMode,
+    CalibrationData,
+)
+
+# ── Constants & enums ───────────────────────────────────────────────────
+from .constants import (
+    GripperParams,
+    UnitConversion,
+    ErrorCode,
+    DefaultParams,
+    describe_error,
+    DM_Motor_Type,
+    Control_Mode,
+)
+
+# ── Exceptions ──────────────────────────────────────────────────────────
+from .exceptions import (
+    LiteGripError,
+    CommError,
+    ConnectError,
+    CommandError,
+    CANTimeoutError,
+    HardwareError,
+    NotInitializedError,
+)
+
+# ── CAN subpackage (expert) ─────────────────────────────────────────────
+from . import can
+
+__all__ = [
+    "__version__",
+    # High-level
+    "LiteGrip",
+    "DEFAULT_CALIB",
+    # Motion actions
+    "MotionConfig",
+    "MoveProgress",
+    "MoveResult",
+    "GraspResult",
+    "EnableResult",
+    "GripperActions",
+    "limit_target",
+    # Models
+    "GripperState",
+    "GripperConfig",
+    "GripperInfo",
+    "GripperStatus",
+    "GripperMode",
+    "CalibrationData",
+    # Constants
+    "GripperParams",
+    "UnitConversion",
+    "ErrorCode",
+    "DefaultParams",
+    "describe_error",
+    "DM_Motor_Type",
+    "Control_Mode",
+    # Exceptions
+    "LiteGripError",
+    "CommError",
+    "ConnectError",
+    "CommandError",
+    "CANTimeoutError",
+    "HardwareError",
+    "NotInitializedError",
+    # Subpackages
+    "can",
+]
