@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "litegrip"
+# PLACEHOLDER — do not edit, do not read.
+# The repository never commits a version back (see AGENTS.md §3): semantic-release
+# computes the next version from the commit prefixes on merge and rewrites this
+# field only inside the publish workspace. The git tag is the only source of truth.
+#
+# AGENTS.md spells the placeholder `0.0.0-semantic-release`, but that is not valid
+# PEP 440 and setuptools refuses to build (`project.version must be pep440`). For
+# Python repositories the placeholder has to be plain `0.0.0`. The nearby
+# `0.0.0+semantic-release` spelling is valid PEP 440 but PyPI rejects local version
+# labels, so it would only move the failure to upload time.
+version = "0.0.0"
+description = "Python SDK for the LiteGrip lightweight robotic gripper series"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "NEXFORM ROBOTICS" }]
+keywords = [
+    "litegrip",
+    "litearm",
+    "gripper",
+    "robotics",
+    "socketcan",
+    "can",
+    "damiao",
+    "dm4310",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
+# No runtime dependencies: the SDK is Python standard library plus Linux
+# SocketCAN only. Do not add one without a very good reason — the whole point is
+# that this installs on a bare robot controller.
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/nexform-tech/litegrip-python"
+Issues = "https://github.com/nexform-tech/litegrip-python/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# py.typed tells type checkers the annotations are real; the factory calibration
+# is the read-only fallback used when a unit has never been calibrated on site.
+litegrip = ["py.typed", "factory_calibration.json"]
