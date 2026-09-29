@@ -167,8 +167,10 @@ python3 examples/teleop.py --mode slave  --channel can0 --host 192.168.1.20
 Both ends must share `grip_id` (default `gripA`) and be connected and enabled first. Teleop is
 exclusive: the background loop owns the CAN I/O, so do not drive the gripper from the caller until
 `teleop_stop()`. `teleop_start` returns the initial `teleop_status()` snapshot; `teleop_status()`
-reports `active`, `mode`, `topic`, `frames`, `last_frame_age_ms`, `stale`, `openness`, `dq_cmd`,
-`loop_hz`, `rejected`, `send_failed`, `fault`, and (master) `matching`.
+reports `active`, `mode`, `topic`, `frames`, `last_frame_age_ms`, `stale`, `openness`,
+`position_mm`, `force_n`, `dq_cmd`, `loop_hz`, `rejected`, `send_failed`, `fault`, and (master)
+`matching`. `position_mm` and `force_n` are the master's own state, or the leader's values from
+the frame the slave followed — a caller can show the jaws without opening a second CAN reader.
 
 - **The follower feeds the leader's velocity forward.** The wire frame carries only the opening, so
   the follower recovers a velocity by differencing successive frames and sends it as the motor's
