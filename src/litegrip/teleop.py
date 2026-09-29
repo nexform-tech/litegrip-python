@@ -31,18 +31,26 @@ Safety notes
 * ``openness`` is clamped to ``[0, 1]``, which keeps every commanded target
   inside the calibrated travel.  That clamp is the only limit this layer
   applies; there is no red-line logic here.
+* A **non-finite** frame (NaN / ±inf) is *dropped*, never clamped.  ``_clamp01``
+  passes NaN through and ``min(hi, NaN)`` returns ``hi``, so clamping a NaN
+  target silently commands the follower to its closed stop.  Bad readings are
+  rejected at the wire boundary on both ends; the follower then holds, which is
+  the safe side.
 * A ``slave`` whose leader goes quiet **holds** its last target at the follow
   gains (it does not relax to zero torque).  The jaws therefore keep pressing
   whatever is between them — the same behaviour as the litearm original.
 * Teleoperation is exclusive: stop any motion you started elsewhere before
   calling :meth:`~litegrip.LiteGrip.teleop_start`.
 * :class:`UdpTeleopTransport` is plain, unauthenticated UDP.  Use it only on a
-  trusted network.
+  trusted network.  For real deployments use the point-to-point zenoh link in
+  :mod:`litegrip.zenoh_link` (``pip install litegrip[zenoh]``), which is what the
+  field-validated litearm teleoperation runs on.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import socket
 import struct
 import threading
@@ -60,6 +68,12 @@ _FRAME = struct.Struct(">4d")
 
 #: Size of one teleop frame in bytes (four doubles).
 FRAME_SIZE = _FRAME.size
+
+#: Default grip id and TCP port.  The topic and the port come from the litearm
+#: teleoperation namespace: the arm uses ``armA``/17447, the gripper
+#: ``gripA``/17448, so one machine can run both without a collision.
+DEFAULT_GRIP_ID = "gripA"
+DEFAULT_GRIP_PORT = 17448
 
 
 def encode_frame(openness: float, position_mm: float, force_n: float,
@@ -90,14 +104,17 @@ def decode_frame(payload: bytes) -> Tuple[float, float, float, float]:
     return _FRAME.unpack(payload)
 
 
-def teleop_topic(master_id: str = "master") -> str:
+def teleop_topic(grip_id: str = DEFAULT_GRIP_ID) -> str:
     """Topic the leader publishes and the follower subscribes to.
 
-    Both ends must agree on ``master_id``; it defaults to ``"master"`` so a
-    single pair needs no configuration.  Use a distinct id per pair when more
-    than one teleoperation runs on the same transport.
+    ⚠ This is the **litearm teleoperation namespace**, shared with the arm and
+    gripper teleoperation stacks: ``litearm/v4/{grip_id}/gripper_teleop``.  The
+    frame format is byte-identical, so the two interoperate — deliberately.
+    Both ends must agree on ``grip_id``; it defaults to ``"gripA"`` so a single
+    pair needs no configuration.  Use a distinct id per pair when more than one
+    teleoperation runs on the same transport.
     """
-    return f"litegrip/teleop/{master_id}"
+    return f"litearm/v4/{grip_id}/gripper_teleop"
 
 
 # ── Transport abstraction ─────────────────────────────────────────────────
@@ -128,8 +145,9 @@ class TeleopTransport:
     """Publish/subscribe transport between a leader and a follower.
 
     Implement this to carry teleop frames over anything (a different network
-    stack, an in-process bus, ...).  Two implementations ship with the SDK:
-    :class:`UdpTeleopTransport` and :class:`InProcTeleopTransport`.
+    stack, an in-process bus, ...).  Three implementations ship with the SDK:
+    :class:`UdpTeleopTransport`, :class:`InProcTeleopTransport`, and — for real
+    deployments — the point-to-point zenoh link in :mod:`litegrip.zenoh_link`.
     """
 
     def pub(self, topic: str, payload: bytes) -> None:
@@ -173,7 +191,7 @@ class UdpTeleopTransport(TeleopTransport):
     The leader sends frames to ``pub_addr``; the follower receives on
     ``bind_addr``.  Either or both may be given, so one object can both send
     and receive (not needed for a single leader/follower pair).  Same machine:
-    ``"127.0.0.1:7448"``.  Across machines: the peer's real address,
+    ``"127.0.0.1:17448"``.  Across machines: the peer's real address,
     ``"0.0.0.0:<port>"`` to accept on every interface.
 
     Unauthenticated and unencrypted — trusted networks only.  A dropped
@@ -303,7 +321,26 @@ def openness_to_rad(openness: float, cfg: Any) -> float:
             - cfg.close_sign * openness * travel_mm(cfg) / cfg.rad_to_mm)
 
 
+def clamp_to_calibrated(cfg: Any, q: float) -> float:
+    """Clamp a motor angle into the calibrated travel.
+
+    Either limit may be the larger one (a reverse mount swaps them), so this
+    takes ``min``/``max`` rather than assuming an order.  Same source as the
+    SDK's own ``goto_rad`` clamp.
+    """
+    lo = min(float(cfg.pos_closed_rad), float(cfg.pos_open_rad))
+    hi = max(float(cfg.pos_closed_rad), float(cfg.pos_open_rad))
+    return max(lo, min(hi, float(q)))
+
+
 def _clamp01(x: float) -> float:
+    """Clamp to ``[0, 1]``.
+
+    ⚠ **This does not sanitise NaN** — every comparison against NaN is false, so
+    NaN passes straight through, and a later ``min(hi, NaN)`` yields ``hi``.
+    Callers must reject non-finite values *before* clamping, not rely on the
+    clamp to bound them.
+    """
     return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
 
 
@@ -320,6 +357,37 @@ class TeleopBusyError(TeleopError):
 
 class TeleopNotActiveError(TeleopError):
     """Raised when an operation needs an active session but none is running."""
+
+
+class TeleopNotReady(TeleopError):
+    """Raised when the gripper cannot safely be teleoperated yet.
+
+    ``send_mit_frame`` and ``goto_rad`` do **not** check ``calibrated`` — only
+    ``open``/``close``/``grasp`` do.  Without this precheck an uncalibrated unit
+    is driven from placeholder limits of unknown direction.
+    """
+
+
+def check_ready(cfg: Any) -> None:
+    """Verify the calibration teleoperation depends on.  **Call before enable.**
+
+    Raises:
+        TeleopNotReady: uncalibrated, zero travel, or ``rad_to_mm == 0``.
+
+    The zero-travel test is written in **rad space** (matching the SDK); testing
+    ``travel_mm == 0`` in mm space is a strictly weaker condition.
+    """
+    if not bool(getattr(cfg, "calibrated", False)):
+        raise TeleopNotReady(
+            "gripper is not calibrated: pos_closed_rad / pos_open_rad are still "
+            "placeholder defaults and the direction is a guess. Run "
+            "load_calibration() / load_template(), or zero() first.")
+    if abs(float(cfg.pos_closed_rad) - float(cfg.pos_open_rad)) <= 1e-6:
+        raise TeleopNotReady(
+            "zero travel: pos_closed_rad equals pos_open_rad — recalibrate.")
+    if not float(cfg.rad_to_mm):
+        raise TeleopNotReady(
+            "rad_to_mm is 0: the openness<->radian conversion would divide by zero.")
 
 
 # ── the algorithm ─────────────────────────────────────────────────────────
@@ -345,10 +413,13 @@ class GripperTeleop:
         topic: Topic to publish/subscribe.
         rate_hz: Loop rate.  ~50 Hz is plenty; the CAN frame stream and the
             publish share the same cycle.
-        kp, kd: Follow gains (slave).  ``None`` uses ``100.0`` / ``2.0``.
+        kp, kd: Follow gains (slave).  ``None`` uses the calibration's ``kp`` /
+            ``kd``, falling back to ``100.0`` / ``2.0``.
         align: Slave only — align to the first frame before following.
         watchdog_s: Slave only — seconds without a fresh frame before the
-            follower is considered stale and starts holding.
+            follower is considered stale and starts holding.  Must be > 0: a
+            non-positive watchdog makes the follower permanently stale, which is
+            a session that starts and then silently does nothing.
         sub_transport: Slave only — a separate transport to subscribe on when
             the leader is remote (the master's transport is local-only).
         sleep_fn, time_fn: Timing seams for tests.  ``time_fn`` must be
@@ -372,8 +443,10 @@ class GripperTeleop:
     ) -> None:
         if mode not in ("master", "slave"):
             raise ValueError(f"mode must be 'master' or 'slave', got {mode!r}")
-        if rate_hz <= 0.0:
+        if not rate_hz > 0.0:
             raise ValueError("rate_hz must be > 0")
+        if not watchdog_s > 0.0:
+            raise ValueError("watchdog_s must be > 0")
         self._g = gripper
         self._tp = transport
         self._mode = mode
@@ -394,7 +467,14 @@ class GripperTeleop:
         self._frames = 0
         self._last_openness = 0.0
         self._last_frame_ts = 0.0
+        #: Explicit "have we ever received a frame" flag.  The watchdog only
+        #: applies after the first frame, and this must not be inferred from a
+        #: ``0.0`` timestamp — see the ``LatestSlot`` note in the design spec.
+        self._ever_received = False
         self._stale = False
+        self._rejected = 0
+        self._send_failed = 0
+        self._fault = ""
         self._loops = 0
         self._loop_hz = 0.0
         self._hz_t0 = 0.0
@@ -432,26 +512,38 @@ class GripperTeleop:
     def stop(self, timeout: float = 2.0) -> None:
         """Stop the loop and leave the gripper holding its position.
 
-        The master also leaves zero-gravity mode, so the jaws hold under the
-        configured gains instead of falling slack.
+        Neither side disables the motor: the master leaves zero-gravity mode and
+        the slave sends one final frame at its current angle, so both hold under
+        gain and whatever is between the jaws stays there.
         """
         self._running = False
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
         self._thread = None
-        if self._mode == "master":
-            try:
-                self._g.exit_zero_gravity()
-            except Exception as e:  # noqa: BLE001
-                log.debug("exit_zero_gravity on stop failed: %s", e)
+        self._handoff()
         log.info("teleop stopped: mode=%s frames=%d", self._mode, self._frames)
+
+    def _handoff(self) -> None:
+        """Leave the gripper holding position — never disable (§8 rule 4/6)."""
+        try:
+            if self._mode == "master":
+                # Internally one frame at the current angle under the config
+                # gains, which is exactly the hand-off we want.
+                self._g.exit_zero_gravity()
+            else:
+                q = clamp_to_calibrated(
+                    self._g.config, self._g.get_state(wait=False).position_rad)
+                self._send(q, self._resolve_kp(), self._resolve_kd())
+        except Exception as e:  # noqa: BLE001
+            log.debug("hand-off on stop failed: %s", e)
 
     def status(self) -> dict:
         """A snapshot of the session, for logging and diagnostics."""
         age_ms = None
-        if self._mode == "slave" and self._last_frame_ts > 0.0:
+        if self._mode == "slave" and self._ever_received:
             age_ms = (self._time_fn() - self._last_frame_ts) * 1000.0
+        matching = getattr(self._tp, "matching", None)
         return {
             "active": self._running,
             "mode": self._mode,
@@ -461,6 +553,14 @@ class GripperTeleop:
             "stale": self._stale,
             "openness": round(self._last_openness, 4),
             "loop_hz": round(self._loop_hz, 1),
+            # Frames dropped at the protocol boundary (non-finite values).
+            "rejected": self._rejected,
+            # ``send_mit_frame`` returned False — the motor is not following.
+            "send_failed": self._send_failed,
+            # The gripper's own error_code was not "enabled".
+            "fault": self._fault,
+            # Master only: whether a subscriber is matched.
+            "matching": matching if isinstance(matching, bool) else None,
         }
 
     # ── master ────────────────────────────────────────────────────────
@@ -475,20 +575,28 @@ class GripperTeleop:
                 # zero-torque frame goes out every cycle even though nothing
                 # is being commanded.
                 try:
-                    self._g.send_mit_frame(q=0.0, kp=0.0, kd=0.0)
+                    self._send(0.0, 0.0, 0.0, quiet=True)
                     state = self._g.get_state(wait=False)
                 except Exception:  # noqa: BLE001
                     log.exception("[master] CAN error; loop exiting")
                     break
+                self._note_grip_fault(state)
                 openness = rad_to_openness(state.position_rad, self._g.config)
-                self._last_openness = openness
-                try:
-                    self._tp.pub(self._topic, encode_frame(
-                        openness, state.position_mm, state.force_n,
-                        self._time_fn()))
-                except Exception as e:  # noqa: BLE001
-                    log.debug("[master] publish failed: %s", e)
-                self._frames += 1
+                if not all(math.isfinite(v) for v in
+                           (openness, state.position_mm, state.force_n)):
+                    # Bad reading: publish nothing.  The follower's watchdog then
+                    # times out and **holds**, which is the safe side.  Sending
+                    # the frame would hand the follower a NaN target.
+                    self._count_rejected(openness)
+                else:
+                    self._last_openness = openness
+                    try:
+                        self._tp.pub(self._topic, encode_frame(
+                            openness, state.position_mm, state.force_n,
+                            self._time_fn()))
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("[master] publish failed: %s", e)
+                    self._frames += 1
                 self._sleep_rest(t0)
         finally:
             log.info("[master] loop exited (%d frames sent)", self._frames)
@@ -502,23 +610,26 @@ class GripperTeleop:
         log.info("[slave] subscribed %s (align=%s watchdog=%.0fms)",
                  self._topic, self._align, self._watchdog_s * 1000.0)
 
-        # Until a frame arrives, hold wherever the jaws already are.
-        openness_cmd = rad_to_openness(self._g.get_state(wait=False).position_rad, cfg)
-        q_cmd = openness_to_rad(openness_cmd, cfg)
+        # Until a frame arrives, hold wherever the jaws already are.  A ``0.0``
+        # target here would be a real position command — the open or the closed
+        # stop, depending on the mount.
+        q_cmd = clamp_to_calibrated(cfg, self._g.get_state(wait=False).position_rad)
 
         if self._align:
-            first = self._wait_first_frame(sub, timeout_s=5.0)
+            first = self._wait_first_frame(sub, timeout_s=5.0, hold_q=q_cmd)
             if first is not None:
-                openness_cmd = _clamp01(first[0])
-                q_cmd = openness_to_rad(openness_cmd, cfg)
-                log.info("[slave] aligning to first frame: openness=%.3f -> %.3f rad",
-                         openness_cmd, q_cmd)
+                q_cmd = clamp_to_calibrated(
+                    cfg, openness_to_rad(_clamp01(first[0]), cfg))
+                log.info("[slave] aligning to first frame: openness=%.3f -> %+.4f rad",
+                         _clamp01(first[0]), q_cmd)
                 try:
                     self._g.goto_rad(q_cmd, kp=self._resolve_kp(),
                                      kd=self._resolve_kd(), duration=1.0)
                 except Exception as e:  # noqa: BLE001
                     log.warning("[slave] align goto_rad failed: %s", e)
                 self._last_frame_ts = self._time_fn()
+                self._ever_received = True
+                self._last_openness = _clamp01(first[0])
             else:
                 log.warning("[slave] no frame within align timeout; "
                             "holding current position")
@@ -533,13 +644,19 @@ class GripperTeleop:
                     except ValueError as e:
                         log.debug("[slave] ignoring bad frame: %s", e)
                     else:
-                        openness_cmd = _clamp01(openness)
-                        q_cmd = openness_to_rad(openness_cmd, cfg)
-                        self._last_openness = openness_cmd
-                        self._last_frame_ts = self._time_fn()
-                        self._frames += 1
-                        self._stale = False
-                elif (self._last_frame_ts > 0.0
+                        # Protocol boundary: reject non-finite values.  Clamping
+                        # a NaN target folds it onto a hard stop, silently.
+                        if not all(math.isfinite(v) for v in (openness, _mm, _force)):
+                            self._count_rejected(openness)
+                        else:
+                            rx_ts = self._time_fn()
+                            q_cmd = openness_to_rad(_clamp01(openness), cfg)
+                            self._last_openness = _clamp01(openness)
+                            self._last_frame_ts = rx_ts
+                            self._ever_received = True
+                            self._frames += 1
+                            self._stale = False
+                elif (self._ever_received
                       and (self._time_fn() - self._last_frame_ts) > self._watchdog_s):
                     if not self._stale:
                         log.warning("[slave] frames stale (>%.0fms); holding position",
@@ -548,9 +665,10 @@ class GripperTeleop:
 
                 # Always send — including while stale.  The frame both holds
                 # the position and keeps the motor from self-locking.
+                q_cmd = clamp_to_calibrated(cfg, q_cmd)
                 try:
-                    self._g.send_mit_frame(q=q_cmd, kp=self._resolve_kp(),
-                                           kd=self._resolve_kd(), dq=0.0)
+                    self._send(q_cmd, self._resolve_kp(), self._resolve_kd())
+                    self._note_grip_fault(self._g.get_state(wait=False))
                 except Exception:  # noqa: BLE001
                     log.exception("[slave] CAN error; loop exiting")
                     break
@@ -560,24 +678,85 @@ class GripperTeleop:
 
     # ── helpers ───────────────────────────────────────────────────────
 
-    def _wait_first_frame(self, sub: TeleopSubscription,
-                          timeout_s: float) -> Optional[Tuple[float, float, float, float]]:
+    def _wait_first_frame(self, sub: TeleopSubscription, timeout_s: float,
+                          hold_q: float) -> Optional[Tuple[float, float, float, float]]:
+        """Wait for the first frame, holding position while we wait.
+
+        ⚠ A **non-finite** frame is skipped and the wait continues, never
+        returned: this value feeds ``goto_rad``, and a NaN folds onto an end
+        stop — one bad frame would pull the follower to the closed limit, on the
+        ``align=True`` default path, before the loop's own guard could see it.
+        ⚠ The wait **keeps sending hold frames**: staying silent for up to 5 s
+        contradicts this module's own "stop sending ⇒ lose force" rule, and the
+        gripper may be holding something.
+        """
         deadline = self._time_fn() + timeout_s
         while self._running and self._time_fn() < deadline:
             msg = sub.drain_latest()
             if msg is not None:
                 try:
-                    return decode_frame(msg)
+                    values = decode_frame(msg)
                 except ValueError:
                     continue
+                if all(math.isfinite(v) for v in values):
+                    return values
+                self._count_rejected(values[0])
+            try:
+                self._send(hold_q, self._resolve_kp(), self._resolve_kd())
+                self._note_grip_fault(self._g.get_state(wait=False))
+            except Exception:  # noqa: BLE001
+                log.exception("[slave] CAN error during align; loop exiting")
+                return None
             self._sleep_fn(0.01)
         return None
 
+    def _count_rejected(self, got: Any) -> None:
+        """Record a frame dropped at the protocol boundary (§8 rule 9)."""
+        self._rejected += 1
+        if self._rejected == 1:
+            log.warning("[%s] dropped a non-finite frame (openness=%r) — "
+                        "holding position rather than folding onto a stop",
+                        self._mode, got)
+
+    def _send(self, q: float, kp: float, kd: float,
+              quiet: bool = False) -> None:
+        """Send one MIT frame and **check the return value** (§8 rule 10).
+
+        ``send_mit_frame`` returns ``False`` when the motor is not enabled or the
+        CAN write fails — it does not raise, so ignoring the result means
+        believing we are driving a gripper that is not moving.
+        """
+        if not self._g.send_mit_frame(q=q, kp=kp, kd=kd):
+            self._send_failed += 1
+            if self._send_failed == 1 and not quiet:
+                log.warning("[%s] send_mit_frame returned False — the motor is "
+                            "not enabled or the CAN write failed; the gripper may "
+                            "not be moving at all", self._mode)
+
+    def _note_grip_fault(self, state: Any) -> None:
+        """Consume the gripper's own ``error_code`` (§8 rule 10).
+
+        Polling without reading ``error_code`` is the same as not polling: ``1``
+        means enabled, ``0`` disabled, anything else is a real fault (over-temp,
+        over-current).  Only the first one is reported.
+        """
+        code = int(getattr(state, "error_code", 1))
+        if code != 1 and not self._fault:
+            self._fault = (f"gripper reports error_code={code}"
+                           + (" (disabled)" if code == 0 else " (fault)")
+                           + " — still streaming hold frames")
+            log.warning("[%s] %s", self._mode, self._fault)
+
     def _resolve_kp(self) -> float:
-        return self._kp if self._kp is not None else 100.0
+        """Follow gain: the explicit one, else the calibration's ``kp``."""
+        if self._kp is not None:
+            return float(self._kp)
+        return float(getattr(self._g.config, "kp", 100.0))
 
     def _resolve_kd(self) -> float:
-        return self._kd if self._kd is not None else 2.0
+        if self._kd is not None:
+            return float(self._kd)
+        return float(getattr(self._g.config, "kd", 2.0))
 
     def _sleep_rest(self, t0: float) -> None:
         self._loops += 1

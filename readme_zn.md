@@ -16,6 +16,7 @@
 | 平台 | 仅 Linux（SocketCAN） |
 | Python | 3.8 及以上 |
 | 运行时依赖 | 无，只用标准库 |
+| 可选扩展 | `litegrip[zenoh]` —— 点对点 zenoh 遥操链路 |
 
 ## 安装
 
@@ -104,20 +105,36 @@ with LiteGrip("can1", mount="reverse") as gripper:
 它按循环频率把「张开程度」发出去；**从夹爪**（follower）收到后驱动自己的爪子跟到位。线上传的
 是归一化到 `[0, 1]` 的张开度，不是角度，所以两端不需要相同的标定、装法或零点。
 
+### 传输
+
+链路是**点对点 zenoh** —— 与真机上跑的遥操同一套结构。两端都是 `mode="peer"`，**关掉全部
+发现机制**（无多播、无 gossip），所以两端只能靠显式端点互相找到：主端监听一个 TCP 端口，从端
+连到主端的地址。话题是共用的 litearm 命名空间 `litearm/v4/{grip_id}/gripper_teleop`，帧格式
+与 litearm 那套逐字节相同 ⇒ 两边可以互通。
+
+zenoh 是**可选依赖**，基础 SDK 仍是「标准库 + SocketCAN」：
+
+```bash
+pip install 'litegrip[zenoh]'
+```
+
+`link="udp"` 可切到明文 UDP 回退方案（仅限可信局域网，无鉴权、无加密）。要给自定义传输，传
+`transport=` 一个 `TeleopTransport`；注入的传输不会被 SDK 关闭。
+
 ```python
 from litegrip import LiteGrip
 
-# 主端：把本夹爪的张开度发到 192.168.1.20 的从端。
+# 主端：监听并发布本夹爪的张开度。
 with LiteGrip("can0") as master:
     master.load_calibration()
     master.enable()
-    master.teleop_start("master", host="192.168.1.20")
+    master.teleop_start("master")                      # zenoh，gripA，端口 17448
 
-# 从端：绑定端口，先对齐首帧，然后跟随。
+# 从端：连到主端，先对齐首帧，然后跟随。
 with LiteGrip("can0") as slave:
     slave.load_calibration()
     slave.enable()
-    slave.teleop_start("slave", host="0.0.0.0")
+    slave.teleop_start("slave", host="192.168.1.20")
     while True:
         print(slave.teleop_status())   # frames, openness, loop_hz, stale, ...
 ```
@@ -126,24 +143,30 @@ with LiteGrip("can0") as slave:
 
 ```bash
 # A 机 —— 你用手掰的主夹爪：
-python3 examples/teleop.py --mode master --channel can0 --host 192.168.1.20
+python3 examples/teleop.py --mode master --channel can0
 # B 机 —— 从夹爪：
-python3 examples/teleop.py --mode slave  --channel can0 --host 0.0.0.0
+python3 examples/teleop.py --mode slave  --channel can0 --host 192.168.1.20
 ```
 
-两端必须共用 `master_id`（默认 `master`），且都已连接、已使能。遥操是互斥的：后台循环独占 CAN
+两端必须共用 `grip_id`（默认 `gripA`），且都已连接、已使能。遥操是互斥的：后台循环独占 CAN
 读写，在 `teleop_stop()` 之前不要再从调用方驱动夹爪。`teleop_start` 返回初始的
 `teleop_status()`；`teleop_status()` 报告 `active`、`mode`、`topic`、`frames`、
-`last_frame_age_ms`、`stale`、`openness`、`loop_hz`。
+`last_frame_age_ms`、`stale`、`openness`、`loop_hz`、`rejected`、`send_failed`、
+`fault`，主端另有 `matching`。
 
-- **传输是明文 UDP**，无鉴权、无加密，只用在可信网络里。要给自定义传输，传 `transport=` 一个
-  `TeleopTransport`；注入的传输不会被 SDK 关闭。
 - **从端与主端失联时是「持位」，不是「卸力」。** 超过 `watchdog_s`（默认 `0.2`）没有新帧后，
   它仍按跟随增益顶着上一个目标继续发帧 —— 于是 `stale` 变真，但爪子停在原地，可能夹住中间的
   东西。
-- **从端会把收到的张开度夹到 `[0, 1]`**，也就是夹在自己的标定行程内，坏帧无法把它指到限位之外。
-- **停止后是持位**，不是卸力：主端在 `teleop_stop()` 时退出零重力模式，爪子按配置增益持位。
-- 跟随增益默认 `kp=100.0`、`kd=2.0`，用 `kp=` / `kd=` 覆盖。
+- **非有限值帧一律丢弃，绝不夹位。** NaN 会原样穿过 `[0, 1]` 的钳位，再被折到某个端点 —— 静默
+  地把从端指到全闭限位。两端都在**协议边界**上拒收 NaN / ±inf（包括对齐用的首帧），计入
+  `rejected`，并改为持位。
+- **从端每拍都把目标夹进自己的标定行程**，并且会看 SDK 的返回值：`send_mit_frame` 返回 `False`
+  会计入 `send_failed`，夹爪自报的 `error_code` 不是「已使能」会记进 `fault` —— 都不吞掉。
+- **停止后是持位**，不是卸力：主端在 `teleop_stop()` 时退出零重力模式，从端在收尾时按当前角度
+  补发一帧 —— 两边都按配置增益持位，都不失能。
+- 未标定、行程为零、或 `rad_to_mm == 0` 的夹爪会**拒绝启动**（`TeleopNotReady`），且在使能或
+  驱动之前就拒掉。
+- 跟随增益默认取标定里的 `kp` / `kd`（出厂是 `100.0` / `2.0`），用 `kp=` / `kd=` 覆盖。
 
 ## 六个动作接口
 

@@ -42,6 +42,25 @@ from .actions import (
     MoveProgress,
     MoveResult,
 )
+from .teleop import DEFAULT_GRIP_ID, DEFAULT_GRIP_PORT
+
+
+def _zenoh_transport(role: str, key: str, port: int,
+                     host: Optional[str]) -> "TeleopTransport":
+    """Build a point-to-point zenoh transport, or explain how to get one.
+
+    zenoh is an optional dependency, so a bare ``import`` failure is turned into
+    an actionable message rather than a ModuleNotFoundError naming a module the
+    user never asked for.
+    """
+    try:
+        from .zenoh_link import ZenohTeleopTransport
+    except ImportError as e:
+        raise ImportError(
+            "the zenoh teleoperation link needs the optional zenoh dependency — "
+            "install it with `pip install litegrip[zenoh]`") from e
+    return ZenohTeleopTransport(role, key, port=port, host=host)
+
 
 # Path to built-in factory calibration (ships with the package, read-only fallback).
 _FACTORY_CALIB = _os.path.join(_os.path.dirname(__file__), "factory_calibration.json")
@@ -229,6 +248,10 @@ class LiteGrip:
         # Transport teleop_start built itself (as opposed to one the caller
         # injected), so teleop_stop knows what it is allowed to close.
         self._teleop_transport: Optional["TeleopTransport"] = None
+        # The leader's zenoh publisher endpoint, kept for the life of this
+        # gripper rather than per session — rebuilding it per session leaves the
+        # port bound and makes matching fail intermittently.
+        self._teleop_pub: Optional["TeleopTransport"] = None
 
         # Declaring the mount is just loading the matching template, so it
         # costs no CAN traffic and is safe this early.  The template carries
@@ -347,6 +370,7 @@ class LiteGrip:
 
         if self._teleop is not None:
             self.teleop_stop()
+        self._close_teleop_pub()
 
         if self._can:
             self._can.disconnect(disable=self._disable_on_disconnect)
@@ -1756,15 +1780,17 @@ class LiteGrip:
     def teleop_start(
         self,
         mode: str,
+        *,
         transport: Optional["TeleopTransport"] = None,
+        link: str = "zenoh",
         host: Optional[str] = None,
-        port: int = 7448,
+        port: int = DEFAULT_GRIP_PORT,
+        grip_id: str = DEFAULT_GRIP_ID,
         kp: Optional[float] = None,
         kd: Optional[float] = None,
         align: bool = True,
         watchdog_s: float = 0.2,
         rate_hz: float = 50.0,
-        master_id: str = "master",
     ) -> dict:
         """Start leader/follower teleoperation on this gripper.
 
@@ -1772,68 +1798,107 @@ class LiteGrip:
         pushed by hand — and publishes the opening.  ``mode="slave"``
         (follower) receives the opening and follows it.
 
-        Both ends must agree on ``master_id``.  Teleoperation is exclusive:
-        the background loop owns the CAN I/O until :meth:`teleop_stop`, so do
-        not drive this gripper from the caller while it runs.
+        Both ends must agree on ``grip_id``.  Teleoperation is exclusive: the
+        background loop owns the CAN I/O until :meth:`teleop_stop`, so do not
+        drive this gripper from the caller while it runs.
 
         Args:
             mode: ``"master"`` or ``"slave"``.
-            transport: A :class:`~litegrip.TeleopTransport`.  When omitted, a
-                :class:`~litegrip.UdpTeleopTransport` is built — the master
-                sends to ``host:port`` (the follower's address), the slave
-                binds ``host:port``.  An injected transport is never closed by
-                this class.
-            host: Address for the default UDP transport (required when
-                ``transport`` is omitted).
-            port: UDP port for the default transport.
-            kp, kd: Follow gains (slave).  ``None`` uses 100.0 / 2.0.
+            transport: A :class:`~litegrip.TeleopTransport`.  When omitted, one
+                is built from ``link``.  An injected transport is never closed
+                by this class.
+            link: ``"zenoh"`` (default) builds the point-to-point zenoh link
+                used by the field teleoperation — see
+                :mod:`litegrip.zenoh_link`, needs ``pip install litegrip[zenoh]``.
+                ``"udp"`` builds the plain-UDP transport, for a trusted LAN.
+            host: The peer's address.  Required for a ``slave``; the master only
+                listens, so it needs no host.
+            port: TCP (zenoh) or UDP port.
+            grip_id: Topic id shared by both ends.
+            kp, kd: Follow gains (slave).  ``None`` uses the calibration's own.
             align: Slave only — align to the first received frame before
                 following.
             watchdog_s: Slave only — hold position after this long without a
                 fresh frame.
             rate_hz: Loop rate.
-            master_id: Topic id shared by both ends.
 
         Returns:
             The initial :meth:`teleop_status` snapshot.
 
         Raises:
+            TeleopNotReady: uncalibrated, zero travel, or ``rad_to_mm == 0``.
             TeleopBusyError: teleoperation is already running.
             NotInitializedError: not connected or not enabled.
         """
-        from .teleop import (GripperTeleop, TeleopBusyError,
-                             UdpTeleopTransport, teleop_topic)
+        from .teleop import (GripperTeleop, TeleopBusyError, check_ready,
+                             teleop_topic)
+        from .teleop import UdpTeleopTransport
 
         self._check_connected()
         self._check_enabled()
         if mode not in ("master", "slave"):
             raise ValueError(f"mode must be 'master' or 'slave', got {mode!r}")
+        # Before anything is enabled or driven: ``send_mit_frame`` and
+        # ``goto_rad`` do not check ``calibrated`` themselves.
+        check_ready(self.config)
         if self._teleop is not None and self._teleop.is_running:
             raise TeleopBusyError("teleop is already running")
 
+        key = teleop_topic(grip_id)
         created_transport = None
         if transport is None:
-            if host is None:
-                raise ValueError("host is required when no transport is given")
-            addr = f"{host}:{port}"
-            if mode == "master":
-                transport = created_transport = UdpTeleopTransport(pub_addr=addr)
+            if link == "zenoh":
+                if mode == "master":
+                    transport = created_transport = self._open_teleop_pub(port, key)
+                else:
+                    transport = created_transport = _zenoh_transport(
+                        "slave", key, port, host)
+            elif link == "udp":
+                if host is None:
+                    raise ValueError("host is required for the udp link")
+                addr = f"{host}:{port}"
+                if mode == "master":
+                    transport = created_transport = UdpTeleopTransport(pub_addr=addr)
+                else:
+                    transport = created_transport = UdpTeleopTransport(bind_addr=addr)
             else:
-                transport = created_transport = UdpTeleopTransport(bind_addr=addr)
+                raise ValueError(f"link must be 'zenoh' or 'udp', got {link!r}")
 
         manager = GripperTeleop(
-            self, transport, mode, teleop_topic(master_id),
+            self, transport, mode, key,
             rate_hz=rate_hz, kp=kp, kd=kd, align=align, watchdog_s=watchdog_s)
         manager.start()
         self._teleop = manager
         self._teleop_transport = created_transport
         return manager.status()
 
+    def _open_teleop_pub(self, port: int, key: str) -> "TeleopTransport":
+        """Return the leader's resident publisher, building it on first use.
+
+        ⚠ **Resident, not per session.**  Rebuilding the zenoh listener on every
+        session leaves the port bound and makes publisher↔subscriber matching
+        fail intermittently; keeping one for the life of the gripper removes
+        both.
+        """
+        if self._teleop_pub is None:
+            self._teleop_pub = _zenoh_transport("master", key, port, None)
+        return self._teleop_pub
+
+    def _close_teleop_pub(self) -> None:
+        pub, self._teleop_pub = self._teleop_pub, None
+        if pub is not None:
+            try:
+                pub.close()
+            except Exception as e:  # noqa: BLE001
+                log.debug("teleop publisher close failed: %s", e)
+
     def teleop_stop(self, timeout: float = 2.0) -> dict:
         """Stop teleoperation and leave the gripper holding its position.
 
-        The master also leaves zero-gravity mode, so the jaws hold under the
-        configured gains rather than falling slack.
+        Neither side disables: the master leaves zero-gravity mode and the slave
+        sends one final frame at its current angle, so the jaws hold under gain.
+        The leader's resident publisher is **not** closed here — only the
+        per-session subscriber is.
         """
         manager = self._teleop
         if manager is None:

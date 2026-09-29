@@ -13,17 +13,21 @@ only delivers to subscribers that already exist, so publishing before
 from __future__ import annotations
 
 import time
+import types
 import unittest
+import unittest.mock
 
 import _sdkpath  # noqa: F401
-from litegrip import (FRAME_SIZE, GripperTeleop, InProcTeleopTransport,
-                      TeleopBusyError, UdpTeleopTransport, decode_frame,
-                      encode_frame, teleop_topic)
-from litegrip.teleop import openness_to_rad, rad_to_openness, travel_mm
+from litegrip import (FRAME_SIZE, GripperTeleop,
+                      InProcTeleopTransport, TeleopBusyError, TeleopNotReady,
+                      UdpTeleopTransport, decode_frame, encode_frame,
+                      teleop_topic)
+from litegrip.teleop import (clamp_to_calibrated, check_ready,
+                             openness_to_rad, rad_to_openness, travel_mm)
 
 from fake_can import POS_CLOSED_RAD, POS_OPEN_RAD, RAD_TO_MM, make_gripper
 
-TOPIC = teleop_topic("master")
+TOPIC = teleop_topic("gripA")
 
 # Far longer than the stub-sleep loop needs; a timeout here means the loop is
 # not running at all, not that the machine is slow.
@@ -55,6 +59,11 @@ class _PreSubTransport(InProcTeleopTransport):
 
 
 class FrameCodecTest(unittest.TestCase):
+    def test_topic_matches_the_litearm_namespace(self):
+        # Shared with the validated litearm teleoperation stack, deliberately.
+        self.assertEqual(TOPIC, "litearm/v4/gripA/gripper_teleop")
+        self.assertEqual(teleop_topic(), "litearm/v4/gripA/gripper_teleop")
+
     def test_size_is_four_doubles(self):
         self.assertEqual(FRAME_SIZE, 32)
         self.assertEqual(len(encode_frame(0.0, 0.0, 0.0, 0.0)), FRAME_SIZE)
@@ -277,8 +286,8 @@ class LiteGripTeleopApiTest(unittest.TestCase):
 
     def test_start_discovers_udp_transport_and_closes_it(self):
         g, _ = make_gripper()
-        g.teleop_start("slave", host="127.0.0.1", port=0, align=False,
-                       rate_hz=200.0)
+        g.teleop_start("slave", link="udp", host="127.0.0.1", port=0,
+                       align=False, rate_hz=200.0)
         self.assertIsNotNone(g._teleop_transport)
         self.assertIsNotNone(g._teleop_transport._sock)
         g.teleop_stop()
@@ -290,6 +299,159 @@ class LiteGripTeleopApiTest(unittest.TestCase):
         self.assertIsNotNone(g._teleop)
         g.disconnect()
         self.assertIsNone(g._teleop)
+
+    def test_start_refuses_uncalibrated_gripper(self):
+        g, _ = make_gripper()
+        g.config.calibrated = False
+        with self.assertRaises(TeleopNotReady):
+            g.teleop_start("slave", transport=InProcTeleopTransport())
+
+    def test_start_refuses_zenoh_link_without_the_extra(self):
+        # Without the optional dependency the failure must name the extra to
+        # install, not the bare ``zenoh`` module.
+        g, _ = make_gripper()
+        from litegrip import gripper as gripper_mod
+        with unittest.mock.patch.object(
+                gripper_mod, "_zenoh_transport",
+                side_effect=ImportError("pip install litegrip[zenoh]")):
+            with self.assertRaises(ImportError):
+                g.teleop_start("master")
+
+
+class ReadinessTest(unittest.TestCase):
+    """The three preconditions that must hold before anything is enabled."""
+
+    def test_accepts_a_calibrated_gripper(self):
+        g, _ = make_gripper()
+        check_ready(g.config)
+
+    def test_rejects_uncalibrated(self):
+        g, _ = make_gripper()
+        g.config.calibrated = False
+        with self.assertRaises(TeleopNotReady):
+            check_ready(g.config)
+
+    def test_rejects_zero_travel(self):
+        g, _ = make_gripper()
+        g.config.pos_open_rad = g.config.pos_closed_rad
+        with self.assertRaises(TeleopNotReady):
+            check_ready(g.config)
+
+    def test_rejects_zero_rad_to_mm(self):
+        g, _ = make_gripper()
+        g.config.rad_to_mm = 0.0
+        with self.assertRaises(TeleopNotReady):
+            check_ready(g.config)
+
+
+class ClampToCalibratedTest(unittest.TestCase):
+    def test_clamps_for_both_mountings(self):
+        for reverse in (False, True):
+            g, _ = make_gripper(reverse=reverse)
+            cfg = g.config
+            lo, hi = sorted((cfg.pos_closed_rad, cfg.pos_open_rad))
+            self.assertAlmostEqual(clamp_to_calibrated(cfg, lo - 5.0), lo)
+            self.assertAlmostEqual(clamp_to_calibrated(cfg, hi + 5.0), hi)
+            mid = (lo + hi) / 2.0
+            self.assertAlmostEqual(clamp_to_calibrated(cfg, mid), mid)
+
+
+class NonFiniteFrameTest(unittest.TestCase):
+    """A NaN frame must be dropped, never clamped onto a limit."""
+
+    def test_master_does_not_publish_a_nan_reading(self):
+        g, fake = make_gripper(start_rad=POS_OPEN_RAD)
+        fake.motor.step = lambda *a, **k: None
+        g.get_state = lambda wait=True: types.SimpleNamespace(
+            position_rad=float("nan"), position_mm=0.0, force_n=0.0,
+            error_code=1)
+        transport = InProcTeleopTransport()
+        sub = transport.sub(TOPIC)
+        mgr = GripperTeleop(g, transport, "master", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep)
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: mgr.status()["rejected"] > 0))
+            self.assertIsNone(sub.drain_latest())
+        finally:
+            mgr.stop()
+
+    def test_slave_drops_a_nan_frame_and_holds(self):
+        g, fake, transport, mgr = SlaveLoopTest()._slave(
+            align=False, watchdog_s=5.0)
+        hold = clamp_to_calibrated(g.config, POS_CLOSED_RAD)
+        transport.pub(TOPIC, encode_frame(float("nan"), 60.0, 0.0, 0.0))
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: mgr.status()["rejected"] > 0))
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 3))
+            # Every frame is the hold position: the NaN was not folded onto an
+            # end stop.
+            for frame in fake.frames:
+                self.assertAlmostEqual(frame.q, hold)
+        finally:
+            mgr.stop()
+
+
+class SlaveGuardTest(unittest.TestCase):
+    def test_align_skips_nan_and_keeps_sending_hold_frames(self):
+        g, fake, transport, mgr = SlaveLoopTest()._slave(
+            align=True, watchdog_s=5.0)
+        hold = clamp_to_calibrated(g.config, POS_CLOSED_RAD)
+        mgr.start()
+        try:
+            # Waiting for the first frame: hold frames must keep flowing.
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 3))
+            self.assertAlmostEqual(fake.frames[-1].q, hold)
+            transport.pub(TOPIC, encode_frame(float("nan"), 60.0, 0.0, 0.0))
+            self.assertTrue(_wait_until(lambda: mgr.status()["rejected"] > 0))
+            self.assertAlmostEqual(fake.frames[-1].q, hold)
+            # A good frame then aligns normally.
+            transport.pub(TOPIC, encode_frame(0.5, 60.0, 0.0, 0.0))
+            target = openness_to_rad(0.5, g.config)
+            self.assertTrue(_wait_until(
+                lambda: abs(fake.frames[-1].q - target) < 1e-9))
+        finally:
+            mgr.stop()
+
+    def test_counts_send_failures(self):
+        g, fake, transport, mgr = SlaveLoopTest()._slave(
+            align=False, watchdog_s=5.0)
+        g.send_mit_frame = lambda **kwargs: False
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: mgr.status()["send_failed"] > 0))
+        finally:
+            mgr.stop()
+
+    def test_reports_the_gripper_fault_code(self):
+        g, _ = make_gripper(start_rad=POS_CLOSED_RAD, err=0)
+        transport = _PreSubTransport()
+        mgr = GripperTeleop(g, transport, "slave", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep, align=False, watchdog_s=5.0)
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: bool(mgr.status()["fault"])))
+        finally:
+            mgr.stop()
+
+    def test_kp_kd_fall_back_to_the_calibration(self):
+        g, fake, transport, mgr = SlaveLoopTest()._slave(
+            align=False, watchdog_s=5.0)
+        g.config.kp, g.config.kd = 33.0, 4.0
+        transport.pub(TOPIC, encode_frame(0.8, 96.0, 0.0, 0.0))
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 0))
+            self.assertEqual((fake.frames[-1].kp, fake.frames[-1].kd), (33.0, 4.0))
+        finally:
+            mgr.stop()
+
+    def test_rejects_non_positive_watchdog(self):
+        g, _ = make_gripper()
+        with self.assertRaises(ValueError):
+            GripperTeleop(g, InProcTeleopTransport(), "slave", TOPIC,
+                          watchdog_s=0.0)
 
 
 if __name__ == "__main__":
