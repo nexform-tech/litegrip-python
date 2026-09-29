@@ -253,6 +253,17 @@ class LiteGrip:
         # port bound and makes matching fail intermittently.
         self._teleop_pub: Optional["TeleopTransport"] = None
 
+        # One long-running session at a time.  Teleoperation and a trajectory
+        # both own the CAN I/O for their whole duration and both run in their
+        # own thread, so "is teleop running? no → start recording" is a
+        # check-then-act race that lets two loops interleave frames on one
+        # motor.  Claiming and releasing under one lock closes it.  The owner
+        # string names the session, so the refusal says who is in the way.
+        self._session_lock = threading.Lock()
+        self._session_owner: Optional[str] = None
+        self._trajectory_recorder: Optional["TrajectoryRecorder"] = None
+        self._trajectory_player: Optional["TrajectoryPlayer"] = None
+
         # Declaring the mount is just loading the matching template, so it
         # costs no CAN traffic and is safe this early.  The template carries
         # only a direction and geometry, so it cannot clobber the identity
@@ -371,6 +382,17 @@ class LiteGrip:
         if self._teleop is not None:
             self.teleop_stop()
         self._close_teleop_pub()
+        # A recording left running would keep sampling a bus that is about to
+        # close, and a replay would keep commanding one.  stop() also leaves the
+        # gripper holding rather than slack.
+        if self._trajectory_recorder is not None:
+            self._trajectory_recorder.stop()
+            self._release_session("record")
+            self._trajectory_recorder = None
+        if self._trajectory_player is not None:
+            self._trajectory_player.stop()
+            self._release_session("play")
+            self._trajectory_player = None
 
         if self._can:
             self._can.disconnect(disable=self._disable_on_disconnect)
@@ -559,10 +581,28 @@ class LiteGrip:
     def exit_zero_gravity(self) -> None:
         """Exit zero-gravity mode and hold current position."""
         if self._can is not None and self._enabled:
+            self._hold_position()
+            log.info("Zero-gravity mode exited; holding position")
+
+    def _hold_position(self) -> None:
+        """Send one MIT frame holding the current position under the configured gains.
+
+        The one "hold, do not go slack" primitive in this SDK: the teleop
+        master and a stopping trajectory replay both need it, and neither wants
+        zero-gravity mode's log line.  It is one frame, not a sustained hold —
+        the motor self-locks a communication-loss fault about 100 ms after the
+        frames stop, so a caller that needs the jaws held longer has to keep
+        sending (or call a motion action).
+        """
+        if self._can is None or not self._enabled:
+            return
+        # Under the same lock as every other CAN operation: a caller normally
+        # joins its loop before holding, but a join that times out would
+        # otherwise let this frame overtake one still being written.
+        with self._io_lock:
             current_pos = self._can.get_position()
             self._can.control_mit(q_target=current_pos, kp=self._config.kp,
                                   kd=self._config.kd, tau_feedforward=0)
-            log.info("Zero-gravity mode exited; holding position")
 
     # ═══════════════════════════════════════════════════════════════════
     # Manual calibration (zero-gravity assisted)
@@ -1846,32 +1886,44 @@ class LiteGrip:
         check_ready(self.config)
         if self._teleop is not None and self._teleop.is_running:
             raise TeleopBusyError("teleop is already running")
+        self._claim_session("teleop", TeleopBusyError)
 
-        key = teleop_topic(grip_id)
-        created_transport = None
-        if transport is None:
-            if link == "zenoh":
-                if mode == "master":
-                    transport = created_transport = self._open_teleop_pub(port, key)
+        # Everything from here to the running loop is inside one try: the
+        # session was claimed above, and a transport that refuses (a bad link,
+        # a missing host, a port already bound) would otherwise leave the slot
+        # claimed for the life of the process, refusing every later teleop,
+        # record and replay in turn.
+        try:
+            key = teleop_topic(grip_id)
+            created_transport = None
+            if transport is None:
+                if link == "zenoh":
+                    if mode == "master":
+                        transport = self._open_teleop_pub(port, key)
+                    else:
+                        transport = _zenoh_transport("slave", key, port, host)
+                    created_transport = transport
+                elif link == "udp":
+                    if host is None:
+                        raise ValueError("host is required for the udp link")
+                    addr = f"{host}:{port}"
+                    if mode == "master":
+                        transport = UdpTeleopTransport(pub_addr=addr)
+                    else:
+                        transport = UdpTeleopTransport(bind_addr=addr)
+                    created_transport = transport
                 else:
-                    transport = created_transport = _zenoh_transport(
-                        "slave", key, port, host)
-            elif link == "udp":
-                if host is None:
-                    raise ValueError("host is required for the udp link")
-                addr = f"{host}:{port}"
-                if mode == "master":
-                    transport = created_transport = UdpTeleopTransport(pub_addr=addr)
-                else:
-                    transport = created_transport = UdpTeleopTransport(bind_addr=addr)
-            else:
-                raise ValueError(f"link must be 'zenoh' or 'udp', got {link!r}")
+                    raise ValueError(
+                        f"link must be 'zenoh' or 'udp', got {link!r}")
 
-        manager = GripperTeleop(
-            self, transport, mode, key,
-            rate_hz=rate_hz, kp=kp, kd=kd, align=align, watchdog_s=watchdog_s,
-            dq_max=dq_max)
-        manager.start()
+            manager = GripperTeleop(
+                self, transport, mode, key,
+                rate_hz=rate_hz, kp=kp, kd=kd, align=align,
+                watchdog_s=watchdog_s, dq_max=dq_max)
+            manager.start()
+        except BaseException:
+            self._release_session("teleop")
+            raise
         self._teleop = manager
         self._teleop_transport = created_transport
         return manager.status()
@@ -1909,6 +1961,7 @@ class LiteGrip:
             return {"active": False, "mode": None}
         manager.stop(timeout=timeout)
         self._teleop = None
+        self._release_session("teleop")
         if self._teleop_transport is not None:
             try:
                 self._teleop_transport.close()
@@ -1924,6 +1977,295 @@ class LiteGrip:
         return self._teleop.status()
 
     # ═══════════════════════════════════════════════════════════════════
+    # Trajectory record and replay
+    # ═══════════════════════════════════════════════════════════════════
+    #
+    # Teach a motion once, repeat it later.  See litegrip.trajectory for what
+    # the recording stores and, importantly, what a replay does *not*
+    # reproduce (force).
+
+    def record_start(
+        self,
+        rate_hz: float = 100.0,
+        zero_gravity: bool = True,
+        max_samples: Optional[int] = None,
+    ) -> dict:
+        """Begin recording this gripper's motion, in the background.
+
+        With ``zero_gravity=True`` — the hand-teaching mode — the recorder
+        itself streams zero-torque frames so the jaws can be pushed by hand.
+        Do not drive the gripper from the caller while that runs.  With
+        ``zero_gravity=False`` the recorder only *reads* state, so the caller is
+        free to drive the gripper from another thread and capture a
+        programmatic move; only the sampling touches the bus.
+
+        Recording is exclusive with teleoperation and replay.
+
+        Args:
+            rate_hz: Samples per second (default 100).
+            zero_gravity: Stream zero-torque frames, leaving the jaws
+                back-drivable by hand.
+            max_samples: Stop by itself after this many samples; ``None``
+                records until :meth:`record_stop`.
+
+        Returns:
+            The initial :meth:`trajectory_status` snapshot.
+
+        Raises:
+            TrajectoryBusyError: another session (teleop, record, play) is running.
+            NotInitializedError: not connected or not enabled.
+            TrajectoryError: the unit is not calibrated, so the normalised
+                opening a sample stores would be a guess.
+        """
+        from .trajectory import (TrajectoryBusyError, TrajectoryError,
+                                 TrajectoryRecorder)
+
+        self._check_connected()
+        self._check_enabled()
+        if not self._config.calibrated:
+            raise TrajectoryError(
+                "未标定 —— 轨迹记录的是按行程归一化的张开度, 没有标定就算不出来; "
+                "先 load_calibration() 或 zero()")
+        self._claim_session("record", TrajectoryBusyError)
+        try:
+            recorder = TrajectoryRecorder(
+                self, rate_hz=rate_hz, zero_gravity=zero_gravity,
+                max_samples=max_samples)
+            recorder.start()
+        except BaseException:
+            self._release_session("record")
+            raise
+        self._trajectory_recorder = recorder
+        return recorder.status()
+
+    def record_stop(self, allow_empty: bool = False) -> "Trajectory":
+        """Stop recording and return the captured trajectory.
+
+        Args:
+            allow_empty: Return an empty trajectory instead of raising when
+                nothing was captured.  For a deliberate start-then-immediately-
+                stop; a capture that was *meant* to contain motion should be
+                allowed to raise.
+
+        Returns:
+            The recorded :class:`~litegrip.Trajectory`.
+
+        Raises:
+            TrajectoryNotActiveError: nothing is being recorded.
+            TrajectoryRecordingError: the sampling loop died — a partial
+                capture is never returned as if it were whole.
+            TrajectoryEmptyError: no samples were captured.
+        """
+        from .trajectory import TrajectoryNotActiveError
+
+        recorder = self._trajectory_recorder
+        if recorder is None:
+            raise TrajectoryNotActiveError("没有正在进行的录制")
+        recorder.stop()
+        self._trajectory_recorder = None
+        self._release_session("record")
+        return recorder.result(allow_empty=allow_empty)
+
+    def record(
+        self,
+        duration_s: float,
+        rate_hz: float = 100.0,
+        zero_gravity: bool = True,
+    ) -> "Trajectory":
+        """Hand-teach a motion: record for *duration_s* seconds, return it.
+
+        Blocking.  Zero-gravity is on, so the jaws go slack and you push them
+        through the motion by hand while the samples are taken.  The call
+        returns once the capture is complete; if it did not fill, it raises and
+        says how many samples it got rather than returning a short recording.
+
+        Args:
+            duration_s: How many seconds to record.  The gripper is slack for
+                that long — keep a hand on it, and be aware that the jaws hold
+                nothing while it is slack.
+            rate_hz: Samples per second (default 100).
+            zero_gravity: ``False`` only if something else drives the gripper
+                during the recording — see :meth:`record_start`.
+
+        Raises:
+            ValueError: ``duration_s <= 0``.
+            TrajectoryBusyError: another session is running.
+            NotInitializedError: not connected or not enabled.
+            TrajectoryError: the unit is not calibrated.
+            TrajectoryRecordingError: the capture did not fill.
+
+        Example::
+
+            with LiteGrip("can0") as gripper:
+                gripper.load_calibration()
+                gripper.enable()
+                taught = gripper.record(5.0)      # push the jaws by hand
+                taught.save("pick")               # ~/.litegrip/trajectories/pick.lgt
+                gripper.play(taught)              # repeat it
+        """
+        duration_s = float(duration_s)
+        if duration_s <= 0.0:
+            raise ValueError(f"duration_s 需 > 0 (给的是 {duration_s})")
+        target = max(1, int(round(duration_s * float(rate_hz))))
+
+        self.record_start(rate_hz=rate_hz, zero_gravity=zero_gravity,
+                          max_samples=target)
+        recorder = self._trajectory_recorder
+        try:
+            recorder.wait_for(target, timeout=duration_s * 1.5 + 3.0)
+        except BaseException:
+            # Never leave the jaws slack and the session claimed because the
+            # capture went wrong — clean up, then let the error through.
+            recorder.stop()
+            self._trajectory_recorder = None
+            self._release_session("record")
+            raise
+        return self.record_stop()
+
+    def play_start(
+        self,
+        trajectory: "Trajectory",
+        speed: float = 1.0,
+        kp: Optional[float] = None,
+        kd: Optional[float] = None,
+        loop: bool = False,
+        align: bool = True,
+    ) -> dict:
+        """Replay a trajectory in the background.
+
+        Only position is replayed: the recorded torque and velocity are
+        diagnostics, never feed-forward, so a motion recorded while gripping an
+        object replays as a position path and *not* as the same gripping force.
+        Follow it with :meth:`grasp` if the force matters.
+
+        Args:
+            trajectory: A :class:`~litegrip.Trajectory`, from :meth:`record_stop`
+                or :meth:`~litegrip.Trajectory.load`.
+            speed: Timing multiplier; ``0.5`` plays at half speed.
+            kp, kd: Gains for the replay frames; ``None`` uses the configured ones.
+            loop: Restart at the end instead of stopping.  A one-sample
+                trajectory is a pose, so looping it holds that opening.
+            align: Move to the trajectory's first opening before following, so
+                the first frame is not a step from wherever the jaws are.
+
+        Returns:
+            The initial :meth:`trajectory_status` snapshot.
+
+        Raises:
+            TrajectoryBusyError: another session is running.
+            TrajectoryEmptyError: the trajectory has no samples.
+            ValueError: ``speed <= 0``.
+            NotInitializedError: not connected or not enabled.
+            TrajectoryError: the unit is not calibrated — the opening has to be
+                converted back through *this* gripper's travel, and with the
+                placeholder limits that conversion is a guess.
+        """
+        from .trajectory import (TrajectoryBusyError, TrajectoryError,
+                                 TrajectoryPlayer)
+
+        self._check_connected()
+        self._check_enabled()
+        if not self._config.calibrated:
+            raise TrajectoryError(
+                "未标定 —— 回放要把张开度按本机行程换算回角度, 没有标定就是瞎走; "
+                "先 load_calibration() 或 zero()")
+        self._claim_session("play", TrajectoryBusyError)
+        try:
+            player = TrajectoryPlayer(
+                self, trajectory, speed=speed, kp=kp, kd=kd, loop=loop,
+                align=align)
+            player.start()
+        except BaseException:
+            self._release_session("play")
+            raise
+        self._trajectory_player = player
+        return player.status()
+
+    def play(
+        self,
+        trajectory: "Trajectory",
+        speed: float = 1.0,
+        kp: Optional[float] = None,
+        kd: Optional[float] = None,
+        loop: bool = False,
+        align: bool = True,
+    ) -> dict:
+        """Replay a trajectory once, blocking until it finishes.
+
+        The last frame holds the final position under the configured gains, but
+        it is *one* frame: the motor self-locks a communication-loss fault about
+        100 ms after the frames stop.  Call the next action promptly, or use
+        :meth:`play_start` with ``loop=True`` for a hold that lasts until
+        :meth:`play_stop`.
+
+        Args:
+            loop: Must be ``False``.  A blocking replay of a looping trajectory
+                never returns; use :meth:`play_start` for that.
+
+        Returns:
+            The final :meth:`trajectory_status` snapshot.
+
+        Raises:
+            ValueError: ``loop`` is true, or ``speed <= 0``.
+            TrajectoryBusyError: another session is running.
+            TrajectoryEmptyError: the trajectory has no samples.
+            TrajectoryError: the unit is not calibrated, or the replay stopped
+                early — a send failed, or the sampling clock stalled.
+            NotInitializedError: not connected or not enabled.
+        """
+        from .trajectory import TrajectoryError
+
+        if loop:
+            raise ValueError(
+                "loop=True 的阻塞回放永远不会返回; 要循环播放用 "
+                "play_start(loop=True), 再用 play_stop() 停")
+        self.play_start(trajectory, speed=speed, kp=kp, kd=kd, loop=False,
+                        align=align)
+        player = self._trajectory_player
+        # Wall-clock pacing plus one align move; the margin covers a slow first
+        # frame.  A stall guard of its own, so a stopped clock cannot hang here.
+        budget = abs(float(trajectory.duration)) / float(speed) * 1.5 + 4.0
+        try:
+            finished = player.wait(budget)
+        except BaseException:
+            # Ctrl+C during a long replay is the ordinary way out of this call.
+            # Without the stop the player keeps commanding the motor and the
+            # session stays claimed, so every later record/play is refused as
+            # busy until the process ends.
+            self.play_stop()
+            raise
+        status = self.play_stop()
+        if not finished:
+            raise TrajectoryError(
+                f"回放未在 {budget:.1f}s 内结束 (已发 {status.get('frames', 0)} 帧) "
+                f"—— 采样时钟可能停住了")
+        if status.get("error") is not None:
+            raise TrajectoryError(f"回放中止: {status['error']}")
+        return status
+
+    def play_stop(self, timeout: float = 2.0) -> dict:
+        """Stop a replay and leave the gripper holding its last target."""
+        player = self._trajectory_player
+        if player is None:
+            return {"active": False, "kind": None}
+        player.stop(timeout=timeout)
+        self._trajectory_player = None
+        self._release_session("play")
+        return player.status()
+
+    def trajectory_status(self) -> dict:
+        """Snapshot of the running recording or replay, or ``{"active": False}``.
+
+        One call for both directions: the ``kind`` key says which
+        (``"record"`` / ``"play"``), and only one of them can be running.
+        """
+        if self._trajectory_recorder is not None:
+            return self._trajectory_recorder.status()
+        if self._trajectory_player is not None:
+            return self._trajectory_player.status()
+        return {"active": False, "kind": None}
+
+    # ═══════════════════════════════════════════════════════════════════
     # Internal
     # ═══════════════════════════════════════════════════════════════════
 
@@ -1934,6 +2276,34 @@ class LiteGrip:
     def _check_enabled(self) -> None:
         if not self._enabled:
             raise NotInitializedError("未使能 — 请先调用 enable()")
+
+    def _claim_session(self, owner: str, error: type) -> None:
+        """Take the single long-running session slot, or raise *error*.
+
+        Teleoperation, trajectory recording and trajectory replay all own the
+        CAN I/O for their duration.  Claiming happens under one lock, so two
+        threads starting different sessions at the same instant cannot both
+        pass the check and then both start.
+        """
+        with self._session_lock:
+            if self._session_owner is not None:
+                raise error(
+                    f"已有会话在运行 ({self._session_owner}) —— "
+                    f"teleop、录制、回放同一时刻只能有一个")
+            self._session_owner = owner
+
+    def _release_session(self, owner: str) -> None:
+        """Give the session slot back.  Harmless if *owner* no longer holds it."""
+        with self._session_lock:
+            if self._session_owner == owner:
+                self._session_owner = None
+
+    @property
+    def session(self) -> Optional[str]:
+        """Which long-running session is active: ``None``, ``"teleop"``,
+        ``"record"`` or ``"play"``.  For diagnostics and for a UI that has to
+        disable the controls that cannot run at the same time."""
+        return self._session_owner
 
     # ═══════════════════════════════════════════════════════════════════
     # Context manager
