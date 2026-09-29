@@ -18,7 +18,7 @@ from litegrip import (CALIB_TEMPLATES, LiteGrip, CommandError, GripperConfig,
                       default_calib_path, list_templates)
 from litegrip.gripper import _FACTORY_CALIB
 
-from fake_can import POS_CLOSED_RAD, POS_OPEN_RAD, make_gripper
+from fake_can import (DT, POS_CLOSED_RAD, POS_OPEN_RAD, Frame, make_gripper)
 
 
 def _capture_warnings(fn):
@@ -352,6 +352,153 @@ class TestPerChannelPaths(unittest.TestCase):
             self.assertTrue(any("channel" in m for m in warnings), warnings)
             self.assertTrue(g.config.calibrated)
             self.assertAlmostEqual(g.config.close_sign, 1.0)
+
+
+class TestCalibrateCommandLeadIsBounded(unittest.TestCase):
+    """探测指令只能领先实测位置一步 —— 这是力矩有界的前提。
+
+    2026-09-29 的事故：``_find_limit`` 用 ``target += sign * step_rad`` 累加，
+    顶到硬限位后目标仍每拍外推一步，``kp × (target − pos)`` 随之线性上涨，
+    直到结构崩掉。改成 ``target = pos + sign * step_rad`` 后，顶住的力矩上限
+    就是 ``kp × step_rad``。
+    """
+
+    def test_probe_never_leads_the_measured_position_by_more_than_one_step(self):
+        step, kp = 0.1, 100.0
+        g, fake = make_gripper(stops=True, start_rad=POS_OPEN_RAD)
+        with contextlib.redirect_stdout(io.StringIO()):
+            g.calibrate(kp=kp, step_rad=step, tau_limit=None,
+                        stall_cycles=5, max_iter=40)
+        # 只看探测段：回退用 kp=80，探测段才是 kp=kp
+        probe = [f for f in fake.frames if f.kp == kp]
+        self.assertTrue(probe, "探测段一帧都没发？")
+        worst = max(abs(f.q - f.pos_after) for f in probe)
+        self.assertLessEqual(worst, step + 1e-9)
+
+
+class TestCalibrateTorqueCeiling(unittest.TestCase):
+    """力矩上限是**独立于**堵转判据的第二道护栏。
+
+    真机顶到限位时让位的是结构（背隙、弹性变形、微滑），编码器一直在读到
+    位移，「位置不再变化」的判据永远凑不满计数。这里让假电机复现这种行为：
+    顶住之后每拍仍让位 ``CREEP × step``，于是位置式堵转**永远不成立**，
+    只有力矩上限能停住探测。
+    """
+
+    # 每帧让位 CREEP × step = 1e-3 rad。太小则位置式判据会成立（delta 顶穿
+    # stall_delta），太大则一拍就让位超过指令领先量、力矩反而缩回去。
+    CREEP = 0.01
+    STEP = 0.1
+    KP = 100.0
+
+    def _calibrate(self, tau_limit, max_iter=40, stall_cycles=5):
+        g, fake = make_gripper(stops=True, start_rad=POS_OPEN_RAD)
+        creep, step, kp_probe = self.CREEP, self.STEP, self.KP
+
+        def soft_control_mit(q_target, kp, kd, dq_target=0.0,
+                             tau_feedforward=0.0):
+            m = fake.motor
+            if (m.limit_hi is not None and q_target > m.limit_hi
+                    and m.pos >= m.limit_hi - 1e-9):
+                # 顶在限位上：结构让位，位置读数是动的（delta > stall_delta）
+                m.pos += creep * step
+                m.tau = kp * (q_target - m.pos)
+            else:
+                m.step(q_target, kp, dq_target, tau_feedforward, DT)
+            fake.frames.append(Frame(
+                q=q_target, kp=kp, kd=kd, dq=dq_target,
+                tau_ff=tau_feedforward, pos_after=m.pos, tau_nm=m.tau))
+            return True
+
+        fake.control_mit = soft_control_mit
+        with contextlib.redirect_stdout(io.StringIO()):
+            data = g.calibrate(kp=kp_probe, step_rad=step, stall_delta=0.0015,
+                               stall_cycles=stall_cycles, max_iter=max_iter,
+                               tau_limit=tau_limit)
+        return data
+
+    def test_stall_counter_alone_would_not_stop_this_probe(self):
+        # 没有力矩上限时位置式判据永远不成立 ⇒ 一路顶到步数上限，
+        # 假结构一直让位，闭合端读数被推到限位之外很远。
+        data = self._calibrate(tau_limit=None)
+        self.assertGreater(data.zero_position, POS_CLOSED_RAD + 0.5)
+
+    def test_torque_ceiling_aborts_the_probe_the_counter_cannot(self):
+        # 一顶住，kp × (领先量) = 100 × 0.07 = 7 Nm ≥ 2 Nm ⇒ 当帧就停，
+        # 只让位了一拍结构形变（0.03 rad），远没被推穿。
+        data = self._calibrate(tau_limit=2.0)
+        self.assertAlmostEqual(data.zero_position, POS_CLOSED_RAD, delta=0.1)
+
+    def test_ceiling_is_independent_of_the_stall_count(self):
+        """把 stall_cycles 抬到探测步数都够不着，力矩上限仍要停下它。"""
+        data = self._calibrate(tau_limit=2.0, max_iter=40,
+                               stall_cycles=10 ** 6)
+        self.assertAlmostEqual(data.zero_position, POS_CLOSED_RAD, delta=0.1)
+
+
+class TestMasterIdIsNotPinned(unittest.TestCase):
+    """``mst_id`` 未知时不能被写成 0 —— 0 会被当成「就用 0x00」。
+
+    写死的 0 会把 CAN 接收过滤设成 ``0x000``，电机所有应答都被丢掉，
+    ``enable()`` 于是在长重试里空转（2026-09-29 真机复现：40 秒后失败、
+    指示灯红绿交替）。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, "can1_calibration.json")
+
+    def test_save_omits_an_unknown_master_id(self):
+        g = LiteGrip("can1")
+        g.load_template("normal")
+        g.save_calibration(self.path)
+        with open(self.path) as f:
+            self.assertNotIn("mst_id", json.load(f))
+
+    def test_save_keeps_a_known_master_id(self):
+        g = LiteGrip("can1")
+        g.load_template("normal")
+        g._mst_id = 0x18
+        g.save_calibration(self.path)
+        with open(self.path) as f:
+            self.assertEqual(json.load(f)["mst_id"], 0x18)
+
+    def _seed(self, **extra):
+        data = {"channel": "can1", "can_id": 8, "calibrated": True,
+                "zero_position_rad": 0.114, "max_position_rad": -1.491,
+                "rad_to_mm": 74.8}
+        data.update(extra)
+        with open(self.path, "w") as f:
+            json.dump(data, f)
+        return self.path
+
+    def test_zero_master_id_in_a_file_keeps_auto_detect(self):
+        path = self._seed(mst_id=0)
+        g = LiteGrip("can1")
+        self.assertTrue(g.load_calibration(path))
+        self.assertIsNone(g.mst_id)
+
+    def test_zero_can_id_in_a_file_keeps_the_default(self):
+        path = self._seed(can_id=0)
+        g = LiteGrip("can1")
+        self.assertTrue(g.load_calibration(path))
+        self.assertNotEqual(g.can_id, 0)
+
+    def test_round_trip_through_a_real_save_keeps_master_id_unknown(self):
+        first = LiteGrip("can1")
+        first.load_template("normal")
+        first.save_calibration(self.path)
+        second = LiteGrip("can1")
+        self.assertTrue(second.load_calibration(self.path))
+        self.assertIsNone(second.mst_id)
+
+
+class TestLibraryDoesNotSilenceItsOwnLogs(unittest.TestCase):
+    """库不得装 NullHandler：通道不一致这类 WARNING 是安全信号，必须可见。"""
+
+    def test_no_handler_is_installed_on_the_package_logger(self):
+        self.assertEqual(logging.getLogger("litegrip").handlers, [])
 
 
 if __name__ == "__main__":

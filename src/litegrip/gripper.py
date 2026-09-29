@@ -721,12 +721,13 @@ class LiteGrip:
 
     def calibrate_guided(
         self,
-        kp: float = 60.0,
+        kp: float = 20.0,
         kd: float = 2.0,
-        step_rad: float = 0.08,
-        stall_delta: float = 0.0004,
-        stall_cycles: int = 6,
-        max_iter: int = 40,
+        step_rad: float = 0.05,
+        stall_delta: float = 0.0015,
+        stall_cycles: int = 5,
+        max_iter: int = 200,
+        tau_limit: Optional[float] = 2.0,
     ) -> CalibrationData:
         """Guided two-step calibration with user confirmation at each limit.
 
@@ -748,6 +749,10 @@ class LiteGrip:
             stall_delta: Position delta for auto-stall detection (rad).
             stall_cycles: Consecutive stalls to auto-confirm limit.
             max_iter: Max steps per direction.
+            tau_limit: Torque ceiling in Nm; the probe stops when ``|tau|``
+                reaches it (``None`` disables the ceiling).  The command lead is
+                already bounded to ``step_rad`` here, so this is the second,
+                independent guard.
 
         Returns:
             CalibrationData; :attr:`config` is updated in-place.
@@ -785,6 +790,7 @@ class LiteGrip:
 
                 new_pos = self._can.get_position()
                 delta = abs(new_pos - current)
+                tau = self._can.get_torque()
 
                 # Non-blocking keyboard check
                 hit_enter = False
@@ -795,9 +801,14 @@ class LiteGrip:
                         hit_enter = True
 
                 print(f"    [{i}] pos={new_pos:.4f} rad  d={delta:.5f}  "
-                      f"stall={stall}", end="")
+                      f"tau={tau:+.3f}  stall={stall}", end="")
                 if hit_enter:
                     print("  ← 用户确认")
+                    return new_pos
+
+                if tau_limit is not None and abs(tau) >= tau_limit:
+                    print(f"  ← 力矩达到上限 {tau_limit:.2f} Nm（{tau:+.3f}）")
+                    print(f"    → 停止推进并保持: {new_pos:.6f} rad")
                     return new_pos
 
                 if delta < stall_delta:
@@ -897,7 +908,11 @@ class LiteGrip:
         data = {
             "channel": self._channel,
             "can_id": self._can_id,
-            "mst_id": self._mst_id or 0,
+            # Only stamp mst_id when it is actually known.  Writing a falsy 0
+            # would pin auto-detection: load_calibration would then install a
+            # RX filter of 0x000, every reply from the motor would be dropped,
+            # and enable() would fail after a long retry loop.  Omitting it
+            # keeps the value "unknown", which connect() reads as auto-detect.
             "canfd_mode": self._canfd_mode or False,
             "calibrated": True,
             # Which of zero/max is numerically larger is what carries the
@@ -911,6 +926,8 @@ class LiteGrip:
             "kd": self._config.kd,
             "grasp_torque_threshold": self._config.grasp_torque_threshold,
         }
+        if self._mst_id:
+            data["mst_id"] = self._mst_id
         parent = _os.path.dirname(path)
         if parent:
             _os.makedirs(parent, exist_ok=True)
@@ -1039,10 +1056,13 @@ class LiteGrip:
                         "同一台电脑上多台夹爪共用 CAN ID 时，通道是唯一身份键，"
                         "确认没有指错文件。", file_channel, self._channel)
 
-        # Also update instance-level IDs if present
-        if "can_id" in data:
+        # Also update instance-level IDs if present.  A falsy value counts as
+        # "unknown", not as ID 0: files written before this SDK started omitting
+        # an unset mst_id (and hand-edited ones) may carry ``"mst_id": 0``, which
+        # would otherwise pin the CAN RX filter to 0x000 and drop every reply.
+        if data.get("can_id"):
             self._can_id = int(data["can_id"])
-        if "mst_id" in data:
+        if data.get("mst_id"):
             self._mst_id = int(data["mst_id"])
 
         s = self._config.close_sign
@@ -1410,12 +1430,13 @@ class LiteGrip:
 
     def calibrate(
         self,
-        kp: float = 60.0,
+        kp: float = 20.0,
         kd: float = 2.0,
-        step_rad: float = 0.1,
-        stall_delta: float = 0.0003,
-        stall_cycles: int = 8,
-        max_iter: int = 30,
+        step_rad: float = 0.05,
+        stall_delta: float = 0.0015,
+        stall_cycles: int = 5,
+        max_iter: int = 200,
+        tau_limit: Optional[float] = 2.0,
     ) -> CalibrationData:
         """Calibrate the gripper: find close and open mechanical limits.
 
@@ -1431,13 +1452,24 @@ class LiteGrip:
         comes from :attr:`GripperConfig.close_sign` (load a calibration
         template first for a reverse mount), and this routine preserves it.
 
+        Safety: at a hard stop the encoder keeps creeping (backlash, elastic
+        deformation, micro-slip), so the position-based stall test alone can
+        never fire — the command would keep advancing and ``kp × error`` would
+        keep growing until the structure breaks.  Two independent guards are
+        therefore in place: the command lead is re-derived from the *measured*
+        position every cycle (bounded to ``step_rad``, so pressing torque is at
+        most ``kp × step_rad``), and the probe aborts the moment ``|tau|``
+        reaches ``tau_limit``.
+
         Args:
             kp: Probing stiffness (low = gentle).
             kd: Probing damping.
-            step_rad: Step size per iteration (rad).
+            step_rad: Step size per iteration (rad); also the command lead cap.
             stall_delta: Position change threshold for stall detection (rad).
             stall_cycles: Consecutive stalls to confirm limit.
             max_iter: Max steps per direction (safety cap).
+            tau_limit: Torque ceiling in Nm.  The probe stops as soon as
+                ``|tau|`` reaches this; ``None`` disables the ceiling.
 
         Returns:
             CalibrationData with zero/max position, travel range, and
@@ -1462,11 +1494,15 @@ class LiteGrip:
 
             self._can.update_state(timeout_s=0.05)
             current = self._can.get_position()
-            target = current
             stall = 0
 
             for i in range(max_iter):
-                target += sign * step_rad
+                # Re-derive the command from the *measured* position each cycle.
+                # Accumulating a running target (``target += sign * step_rad``)
+                # lets the command lead grow without bound once the stop is
+                # reached, and the pressing torque (kp × lead) grows with it.
+                # Bounding the lead to one step caps it at kp × step_rad.
+                target = current + sign * step_rad
                 self._can.control_mit_stream(target, kp, kd, duration_s=0.3, interval_s=0.005)
                 self._can.update_state(timeout_s=0.1)
 
@@ -1476,6 +1512,11 @@ class LiteGrip:
 
                 print(f"    [{i}] tgt={target:+.3f} pos={new_pos:.4f} "
                       f"d={delta:.5f} tau={tau:+.3f} st={stall}")
+
+                if tau_limit is not None and abs(tau) >= tau_limit:
+                    print(f"    → 力矩达到上限 {tau_limit:.2f} Nm（{tau:+.3f}），"
+                          f"停止推进并保持: {new_pos:.6f} rad")
+                    return new_pos
 
                 if delta < stall_delta:
                     stall += 1
@@ -1489,19 +1530,47 @@ class LiteGrip:
             print(f"    → 安全停止（达到最大步数 {max_iter}）: {current:.4f} rad")
             return current
 
+        def _bounded_move(target: float, label: str) -> None:
+            """Move toward *target*, guarded the same way as the probe.
+
+            The plain ``goto_rad`` streams one constant command for half a
+            second with no ceiling.  If the jaws already sit at the stop that
+            command is heading for, the pressing torque is ``kp × 0.2`` (16 Nm at
+            ``kp=80``) held for the whole duration — the same kind of unguarded
+            push that broke a jaw.  Leading by one step at a time and watching
+            ``|tau|`` bounds it to the probe's ceiling instead.
+            """
+            current = self._can.get_position()
+            sign = 1.0 if target >= current else -1.0
+            for _ in range(max_iter):        # same cap as the probe
+                if abs(target - current) <= step_rad:
+                    return
+                self._can.control_mit_stream(
+                    current + sign * step_rad, kp, kd,
+                    duration_s=0.1, interval_s=0.005)
+                self._can.update_state(timeout_s=0.1)
+                new_pos = self._can.get_position()
+                tau = self._can.get_torque()
+                if tau_limit is not None and abs(tau) >= tau_limit:
+                    print(f"    → {label}：力矩达到上限 {tau_limit:.2f} Nm"
+                          f"（{tau:+.3f}），停止")
+                    return
+                if abs(new_pos - current) < stall_delta:
+                    print(f"    → {label}：位置不再变化，停止")
+                    return
+                current = new_pos
+
         # 1. Safe back-off (a nudge toward the close side, as before, flipped
         #    with the mount)
         print("  安全回退...")
-        self.goto_rad(init_pos + s * 0.2, kp=80, kd=kd, duration=0.5)
-        self._can.update_state(timeout_s=0.1)
+        _bounded_move(init_pos + s * 0.2, "安全回退")
 
         # 2. Find zero (close direction)
         zero_pos = _find_limit("close")
 
         # 3. Back off, away from the close stop toward the open side
         print("  回退...")
-        self.goto_rad(zero_pos - s * 0.3, kp=80, kd=kd, duration=0.5)
-        self._can.update_state(timeout_s=0.1)
+        _bounded_move(zero_pos - s * 0.3, "回退")
 
         # 4. Find max (open direction)
         max_pos = _find_limit("open")

@@ -104,12 +104,17 @@ class MotionConfig:
     enable_retry_interval: float = 0.2  # 使能重试间隔 s
 
     # ── zero() 标定探测 ────────────────────────────────────────────────
-    calib_kp: float = 60.0              # 低刚度更温和
+    # 探测顶在限位上的力矩就是 calib_kp × 指令领先量，而领先量本身被
+    # _find_limit 限成 calib_step_rad（目标只比实测位置多一步），所以这两个
+    # 值同时决定「走多快」和「顶多重」：20 × 0.05 ⇒ 空载推进约 1 Nm，
+    # 远低于 DM4310 的峰值。calib_tau_limit 是独立于堵转判据的硬上限。
+    calib_kp: float = 20.0              # 低刚度更温和（力矩 = kp × 领先量）
     calib_kd: float = 2.0
-    calib_step_rad: float = 0.1         # 每步步进 rad
+    calib_step_rad: float = 0.05        # 每步步进 rad（= 指令领先上限）
+    calib_tau_limit: float = 2.0        # 力矩上限 Nm，超过即停
     calib_stall_delta: float = 0.0015   # 标定堵转判据 rad
     calib_stall_cycles: int = 5         # 标定连续堵转次数
-    calib_max_iter: int = 80            # 单向步数上限
+    calib_max_iter: int = 200           # 单向步数上限
 
     # ── 测试/仿真缝 ────────────────────────────────────────────────────
     sleep_fn: Callable[[float], None] = field(
@@ -382,6 +387,9 @@ class GripperActions:
         """完整标定：探闭合 + 张开两个限位，算出行程与换算系数，并存盘。
 
         过程中夹爪会主动顶住两端机械限位（低刚度探测）。确保行程内无物。
+        探测自带两道护栏：指令领先量不超过 ``calib_step_rad``，且 ``|tau|`` 一到
+        ``calib_tau_limit`` 立即停止推进 —— 顶住限位时结构让位（背隙/弹性变形）
+        会让位置读数一直在动，只靠「位置不再变化」是停不下来的。
 
         Returns:
             :class:`CalibrationData`。
@@ -394,6 +402,7 @@ class GripperActions:
             stall_delta=cfg.calib_stall_delta,
             stall_cycles=cfg.calib_stall_cycles,
             max_iter=cfg.calib_max_iter,
+            tau_limit=cfg.calib_tau_limit,
         )
         self._g.save_calibration()
         return data
