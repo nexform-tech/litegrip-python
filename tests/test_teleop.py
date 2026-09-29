@@ -178,6 +178,25 @@ class MasterLoopTest(unittest.TestCase):
         finally:
             mgr.stop()
 
+    def test_status_reports_position_and_force(self):
+        # A caller (an operator UI) shows the jaws' position and force from the
+        # status alone — it cannot read the bus itself, the loop owns it.
+        g, fake = make_gripper(start_rad=POS_OPEN_RAD)
+        fake.motor.step = lambda *a, **k: None
+        transport = InProcTeleopTransport()
+        sub = transport.sub(TOPIC)
+        mgr = GripperTeleop(g, transport, "master", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep)
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: mgr.status()["frames"] > 0))
+            _o, position_mm, force_n, _ts = decode_frame(sub.drain_latest())
+            status = mgr.status()
+            self.assertAlmostEqual(status["position_mm"], position_mm, places=3)
+            self.assertAlmostEqual(status["force_n"], force_n, places=3)
+        finally:
+            mgr.stop()
+
     def test_stop_leaves_zero_gravity(self):
         g, fake = make_gripper()
         mgr = GripperTeleop(g, InProcTeleopTransport(), "master", TOPIC,
@@ -210,6 +229,19 @@ class SlaveLoopTest(unittest.TestCase):
             last = fake.frames[-1]
             self.assertEqual((last.kp, last.kd), (100.0, 2.0))
             self.assertFalse(mgr.status()["stale"])
+        finally:
+            mgr.stop()
+
+    def test_status_reports_the_followed_position_and_force(self):
+        g, fake, transport, mgr = self._slave(align=False, watchdog_s=5.0)
+        transport.pub(TOPIC, encode_frame(0.25, 30.0, -4.5, 0.0))
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: mgr.status()["frames"] > 0))
+            status = mgr.status()
+            self.assertAlmostEqual(status["openness"], 0.25, places=4)
+            self.assertAlmostEqual(status["position_mm"], 30.0, places=4)
+            self.assertAlmostEqual(status["force_n"], -4.5, places=4)
         finally:
             mgr.stop()
 

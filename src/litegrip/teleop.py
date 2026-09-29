@@ -485,6 +485,13 @@ class GripperTeleop:
         # Diagnostics.
         self._frames = 0
         self._last_openness = 0.0
+        #: Last ``position_mm`` / ``force_n`` the session saw — the master reads
+        #: them off its own state, the slave takes them from the frame it
+        #: followed.  Reported by :meth:`status` so a caller can show what the
+        #: jaws are doing without a second CAN reader (the teleop loop owns the
+        #: bus while it runs).
+        self._last_position_mm = 0.0
+        self._last_force_n = 0.0
         self._last_frame_ts = 0.0
         #: Explicit "have we ever received a frame" flag.  The watchdog only
         #: applies after the first frame, and this must not be inferred from a
@@ -577,6 +584,10 @@ class GripperTeleop:
             "last_frame_age_ms": age_ms,
             "stale": self._stale,
             "openness": round(self._last_openness, 4),
+            # Position and force behind that opening — the master's own state,
+            # or (slave) the leader's values from the followed frame.
+            "position_mm": round(self._last_position_mm, 4),
+            "force_n": round(self._last_force_n, 4),
             "loop_hz": round(self._loop_hz, 1),
             # Slave only: the leader velocity last fed forward, in rad/s.
             "dq_cmd": round(self._dq_cmd, 4),
@@ -617,6 +628,8 @@ class GripperTeleop:
                     self._count_rejected(openness)
                 else:
                     self._last_openness = openness
+                    self._last_position_mm = float(state.position_mm)
+                    self._last_force_n = float(state.force_n)
                     try:
                         self._tp.pub(self._topic, encode_frame(
                             openness, state.position_mm, state.force_n,
@@ -657,6 +670,8 @@ class GripperTeleop:
                 self._last_frame_ts = self._time_fn()
                 self._ever_received = True
                 self._last_openness = _clamp01(first[0])
+                self._last_position_mm = float(first[1])
+                self._last_force_n = float(first[2])
             else:
                 log.warning("[slave] no frame within align timeout; "
                             "holding current position")
@@ -684,6 +699,8 @@ class GripperTeleop:
                             self._prev_q = q_cmd
                             self._prev_rx_ts = rx_ts
                             self._last_openness = _clamp01(openness)
+                            self._last_position_mm = float(_mm)
+                            self._last_force_n = float(_force)
                             self._last_frame_ts = rx_ts
                             self._ever_received = True
                             self._frames += 1

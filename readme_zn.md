@@ -151,8 +151,9 @@ python3 examples/teleop.py --mode slave  --channel can0 --host 192.168.1.20
 两端必须共用 `grip_id`（默认 `gripA`），且都已连接、已使能。遥操是互斥的：后台循环独占 CAN
 读写，在 `teleop_stop()` 之前不要再从调用方驱动夹爪。`teleop_start` 返回初始的
 `teleop_status()`；`teleop_status()` 报告 `active`、`mode`、`topic`、`frames`、
-`last_frame_age_ms`、`stale`、`openness`、`dq_cmd`、`loop_hz`、`rejected`、`send_failed`、
-`fault`，主端另有 `matching`。
+`last_frame_age_ms`、`stale`、`openness`、`position_mm`、`force_n`、`dq_cmd`、`loop_hz`、
+`rejected`、`send_failed`、`fault`，主端另有 `matching`。`position_mm` 与 `force_n` 是主端自
+己的状态，或从端刚刚跟随的那一帧里主端的值 —— 调用方不必再开一路 CAN 读就能显示夹爪。
 
 - **从端把主端的速度前馈下去。** 线上帧只带 openness，所以从端用相邻两帧的差分还原出速度，作为
   电机的 `dq` 目标下发 —— 机械臂遥操是直接发 `dq` 的。没有这一项，从端只能靠位置误差出力，会
