@@ -119,6 +119,11 @@ from .teleop import (
     TeleopError,
     TeleopBusyError,
     TeleopNotActiveError,
+    TeleopNotReady,
+    check_ready,
+    clamp_to_calibrated,
+    DEFAULT_GRIP_ID,
+    DEFAULT_GRIP_PORT,
     FRAME_SIZE,
     encode_frame,
     decode_frame,
@@ -127,6 +132,30 @@ from .teleop import (
 
 # ── CAN subpackage (expert) ─────────────────────────────────────────────
 from . import can
+
+
+# The zenoh link needs the optional ``zenoh`` dependency, so it is resolved on
+# first access rather than at import time: ``import litegrip`` must work on a
+# bare robot controller that will never teleoperate.  Install the extra with
+# ``pip install litegrip[zenoh]``.
+_ZENOH_EXPORTS = frozenset(
+    {"ZenohTeleopTransport", "Listener", "Connector", "LatestSlot"})
+
+
+def __getattr__(name: str):
+    if name in _ZENOH_EXPORTS:
+        try:
+            from . import zenoh_link
+        except ImportError as e:
+            raise ImportError(
+                f"litegrip.{name} needs the optional zenoh dependency — install "
+                "it with `pip install litegrip[zenoh]`") from e
+        return getattr(zenoh_link, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | _ZENOH_EXPORTS)
 
 __all__ = [
     "__version__",
@@ -177,10 +206,20 @@ __all__ = [
     "TeleopError",
     "TeleopBusyError",
     "TeleopNotActiveError",
+    "TeleopNotReady",
+    "check_ready",
+    "clamp_to_calibrated",
+    "DEFAULT_GRIP_ID",
+    "DEFAULT_GRIP_PORT",
     "FRAME_SIZE",
     "encode_frame",
     "decode_frame",
     "teleop_topic",
+    # Teleoperation — zenoh link (resolved lazily; needs litegrip[zenoh])
+    "ZenohTeleopTransport",
+    "Listener",
+    "Connector",
+    "LatestSlot",
     # Subpackages
     "can",
 ]

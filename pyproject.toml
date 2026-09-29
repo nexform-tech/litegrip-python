@@ -50,6 +50,12 @@ classifiers = [
 # that this installs on a bare robot controller.
 dependencies = []
 
+[project.optional-dependencies]
+# The point-to-point zenoh link used by the field teleoperation.  Optional so
+# the base install stays stdlib + SocketCAN; only `litegrip.zenoh_link` and the
+# default `teleop_start` transport need it.
+zenoh = ["eclipse-zenoh>=1.0"]
+
 [project.urls]
 Repository = "https://github.com/nexform-tech/litegrip-python"
 Issues = "https://github.com/nexform-tech/litegrip-python/issues"

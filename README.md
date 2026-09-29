@@ -17,6 +17,7 @@ using the MIT control protocol.
 | Platform | Linux only (SocketCAN) |
 | Python | 3.8 or newer |
 | Runtime dependencies | none, standard library only |
+| Optional extra | `litegrip[zenoh]` — the point-to-point zenoh teleoperation link |
 
 ## Installation
 
@@ -117,20 +118,39 @@ you push its jaws by hand — and it publishes how far open it is at the loop ra
 normalized opening in `[0, 1]`, not an angle, so the two ends do not need the same calibration,
 mount, or zero point.
 
+### Transport
+
+The link is a **point-to-point zenoh** session — the same structure the field teleoperation runs
+on. Both ends use `mode="peer"` with all discovery **off** (no multicast, no gossip), so the only
+way they find each other is an explicit endpoint: the leader listens on a TCP port, the follower
+connects to the leader's address. The topic is the shared litearm namespace,
+`litearm/v4/{grip_id}/gripper_teleop`, and the frame is byte-identical to the litearm stack's, so
+the two interoperate.
+
+zenoh is an optional dependency — the base SDK stays stdlib + SocketCAN:
+
+```bash
+pip install 'litegrip[zenoh]'
+```
+
+`link="udp"` selects a plain-UDP fallback for a trusted LAN; it has no authentication or
+encryption. Pass `transport=` a `TeleopTransport` to supply your own; an injected one is never
+closed by the SDK.
+
 ```python
 from litegrip import LiteGrip
 
-# Leader: publish this gripper's opening to the follower at 192.168.1.20.
+# Leader: listen and publish this gripper's opening.
 with LiteGrip("can0") as master:
     master.load_calibration()
     master.enable()
-    master.teleop_start("master", host="192.168.1.20")
+    master.teleop_start("master")                      # zenoh, gripA, port 17448
 
-# Follower: bind, align to the first frame, then follow.
+# Follower: connect to the leader, align to the first frame, then follow.
 with LiteGrip("can0") as slave:
     slave.load_calibration()
     slave.enable()
-    slave.teleop_start("slave", host="0.0.0.0")
+    slave.teleop_start("slave", host="192.168.1.20")
     while True:
         print(slave.teleop_status())   # frames, openness, loop_hz, stale, ...
 ```
@@ -139,27 +159,34 @@ with LiteGrip("can0") as slave:
 
 ```bash
 # Machine A — the leader you push by hand:
-python3 examples/teleop.py --mode master --channel can0 --host 192.168.1.20
+python3 examples/teleop.py --mode master --channel can0
 # Machine B — the follower:
-python3 examples/teleop.py --mode slave  --channel can0 --host 0.0.0.0
+python3 examples/teleop.py --mode slave  --channel can0 --host 192.168.1.20
 ```
 
-Both ends must share `master_id` (default `master`) and be connected and enabled first. Teleop is
+Both ends must share `grip_id` (default `gripA`) and be connected and enabled first. Teleop is
 exclusive: the background loop owns the CAN I/O, so do not drive the gripper from the caller until
 `teleop_stop()`. `teleop_start` returns the initial `teleop_status()` snapshot; `teleop_status()`
-reports `active`, `mode`, `topic`, `frames`, `last_frame_age_ms`, `stale`, `openness`, `loop_hz`.
+reports `active`, `mode`, `topic`, `frames`, `last_frame_age_ms`, `stale`, `openness`,
+`loop_hz`, `rejected`, `send_failed`, `fault`, and (master) `matching`.
 
-- **The transport is plain UDP**, with no authentication or encryption. Use it only on a trusted
-  network. Pass `transport=` a `TeleopTransport` to supply your own; an injected one is never closed
-  by the SDK.
 - **A follower that loses the leader holds its position, it does not go slack.** After
   `watchdog_s` (default `0.2`) without a fresh frame it keeps commanding its last target under the
   follow gains, so `stale` goes true but the jaws stay put — and can hold whatever is between them.
-- **The follower clamps the incoming opening to `[0, 1]`**, i.e. to its own calibrated travel, so a
-  bad frame cannot command it past a limit.
+- **Non-finite frames are dropped, never clamped.** A NaN opening would pass a `[0, 1]` clamp and
+  then fold onto a hard stop, silently driving the follower closed. Both ends reject NaN / ±inf at
+  the wire boundary — including the first frame used for the align — count them in `rejected`, and
+  hold position instead.
+- **The follower clamps the target into its own calibrated travel every cycle**, and checks what
+  the SDK tells it: a `send_mit_frame` that returns `False` bumps `send_failed`, and a gripper
+  `error_code` other than "enabled" is reported in `fault` — neither is swallowed.
 - **Stopping leaves the gripper holding**, not slack: the master leaves zero-gravity mode on
-  `teleop_stop()`, so its jaws hold under the configured gains.
-- Follow gains default to `kp=100.0`, `kd=2.0`; override with `kp=` / `kd=`.
+  `teleop_stop()` and the follower sends one final frame at its current angle, so both hold under
+  the configured gains and neither disables.
+- Teleop refuses to start on an uncalibrated gripper, a zero-travel one, or one with
+  `rad_to_mm == 0` (`TeleopNotReady`), before anything is enabled or driven.
+- Follow gains default to the calibration's `kp` / `kd` (`100.0` / `2.0` out of the box); override
+  with `kp=` / `kd=`.
 
 ## The six actions
 
