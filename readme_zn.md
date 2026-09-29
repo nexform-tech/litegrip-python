@@ -215,9 +215,10 @@ with LiteGrip("can0") as gripper:
 | `hold_interval` | `0.2` | 保力的分片时长 s |
 | `hold_kp` / `hold_kd` | `150.0` / `2.0` | 保力时用的刚度 / 阻尼 |
 | `enable_retries` / `enable_retry_interval` | `3` / `0.2` | 使能重试次数与间隔 |
-| `calib_kp` / `calib_kd` | `60.0` / `2.0` | `zero()` 探测用的刚度 / 阻尼 |
-| `calib_step_rad` | `0.1` | `zero()` 的探测步长 |
-| `calib_stall_delta` / `calib_stall_cycles` / `calib_max_iter` | `0.0015` / `5` / `80` | 探测的堵转判据 |
+| `calib_kp` / `calib_kd` | `20.0` / `2.0` | `zero()` 探测用的刚度 / 阻尼 |
+| `calib_step_rad` | `0.05` | `zero()` 的探测步长，同时也是指令领先实测位置的上限 |
+| `calib_tau_limit` | `2.0` | 探测的力矩上限 Nm —— `\|tau\|` 一到就停 |
+| `calib_stall_delta` / `calib_stall_cycles` / `calib_max_iter` | `0.0015` / `5` / `200` | 探测的堵转判据 |
 | `sleep_fn` / `monotonic_fn` | `time.sleep` / `time.monotonic` | 给测试和仿真留的缝 |
 
 `sleep_fn` 与 `monotonic_fn` 是官方推荐的仿真入口：引擎内部只调这两个，所以传
@@ -327,8 +328,13 @@ with LiteGrip("can0") as gripper:
 - `enable()` 现在会如实报失败。以前只要状态帧是 `0` 或 `1` 它就返回 `True`，于是「根本没
   使能」的电机看起来是使能的。那些忽略返回值继续往下跑的代码，现在会在启动时看到
   `HardwareError`。
-- `zero()` 不等于 `calibrate()`。它按 `MotionConfig.calib_*` 的参数探测并保存结果，而
-  `calibrate()` 保留着自己那套更旧的默认值，而且不存盘。
+- `zero()` 不等于 `calibrate()`。两者现在用同一套默认值、都把指令领先量限成一步、
+  都在 `tau_limit` 到顶时停下；区别只在于 `zero()` 取 `MotionConfig.calib_*` 并**存盘**，
+  而 `calibrate()` 直接收参数、不存盘。
+- 探测在硬限位处是安全的。旧实现无条件外推目标，顶住之后指令每拍继续领先，`kp × 误差`
+  随之上涨直到结构崩掉。现在每个循环都从实测位置重新算目标（领先量 ≤ `calib_step_rad`），
+  且 `|tau|` 一到 `calib_tau_limit` 立刻中止 —— 这道护栏不依赖位置式堵转判据，后者在结构
+  还在让位时永远不会成立。
 - `MoveResult.__bool__` 以前是 `reached and not stalled`，现在是 `ok`。对 `grasp` 闭合段
   两者一致；对 `open` 和 `close` 恰好相反 —— 成功顶到限位是 `stalled=True,
   reached=False`，所以 `if gripper.close():` 的含义变了，尽管类型没变。

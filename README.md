@@ -232,9 +232,10 @@ with LiteGrip("can0") as gripper:
 | `hold_interval` | `0.2` | force-hold slice length, seconds |
 | `hold_kp` / `hold_kd` | `150.0` / `2.0` | gains used while holding force |
 | `enable_retries` / `enable_retry_interval` | `3` / `0.2` | enable retry count and gap |
-| `calib_kp` / `calib_kd` | `60.0` / `2.0` | probe stiffness used by `zero()` |
-| `calib_step_rad` | `0.1` | probe increment used by `zero()` |
-| `calib_stall_delta` / `calib_stall_cycles` / `calib_max_iter` | `0.0015` / `5` / `80` | probe stall criteria |
+| `calib_kp` / `calib_kd` | `20.0` / `2.0` | probe stiffness used by `zero()` |
+| `calib_step_rad` | `0.05` | probe increment used by `zero()`, and the cap on how far the command may lead the measured position |
+| `calib_tau_limit` | `2.0` | probe torque ceiling, Nm — the probe freezes as soon as `\|tau\|` reaches it |
+| `calib_stall_delta` / `calib_stall_cycles` / `calib_max_iter` | `0.0015` / `5` / `200` | probe stall criteria |
 | `sleep_fn` / `monotonic_fn` | `time.sleep` / `time.monotonic` | seams for tests and simulation |
 
 `sleep_fn` and `monotonic_fn` are the supported way to simulate the gripper: the engine calls
@@ -361,8 +362,16 @@ These behaviour changes matter beyond the signatures:
 - `enable()` now reports failure honestly. It used to return `True` whenever the status frame
   held `0` or `1`, so a motor that never energised looked enabled. Code that ignored the return
   value and carried on will now see a `HardwareError` at startup instead.
-- `zero()` is not `calibrate()`. It probes with the `MotionConfig.calib_*` values and saves the
-  result, whereas `calibrate()` keeps its own older defaults and does not save.
+- `zero()` is not `calibrate()`. Both now probe with the same defaults and both bound the command
+  lead to one step and stop at `tau_limit`; the difference is that `zero()` probes with the
+  `MotionConfig.calib_*` values and **saves** the result, while `calibrate()` takes its arguments
+  directly and does not save.
+- The probe is safe at a hard stop. It used to advance its target unconditionally, so once the
+  jaws reached a stop the command kept leading further every cycle and `kp × error` kept growing
+  until the structure gave way. The command is now re-derived from the measured position each
+  cycle (lead ≤ `calib_step_rad`), and the probe aborts the instant `|tau|` reaches
+  `calib_tau_limit` — a guard that does not depend on the position-based stall test, which cannot
+  fire while the structure is still yielding.
 - `MoveResult.__bool__` used to be `reached and not stalled`; it is now `ok`. For `grasp`'s
   closing phase the two agree. For `open` and `close` they are opposite: a successful press onto
   the stop is `stalled=True, reached=False`, so `if gripper.close():` means something different

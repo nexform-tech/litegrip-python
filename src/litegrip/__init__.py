@@ -22,8 +22,6 @@ Subpackages
   Use directly if you need fine-grained control or multi-motor setups.
 """
 
-import logging
-
 # Version of a package that is on disk but not installed as a distribution — a
 # source checkout, a vendored copy, or the files dropped in by a system package.
 # The ``+`` local segment keeps it valid PEP 440 and makes it obvious in a bug
@@ -55,9 +53,13 @@ def _detect_version(dist_name: str = "litegrip") -> str:
 
 __version__ = _detect_version()
 
-# Ensure log messages are visible even if the user hasn't configured logging.
-_log = logging.getLogger("litegrip")
-_log.addHandler(logging.NullHandler())
+# This package deliberately installs no handler and does not call
+# ``logging.disable()``: a WARNING such as "this calibration file belongs to
+# another channel" is a safety signal, and must reach the user even when the
+# embedding program never configured logging.  With no handler, Python's
+# ``logging.lastResort`` prints WARNING and above to stderr.  Applications that
+# want to capture the records can still attach their own handler to the
+# ``litegrip`` logger.
 
 # ── High-level API ──────────────────────────────────────────────────────
 from .gripper import (LiteGrip, DEFAULT_CALIB, CALIB_TEMPLATES,
