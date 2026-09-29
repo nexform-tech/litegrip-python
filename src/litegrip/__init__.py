@@ -107,6 +107,22 @@ from .exceptions import (
     NotInitializedError,
 )
 
+# ── Teleoperation (leader / follower) ───────────────────────────────────
+from .teleop import (
+    GripperTeleop,
+    TeleopTransport,
+    TeleopSubscription,
+    UdpTeleopTransport,
+    InProcTeleopTransport,
+    TeleopError,
+    TeleopBusyError,
+    TeleopNotActiveError,
+    FRAME_SIZE,
+    encode_frame,
+    decode_frame,
+    teleop_topic,
+)
+
 # ── CAN subpackage (expert) ─────────────────────────────────────────────
 from . import can
 
@@ -150,6 +166,19 @@ __all__ = [
     "CANTimeoutError",
     "HardwareError",
     "NotInitializedError",
+    # Teleoperation
+    "GripperTeleop",
+    "TeleopTransport",
+    "TeleopSubscription",
+    "UdpTeleopTransport",
+    "InProcTeleopTransport",
+    "TeleopError",
+    "TeleopBusyError",
+    "TeleopNotActiveError",
+    "FRAME_SIZE",
+    "encode_frame",
+    "decode_frame",
+    "teleop_topic",
     # Subpackages
     "can",
 ]

@@ -27,6 +27,7 @@ import logging
 import os as _os
 import select as _select_mod
 import sys
+import threading
 import time
 from datetime import datetime
 from typing import Callable, List, Optional
@@ -220,6 +221,15 @@ class LiteGrip:
         self._status_flags = GripperStatus.NONE
         self._actions = GripperActions(self, motion_config)
 
+        # Reentrant lock around the low-level CAN I/O that a teleop background
+        # thread shares with the caller (send/poll/get_state).  A no-op for the
+        # single-threaded use this SDK assumed before teleop existed.
+        self._io_lock = threading.RLock()
+        self._teleop: Optional["GripperTeleop"] = None
+        # Transport teleop_start built itself (as opposed to one the caller
+        # injected), so teleop_stop knows what it is allowed to close.
+        self._teleop_transport: Optional["TeleopTransport"] = None
+
         # Declaring the mount is just loading the matching template, so it
         # costs no CAN traffic and is safe this early.  The template carries
         # only a direction and geometry, so it cannot clobber the identity
@@ -334,6 +344,9 @@ class LiteGrip:
         """
         if not self._connected:
             return
+
+        if self._teleop is not None:
+            self.teleop_stop()
 
         if self._can:
             self._can.disconnect(disable=self._disable_on_disconnect)
@@ -467,8 +480,9 @@ class LiteGrip:
         """
         if self._can is None or not self._enabled:
             return False
-        return self._can.control_mit(
-            q_target=q, kp=kp, kd=kd, dq_target=dq, tau_feedforward=tau)
+        with self._io_lock:
+            return self._can.control_mit(
+                q_target=q, kp=kp, kd=kd, dq_target=dq, tau_feedforward=tau)
 
     def poll(self, timeout_s: float = 0.0) -> bool:
         """Poll for one CAN frame and update cached motor state.
@@ -481,7 +495,8 @@ class LiteGrip:
         """
         if self._can is None:
             return False
-        return self._can.poll(timeout_s=timeout_s)
+        with self._io_lock:
+            return self._can.poll(timeout_s=timeout_s)
 
     # ═══════════════════════════════════════════════════════════════════
     # Zero-gravity mode (manual back-driving)
@@ -1542,38 +1557,39 @@ class LiteGrip:
         if self._can is None:
             return GripperState()
 
-        if wait:
-            self._can.update_state(timeout_s=0.05)
-        else:
-            self._can.poll(timeout_s=0.0)
+        with self._io_lock:
+            if wait:
+                self._can.update_state(timeout_s=0.05)
+            else:
+                self._can.poll(timeout_s=0.0)
 
-        position_rad = self._can.get_position()
-        velocity_rad_s = self._can.get_velocity()
-        torque_nm = self._can.get_torque()
-        error_code = self._can.get_error()
-        t_mos, t_coil = self._can.get_temperature()
+            position_rad = self._can.get_position()
+            velocity_rad_s = self._can.get_velocity()
+            torque_nm = self._can.get_torque()
+            error_code = self._can.get_error()
+            t_mos, t_coil = self._can.get_temperature()
 
-        # pos_closed_rad = closed (0 mm), pos_open_rad = open (max mm).  Which
-        # way the rad count runs depends on the mount, so close_sign sets the
-        # sign; the result is 0 mm at the closed limit and +stroke at the open
-        # limit for both mountings.
-        s = self._config.close_sign
-        position_mm = ((self._config.pos_closed_rad - position_rad)
-                       * s * self._config.rad_to_mm)
-        # Squeeze is positive force: the sign flips with the mount too.
-        force_n = s * torque_nm * UnitConversion.NM_TO_N
+            # pos_closed_rad = closed (0 mm), pos_open_rad = open (max mm).
+            # Which way the rad count runs depends on the mount, so close_sign
+            # sets the sign; the result is 0 mm at the closed limit and +stroke
+            # at the open limit for both mountings.
+            s = self._config.close_sign
+            position_mm = ((self._config.pos_closed_rad - position_rad)
+                           * s * self._config.rad_to_mm)
+            # Squeeze is positive force: the sign flips with the mount too.
+            force_n = s * torque_nm * UnitConversion.NM_TO_N
 
-        return GripperState(
-            position_rad=position_rad,
-            velocity_rad_s=velocity_rad_s,
-            torque_nm=torque_nm,
-            temperature_mos=t_mos,
-            temperature_coil=t_coil,
-            error_code=error_code,
-            timestamp=time.time(),
-            position_mm=position_mm,
-            force_n=force_n,
-        )
+            return GripperState(
+                position_rad=position_rad,
+                velocity_rad_s=velocity_rad_s,
+                torque_nm=torque_nm,
+                temperature_mos=t_mos,
+                temperature_coil=t_coil,
+                error_code=error_code,
+                timestamp=time.time(),
+                position_mm=position_mm,
+                force_n=force_n,
+            )
 
     def get_position(self) -> float:
         """Current position in mm."""
@@ -1663,6 +1679,111 @@ class LiteGrip:
         if self._can is None:
             raise NotInitializedError("未连接")
         return self._can.read_param(rid, timeout_s=timeout_s)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Teleoperation (leader / follower)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def teleop_start(
+        self,
+        mode: str,
+        transport: Optional["TeleopTransport"] = None,
+        host: Optional[str] = None,
+        port: int = 7448,
+        kp: Optional[float] = None,
+        kd: Optional[float] = None,
+        align: bool = True,
+        watchdog_s: float = 0.2,
+        rate_hz: float = 50.0,
+        master_id: str = "master",
+    ) -> dict:
+        """Start leader/follower teleoperation on this gripper.
+
+        ``mode="master"`` (leader) makes the motor slack — the jaws can be
+        pushed by hand — and publishes the opening.  ``mode="slave"``
+        (follower) receives the opening and follows it.
+
+        Both ends must agree on ``master_id``.  Teleoperation is exclusive:
+        the background loop owns the CAN I/O until :meth:`teleop_stop`, so do
+        not drive this gripper from the caller while it runs.
+
+        Args:
+            mode: ``"master"`` or ``"slave"``.
+            transport: A :class:`~litegrip.TeleopTransport`.  When omitted, a
+                :class:`~litegrip.UdpTeleopTransport` is built — the master
+                sends to ``host:port`` (the follower's address), the slave
+                binds ``host:port``.  An injected transport is never closed by
+                this class.
+            host: Address for the default UDP transport (required when
+                ``transport`` is omitted).
+            port: UDP port for the default transport.
+            kp, kd: Follow gains (slave).  ``None`` uses 100.0 / 2.0.
+            align: Slave only — align to the first received frame before
+                following.
+            watchdog_s: Slave only — hold position after this long without a
+                fresh frame.
+            rate_hz: Loop rate.
+            master_id: Topic id shared by both ends.
+
+        Returns:
+            The initial :meth:`teleop_status` snapshot.
+
+        Raises:
+            TeleopBusyError: teleoperation is already running.
+            NotInitializedError: not connected or not enabled.
+        """
+        from .teleop import (GripperTeleop, TeleopBusyError,
+                             UdpTeleopTransport, teleop_topic)
+
+        self._check_connected()
+        self._check_enabled()
+        if mode not in ("master", "slave"):
+            raise ValueError(f"mode must be 'master' or 'slave', got {mode!r}")
+        if self._teleop is not None and self._teleop.is_running:
+            raise TeleopBusyError("teleop is already running")
+
+        created_transport = None
+        if transport is None:
+            if host is None:
+                raise ValueError("host is required when no transport is given")
+            addr = f"{host}:{port}"
+            if mode == "master":
+                transport = created_transport = UdpTeleopTransport(pub_addr=addr)
+            else:
+                transport = created_transport = UdpTeleopTransport(bind_addr=addr)
+
+        manager = GripperTeleop(
+            self, transport, mode, teleop_topic(master_id),
+            rate_hz=rate_hz, kp=kp, kd=kd, align=align, watchdog_s=watchdog_s)
+        manager.start()
+        self._teleop = manager
+        self._teleop_transport = created_transport
+        return manager.status()
+
+    def teleop_stop(self, timeout: float = 2.0) -> dict:
+        """Stop teleoperation and leave the gripper holding its position.
+
+        The master also leaves zero-gravity mode, so the jaws hold under the
+        configured gains rather than falling slack.
+        """
+        manager = self._teleop
+        if manager is None:
+            return {"active": False, "mode": None}
+        manager.stop(timeout=timeout)
+        self._teleop = None
+        if self._teleop_transport is not None:
+            try:
+                self._teleop_transport.close()
+            except Exception as e:  # noqa: BLE001
+                log.debug("teleop transport close failed: %s", e)
+            self._teleop_transport = None
+        return manager.status()
+
+    def teleop_status(self) -> dict:
+        """Snapshot of the running teleoperation, or ``{"active": False}``."""
+        if self._teleop is None:
+            return {"active": False, "mode": None}
+        return self._teleop.status()
 
     # ═══════════════════════════════════════════════════════════════════
     # Internal

@@ -98,6 +98,53 @@ with LiteGrip("can1", mount="reverse") as gripper:
 `False`，随后运动接口抛 `CommandError`），而不是悄悄采纳 `can0` 的方向。想让所有通道共用一个
 显式路径，设 `LITEGRIP_CALIB`。
 
+## 主从遥操
+
+两台夹爪可以联动，一台跟着另一台动。**主夹爪**（leader）的电机卸力 —— 你用手掰它的爪子，
+它按循环频率把「张开程度」发出去；**从夹爪**（follower）收到后驱动自己的爪子跟到位。线上传的
+是归一化到 `[0, 1]` 的张开度，不是角度，所以两端不需要相同的标定、装法或零点。
+
+```python
+from litegrip import LiteGrip
+
+# 主端：把本夹爪的张开度发到 192.168.1.20 的从端。
+with LiteGrip("can0") as master:
+    master.load_calibration()
+    master.enable()
+    master.teleop_start("master", host="192.168.1.20")
+
+# 从端：绑定端口，先对齐首帧，然后跟随。
+with LiteGrip("can0") as slave:
+    slave.load_calibration()
+    slave.enable()
+    slave.teleop_start("slave", host="0.0.0.0")
+    while True:
+        print(slave.teleop_status())   # frames, openness, loop_hz, stale, ...
+```
+
+`examples/teleop.py` 可以在命令行跑其中一端：
+
+```bash
+# A 机 —— 你用手掰的主夹爪：
+python3 examples/teleop.py --mode master --channel can0 --host 192.168.1.20
+# B 机 —— 从夹爪：
+python3 examples/teleop.py --mode slave  --channel can0 --host 0.0.0.0
+```
+
+两端必须共用 `master_id`（默认 `master`），且都已连接、已使能。遥操是互斥的：后台循环独占 CAN
+读写，在 `teleop_stop()` 之前不要再从调用方驱动夹爪。`teleop_start` 返回初始的
+`teleop_status()`；`teleop_status()` 报告 `active`、`mode`、`topic`、`frames`、
+`last_frame_age_ms`、`stale`、`openness`、`loop_hz`。
+
+- **传输是明文 UDP**，无鉴权、无加密，只用在可信网络里。要给自定义传输，传 `transport=` 一个
+  `TeleopTransport`；注入的传输不会被 SDK 关闭。
+- **从端与主端失联时是「持位」，不是「卸力」。** 超过 `watchdog_s`（默认 `0.2`）没有新帧后，
+  它仍按跟随增益顶着上一个目标继续发帧 —— 于是 `stale` 变真，但爪子停在原地，可能夹住中间的
+  东西。
+- **从端会把收到的张开度夹到 `[0, 1]`**，也就是夹在自己的标定行程内，坏帧无法把它指到限位之外。
+- **停止后是持位**，不是卸力：主端在 `teleop_stop()` 时退出零重力模式，爪子按配置增益持位。
+- 跟随增益默认 `kp=100.0`、`kd=2.0`，用 `kp=` / `kd=` 覆盖。
+
 ## 六个动作接口
 
 要让夹爪动起来就用这六个。每一个都会自己校验结果再报成功，所以调用方不必再重写斜坡和
