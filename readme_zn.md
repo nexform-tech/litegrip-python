@@ -151,9 +151,14 @@ python3 examples/teleop.py --mode slave  --channel can0 --host 192.168.1.20
 两端必须共用 `grip_id`（默认 `gripA`），且都已连接、已使能。遥操是互斥的：后台循环独占 CAN
 读写，在 `teleop_stop()` 之前不要再从调用方驱动夹爪。`teleop_start` 返回初始的
 `teleop_status()`；`teleop_status()` 报告 `active`、`mode`、`topic`、`frames`、
-`last_frame_age_ms`、`stale`、`openness`、`loop_hz`、`rejected`、`send_failed`、
+`last_frame_age_ms`、`stale`、`openness`、`dq_cmd`、`loop_hz`、`rejected`、`send_failed`、
 `fault`，主端另有 `matching`。
 
+- **从端把主端的速度前馈下去。** 线上帧只带 openness，所以从端用相邻两帧的差分还原出速度，作为
+  电机的 `dq` 目标下发 —— 机械臂遥操是直接发 `dq` 的。没有这一项，从端只能靠位置误差出力，会
+  明显拖在运动中的主端后面（滞后量 ≈ 速度 / `kp`）。因为 `kd * dq` 是实打实的力矩项，这个估计
+  是有界的：首帧（没有可差分的前一帧）、退化的时间间隔、以及超过 `MAX_FRAME_GAP_S` 的断流都取
+  `dq = 0`，结果再钳到 `dq_max`（默认 `10.0` rad/s；`dq_max=0` 关闭前馈）。
 - **从端与主端失联时是「持位」，不是「卸力」。** 超过 `watchdog_s`（默认 `0.2`）没有新帧后，
   它仍按跟随增益顶着上一个目标继续发帧 —— 于是 `stale` 变真，但爪子停在原地，可能夹住中间的
   东西。

@@ -167,9 +167,16 @@ python3 examples/teleop.py --mode slave  --channel can0 --host 192.168.1.20
 Both ends must share `grip_id` (default `gripA`) and be connected and enabled first. Teleop is
 exclusive: the background loop owns the CAN I/O, so do not drive the gripper from the caller until
 `teleop_stop()`. `teleop_start` returns the initial `teleop_status()` snapshot; `teleop_status()`
-reports `active`, `mode`, `topic`, `frames`, `last_frame_age_ms`, `stale`, `openness`,
+reports `active`, `mode`, `topic`, `frames`, `last_frame_age_ms`, `stale`, `openness`, `dq_cmd`,
 `loop_hz`, `rejected`, `send_failed`, `fault`, and (master) `matching`.
 
+- **The follower feeds the leader's velocity forward.** The wire frame carries only the opening, so
+  the follower recovers a velocity by differencing successive frames and sends it as the motor's
+  `dq` target — the arm teleoperation sends `dq` outright. Without it the follower biases on
+  position error alone and trails a moving leader (the lag scales with speed / `kp`). Because
+  `kd * dq` is a real torque term the estimate is bounded: the first frame (nothing to difference
+  against), a degenerate interval, and a gap longer than `MAX_FRAME_GAP_S` all yield `dq = 0`, and
+  the result is clamped to `dq_max` (default `10.0` rad/s; `dq_max=0` disables the feedforward).
 - **A follower that loses the leader holds its position, it does not go slack.** After
   `watchdog_s` (default `0.2`) without a fresh frame it keeps commanding its last target under the
   follow gains, so `stale` goes true but the jaws stay put — and can hold whatever is between them.

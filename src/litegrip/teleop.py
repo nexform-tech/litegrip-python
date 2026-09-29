@@ -75,6 +75,18 @@ FRAME_SIZE = _FRAME.size
 DEFAULT_GRIP_ID = "gripA"
 DEFAULT_GRIP_PORT = 17448
 
+#: Default ceiling on the leader velocity the follower feeds forward, in rad/s.
+#: The wire frame carries no velocity, so the follower recovers one by finite
+#: difference (see :meth:`GripperTeleop._estimate_dq`); this bounds what a bad
+#: estimate can demand.  A hand sweep is well under 5 rad/s, and the DM4310's own
+#: ``dq`` range is ±30, so this is generous for motion and tight for a glitch.
+DEFAULT_DQ_MAX = 10.0
+
+#: Longest interval a finite-difference velocity is trusted over, in seconds.
+#: Past this the "velocity" would be an average across a dropout — refuse it and
+#: fall back to position-only control for that cycle.
+MAX_FRAME_GAP_S = 0.05
+
 
 def encode_frame(openness: float, position_mm: float, force_n: float,
                  timestamp: float) -> bytes:
@@ -399,7 +411,8 @@ class GripperTeleop:
     ``mode="master"`` streams zero-torque frames (so the jaws can be moved by
     hand) and publishes the opening.  ``mode="slave"`` subscribes, aligns to
     the first frame with a single :meth:`~litegrip.LiteGrip.goto_rad`, then
-    follows every fresh sample with ``send_mit_frame``.
+    follows every fresh sample with ``send_mit_frame``, feeding the leader's
+    finite-difference velocity forward as ``dq`` (:meth:`_estimate_dq`).
 
     One loop thread per side, sampling and sending in the same cycle — no
     shared buffers and no contention, which is all a single-DOF gripper needs
@@ -420,6 +433,10 @@ class GripperTeleop:
             follower is considered stale and starts holding.  Must be > 0: a
             non-positive watchdog makes the follower permanently stale, which is
             a session that starts and then silently does nothing.
+        dq_max: Slave only — ceiling in rad/s on the leader velocity fed forward
+            as the follower's ``dq`` target.  ``0`` disables the feedforward, in
+            which case the follower biases on position error alone and trails a
+            moving leader.  See :meth:`_estimate_dq`.
         sub_transport: Slave only — a separate transport to subscribe on when
             the leader is remote (the master's transport is local-only).
         sleep_fn, time_fn: Timing seams for tests.  ``time_fn`` must be
@@ -437,6 +454,7 @@ class GripperTeleop:
         kd: Optional[float] = None,
         align: bool = True,
         watchdog_s: float = 0.2,
+        dq_max: float = DEFAULT_DQ_MAX,
         sub_transport: Optional[TeleopTransport] = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         time_fn: Callable[[], float] = time.monotonic,
@@ -456,6 +474,7 @@ class GripperTeleop:
         self._kd = kd
         self._align = align
         self._watchdog_s = watchdog_s
+        self._dq_max = float(dq_max)
         self._sub_tp = sub_transport
         self._sleep_fn = sleep_fn
         self._time_fn = time_fn
@@ -475,6 +494,12 @@ class GripperTeleop:
         self._rejected = 0
         self._send_failed = 0
         self._fault = ""
+        #: Leader velocity fed forward as this cycle's ``dq`` target, and the
+        #: two samples it is differenced from.  Seeded on the first good frame;
+        #: see :meth:`_estimate_dq`.
+        self._dq_cmd = 0.0
+        self._prev_q: Optional[float] = None
+        self._prev_rx_ts: Optional[float] = None
         self._loops = 0
         self._loop_hz = 0.0
         self._hz_t0 = 0.0
@@ -553,6 +578,8 @@ class GripperTeleop:
             "stale": self._stale,
             "openness": round(self._last_openness, 4),
             "loop_hz": round(self._loop_hz, 1),
+            # Slave only: the leader velocity last fed forward, in rad/s.
+            "dq_cmd": round(self._dq_cmd, 4),
             # Frames dropped at the protocol boundary (non-finite values).
             "rejected": self._rejected,
             # ``send_mit_frame`` returned False — the motor is not following.
@@ -637,6 +664,8 @@ class GripperTeleop:
         try:
             while self._running:
                 t0 = self._time_fn()
+                # Only a fresh frame sets a velocity; a hold cycle is ``dq = 0``.
+                dq_cmd = 0.0
                 msg = sub.drain_latest()
                 if msg is not None:
                     try:
@@ -651,6 +680,9 @@ class GripperTeleop:
                         else:
                             rx_ts = self._time_fn()
                             q_cmd = openness_to_rad(_clamp01(openness), cfg)
+                            dq_cmd = self._estimate_dq(q_cmd, rx_ts)
+                            self._prev_q = q_cmd
+                            self._prev_rx_ts = rx_ts
                             self._last_openness = _clamp01(openness)
                             self._last_frame_ts = rx_ts
                             self._ever_received = True
@@ -666,8 +698,10 @@ class GripperTeleop:
                 # Always send — including while stale.  The frame both holds
                 # the position and keeps the motor from self-locking.
                 q_cmd = clamp_to_calibrated(cfg, q_cmd)
+                self._dq_cmd = dq_cmd
                 try:
-                    self._send(q_cmd, self._resolve_kp(), self._resolve_kd())
+                    self._send(q_cmd, self._resolve_kp(), self._resolve_kd(),
+                               dq=dq_cmd)
                     self._note_grip_fault(self._g.get_state(wait=False))
                 except Exception:  # noqa: BLE001
                     log.exception("[slave] CAN error; loop exiting")
@@ -710,6 +744,31 @@ class GripperTeleop:
             self._sleep_fn(0.01)
         return None
 
+    def _estimate_dq(self, q: float, rx_ts: float) -> float:
+        """Leader velocity in rad/s, differenced from the previous good frame.
+
+        The gripper wire frame carries no velocity field, so the follower
+        recovers one here and feeds it forward as its own ``dq`` target — this
+        stands in for the ``dq`` the arm teleoperation sends outright.  Without
+        it the follower biases on position error alone and visibly trails a
+        moving leader (the lag scales with speed / ``kp``).
+
+        Deliberately conservative: nothing to difference against on the first
+        frame, a degenerate or dropout-sized interval is refused, and the result
+        is clamped to ``dq_max``.  ``kd * (dq - dq_measured)`` is a real torque
+        term, so an unbounded estimate could command a large one.
+        """
+        if (self._dq_max <= 0.0 or self._prev_q is None
+                or self._prev_rx_ts is None):
+            return 0.0
+        dt = rx_ts - self._prev_rx_ts
+        if not 1e-4 < dt < MAX_FRAME_GAP_S:
+            return 0.0
+        dq = (q - self._prev_q) / dt
+        if not math.isfinite(dq):
+            return 0.0
+        return max(-self._dq_max, min(self._dq_max, dq))
+
     def _count_rejected(self, got: Any) -> None:
         """Record a frame dropped at the protocol boundary (§8 rule 9)."""
         self._rejected += 1
@@ -718,15 +777,19 @@ class GripperTeleop:
                         "holding position rather than folding onto a stop",
                         self._mode, got)
 
-    def _send(self, q: float, kp: float, kd: float,
+    def _send(self, q: float, kp: float, kd: float, dq: float = 0.0,
               quiet: bool = False) -> None:
         """Send one MIT frame and **check the return value** (§8 rule 10).
+
+        ``dq`` is the follower's velocity target: zero for a hold (and for the
+        master's slack frames), the leader's finite-difference velocity for a
+        follower cycle — see :meth:`_estimate_dq`.
 
         ``send_mit_frame`` returns ``False`` when the motor is not enabled or the
         CAN write fails — it does not raise, so ignoring the result means
         believing we are driving a gripper that is not moving.
         """
-        if not self._g.send_mit_frame(q=q, kp=kp, kd=kd):
+        if not self._g.send_mit_frame(q=q, kp=kp, kd=kd, dq=dq):
             self._send_failed += 1
             if self._send_failed == 1 and not quiet:
                 log.warning("[%s] send_mit_frame returned False — the motor is "

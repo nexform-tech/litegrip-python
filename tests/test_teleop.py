@@ -18,11 +18,11 @@ import unittest
 import unittest.mock
 
 import _sdkpath  # noqa: F401
-from litegrip import (FRAME_SIZE, GripperTeleop,
+from litegrip import (DEFAULT_DQ_MAX, FRAME_SIZE, GripperTeleop,
                       InProcTeleopTransport, TeleopBusyError, TeleopNotReady,
                       UdpTeleopTransport, decode_frame, encode_frame,
                       teleop_topic)
-from litegrip.teleop import (clamp_to_calibrated, check_ready,
+from litegrip.teleop import (MAX_FRAME_GAP_S, clamp_to_calibrated, check_ready,
                              openness_to_rad, rad_to_openness, travel_mm)
 
 from fake_can import POS_CLOSED_RAD, POS_OPEN_RAD, RAD_TO_MM, make_gripper
@@ -452,6 +452,77 @@ class SlaveGuardTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             GripperTeleop(g, InProcTeleopTransport(), "slave", TOPIC,
                           watchdog_s=0.0)
+
+
+class VelocityFeedforwardTest(unittest.TestCase):
+    """The leader's velocity is recovered locally and fed forward as ``dq``.
+
+    The gripper wire frame carries no velocity field, so the follower
+    differences successive positions.  These bounds keep a bad estimate from
+    turning into a large ``kd * (dq - dq_measured)`` torque.
+    """
+
+    def _mgr(self, **kwargs):
+        g, _ = make_gripper()
+        return GripperTeleop(g, InProcTeleopTransport(), "slave", TOPIC,
+                             sleep_fn=_nop_sleep, **kwargs)
+
+    def test_first_sample_has_nothing_to_difference(self):
+        self.assertEqual(self._mgr()._estimate_dq(0.5, 100.0), 0.0)
+
+    def test_is_a_finite_difference(self):
+        mgr = self._mgr()
+        mgr._prev_q, mgr._prev_rx_ts = 0.10, 100.00
+        self.assertAlmostEqual(mgr._estimate_dq(0.15, 100.01), 5.0)
+
+    def test_is_clamped_to_dq_max(self):
+        mgr = self._mgr(dq_max=2.0)
+        mgr._prev_q, mgr._prev_rx_ts = 0.0, 100.0
+        self.assertEqual(mgr._estimate_dq(5.0, 100.01), 2.0)
+        self.assertEqual(mgr._estimate_dq(-5.0, 100.01), -2.0)
+
+    def test_refuses_a_dropout_sized_gap(self):
+        mgr = self._mgr()
+        mgr._prev_q, mgr._prev_rx_ts = 0.0, 100.0
+        self.assertEqual(
+            mgr._estimate_dq(0.5, 100.0 + MAX_FRAME_GAP_S + 0.01), 0.0)
+
+    def test_refuses_a_degenerate_interval(self):
+        mgr = self._mgr()
+        mgr._prev_q, mgr._prev_rx_ts = 0.0, 100.0
+        self.assertEqual(mgr._estimate_dq(0.5, 100.0 + 1e-6), 0.0)
+
+    def test_zero_dq_max_disables_the_feedforward(self):
+        mgr = self._mgr(dq_max=0.0)
+        mgr._prev_q, mgr._prev_rx_ts = 0.0, 100.0
+        self.assertEqual(mgr._estimate_dq(0.5, 100.01), 0.0)
+
+    def test_slave_sends_the_leader_velocity_as_dq(self):
+        # Paced by the real clock, so consecutive frames land a realistic
+        # interval apart.  The step is then far past ``dq_max`` and clamps,
+        # which is stable against the exact timing.
+        g, fake = make_gripper(start_rad=POS_CLOSED_RAD, reverse=False)
+        transport = _PreSubTransport()
+        mgr = GripperTeleop(g, transport, "slave", TOPIC, rate_hz=100.0,
+                            align=False, watchdog_s=5.0)
+        transport.pub(TOPIC, encode_frame(0.2, 24.0, 0.0, 0.0))
+        mgr.start()
+        try:
+            q1 = openness_to_rad(0.2, g.config)
+            self.assertTrue(_wait_until(
+                lambda: fake.frames and abs(fake.frames[-1].q - q1) < 1e-9))
+            # Nothing to difference against yet: a pure position hold.
+            self.assertEqual(fake.frames[-1].dq, 0.0)
+            transport.pub(TOPIC, encode_frame(0.8, 96.0, 0.0, 0.0))
+            q2 = openness_to_rad(0.8, g.config)
+            self.assertTrue(_wait_until(
+                lambda: any(abs(f.q - q2) < 1e-9 for f in fake.frames)))
+            # Opening up drives the normal-mount jaw toward a smaller angle, so
+            # the fed-forward velocity is negative — and bounded.
+            self.assertTrue(any(abs(f.q - q2) < 1e-9 and f.dq == -DEFAULT_DQ_MAX
+                                for f in fake.frames))
+        finally:
+            mgr.stop()
 
 
 if __name__ == "__main__":
