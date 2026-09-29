@@ -123,6 +123,23 @@ from .teleop import (
     teleop_topic,
 )
 
+# ── Trajectory record and replay ────────────────────────────────────────
+from .trajectory import (
+    Trajectory,
+    TrajectorySample,
+    TrajectoryRecorder,
+    TrajectoryPlayer,
+    trajectory_dir,
+    resolve_path,
+    DEFAULT_RATE_HZ,
+    TrajectoryError,
+    TrajectoryBusyError,
+    TrajectoryNotActiveError,
+    TrajectoryEmptyError,
+    TrajectoryRecordingError,
+    TrajectoryFormatError,
+)
+
 # ── CAN subpackage (expert) ─────────────────────────────────────────────
 from . import can
 
@@ -179,6 +196,20 @@ __all__ = [
     "encode_frame",
     "decode_frame",
     "teleop_topic",
+    # Trajectory record and replay
+    "Trajectory",
+    "TrajectorySample",
+    "TrajectoryRecorder",
+    "TrajectoryPlayer",
+    "trajectory_dir",
+    "resolve_path",
+    "DEFAULT_RATE_HZ",
+    "TrajectoryError",
+    "TrajectoryBusyError",
+    "TrajectoryNotActiveError",
+    "TrajectoryEmptyError",
+    "TrajectoryRecordingError",
+    "TrajectoryFormatError",
     # Subpackages
     "can",
 ]

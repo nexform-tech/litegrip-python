@@ -161,6 +161,72 @@ reports `active`, `mode`, `topic`, `frames`, `last_frame_age_ms`, `stale`, `open
   `teleop_stop()`, so its jaws hold under the configured gains.
 - Follow gains default to `kp=100.0`, `kd=2.0`; override with `kp=` / `kd=`.
 
+## Trajectory record and replay
+
+A motion you teach by hand can be captured once and repeated later. Recording puts the motor into
+zero-gravity so you can push the jaws through the motion; replay streams the captured openings back
+as MIT command frames. What is stored is the normalized opening in `[0, 1]`, exactly as teleop
+sends it, so a trajectory taught on one gripper replays on another with a different mount or
+calibration.
+
+```python
+from litegrip import LiteGrip
+
+with LiteGrip("can0") as gripper:
+    gripper.load_calibration()
+    gripper.enable()
+
+    taught = gripper.record(5.0)   # 5 s of hand-teaching; the jaws are slack
+    taught.save("pick")            # ~/.litegrip/trajectories/pick.lgt
+    gripper.play(taught)           # repeat it
+```
+
+| Method | Behaviour |
+| --- | --- |
+| `record(duration_s, rate_hz=100.0, zero_gravity=True)` | Blocking hand-teach. Returns the `Trajectory`. |
+| `record_start(rate_hz=100.0, zero_gravity=True, max_samples=None)` | Background recording; returns the status snapshot. |
+| `record_stop(allow_empty=False)` | Stops and returns the captured `Trajectory`. |
+| `play(trajectory, speed=1.0, kp=None, kd=None, align=True)` | Blocking replay. `loop` must be `False`. |
+| `play_start(trajectory, speed=1.0, kp=None, kd=None, loop=False, align=True)` | Background replay. |
+| `play_stop(timeout=2.0)` | Stops a replay and leaves the gripper holding. |
+| `trajectory_status()` | One snapshot for both directions. `active`, `kind`, `samples` and `error` are always there; a recording adds `rate_hz`, `zero_gravity` and `loop_hz`, a replay adds `frames`, `speed`, `openness` and `completed`. |
+
+`examples/trajectory.py` runs the same thing from the command line:
+
+```bash
+python3 examples/trajectory.py --record 5 --save pick   # hand-teach, then save
+python3 examples/trajectory.py --list                   # no hardware needed
+python3 examples/trajectory.py --play pick --repeat 3
+```
+
+`Trajectory.save("pick")` writes `~/.litegrip/trajectories/pick.lgt`; a name with a path separator
+in it is used as written. Set `LITEGRIP_TRAJ_DIR` to move that directory. `Trajectory.load("pick")`
+reads it back, and `--list` prints one line per file. The format is compact binary with an 8-byte
+magic header, and a file whose length does not match the sample count in its header is rejected
+rather than parsed into half a trajectory.
+
+- **Replay commands position, not force.** The recorded torque is stored for diagnostics and never
+  fed forward, so a squeeze recorded against an object repeats as a position path that presses with
+  whatever `kp` yields. The grip force you taught is not preserved — follow the replay with
+  `grasp(force_n=...)` if it matters.
+- **`record()` is exclusive and the jaws are slack for its whole duration.** It streams zero-torque
+  frames itself, so do not drive the gripper from the caller while it runs, and keep a hand on it:
+  nothing is holding the jaws.
+- **Record without zero-gravity when something else drives.** `record_start(zero_gravity=False)`
+  only *reads* state, so the caller may run a `grasp()` or a move sequence from another thread and
+  capture it. That is the way to record a programmatic motion.
+- **A capture that did not fill raises.** `record()` reports how many samples it got instead of
+  returning a short recording as if it were whole, and a sampling loop that died is never reported
+  as a good capture.
+- **A blocking `play()` returns with only one hold frame sent.** The motor self-locks a
+  communication-loss fault about 100 ms after the frames stop, so call the next action promptly —
+  or use `play_start(loop=True)` with `play_stop()` for a hold that lasts. A trajectory of one
+  sample is a pose with nothing to repeat, so looping it holds that opening.
+- **Recording, replay and teleop are mutually exclusive.** All three own the CAN I/O, and starting
+  a second one raises `TeleopBusyError` or `TrajectoryBusyError`. `disconnect()` stops whichever is
+  running.
+- Record and play both require a loaded calibration: without one the normalized opening is a guess.
+
 ## The six actions
 
 These are the supported entry points for moving the gripper. Each one verifies its own

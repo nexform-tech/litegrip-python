@@ -145,6 +145,63 @@ python3 examples/teleop.py --mode slave  --channel can0 --host 0.0.0.0
 - **停止后是持位**，不是卸力：主端在 `teleop_stop()` 时退出零重力模式，爪子按配置增益持位。
 - 跟随增益默认 `kp=100.0`、`kd=2.0`，用 `kp=` / `kd=` 覆盖。
 
+## 轨迹录制与回放
+
+你用手教一遍的动作可以录下来，之后反复重放。录制时电机进零重力，你直接掰爪子走完整个动作；
+回放把录到的张开度按 MIT 指令帧发回去。存的是归一化到 `[0, 1]` 的张开度，和遥操线上传的是同一个
+量，所以在一台夹爪上教出来的轨迹，换一台装法不同、标定不同的夹爪也能重放。
+
+```python
+from litegrip import LiteGrip
+
+with LiteGrip("can0") as gripper:
+    gripper.load_calibration()
+    gripper.enable()
+
+    taught = gripper.record(5.0)   # 手把手教 5 秒，期间爪子是卸力的
+    taught.save("pick")            # ~/.litegrip/trajectories/pick.lgt
+    gripper.play(taught)           # 重放
+```
+
+| 方法 | 行为 |
+| --- | --- |
+| `record(duration_s, rate_hz=100.0, zero_gravity=True)` | 阻塞式手把手录制，返回 `Trajectory`。 |
+| `record_start(rate_hz=100.0, zero_gravity=True, max_samples=None)` | 后台录制，返回状态快照。 |
+| `record_stop(allow_empty=False)` | 停止并返回录到的 `Trajectory`。 |
+| `play(trajectory, speed=1.0, kp=None, kd=None, align=True)` | 阻塞式回放。`loop` 必须是 `False`。 |
+| `play_start(trajectory, speed=1.0, kp=None, kd=None, loop=False, align=True)` | 后台回放。 |
+| `play_stop(timeout=2.0)` | 停止回放，并让夹爪持位。 |
+| `trajectory_status()` | 两个方向共用一个快照。`active`、`kind`、`samples`、`error` 一直都在；录制时另有 `rate_hz`、`zero_gravity`、`loop_hz`，回放时另有 `frames`、`speed`、`openness`、`completed`。 |
+
+`examples/trajectory.py` 在命令行做同样的事：
+
+```bash
+python3 examples/trajectory.py --record 5 --save pick   # 手把手录一段再存盘
+python3 examples/trajectory.py --list                   # 不需要接硬件
+python3 examples/trajectory.py --play pick --repeat 3
+```
+
+`Trajectory.save("pick")` 写到 `~/.litegrip/trajectories/pick.lgt`；带路径分隔符的名字按原样
+使用。目录可以用 `LITEGRIP_TRAJ_DIR` 改。`Trajectory.load("pick")` 读回来，`--list` 每个文件
+打一行。格式是紧凑二进制，开头 8 字节魔数；文件长度和头部声明的采样数对不上的会被拒绝，而不是
+解析出半截轨迹。
+
+- **回放的是位置，不是力。** 录到的力矩只是诊断信息，不会前馈下发，所以对着物体挤出来的那段，
+  重放时是一条位置轨迹，按 `kp` 顶上去 —— 你教的那个夹持力不会复现。力重要的话，回放完再调
+  `grasp(force_n=...)`。
+- **`record()` 期间独占，而且爪子全程卸力。** 它自己持续发零力矩帧，所以录制期间不要再从调用方
+  驱动夹爪，也要用手扶着：这期间没有任何东西托着爪子。
+- **有别的东西在驱动时，用非零重力模式录。** `record_start(zero_gravity=False)` 只读状态，调用方
+  可以在另一个线程里跑 `grasp()` 或一串运动，把它录下来。要录程序化的动作就走这条路。
+- **没录满会报错。** `record()` 会说清只录到几拍，而不是把一段短录制当成完整结果返回；采样循环
+  死掉也不会被报成一次好录制。
+- **阻塞式 `play()` 返回时只发了一帧持位。** 电机在停帧约 100 ms 后会因通信丢失自锁，所以要接着
+  调下一个动作 —— 想要持续持位就用 `play_start(loop=True)` 配 `play_stop()`。只有一拍采样的轨迹
+  是一个姿势、没有可循环的行程，循环它就等于一直保持那个张开度。
+- **录制、回放、遥操三者互斥。** 它们都独占 CAN 读写，起第二个会抛 `TeleopBusyError` 或
+  `TrajectoryBusyError`。`disconnect()` 会把正在跑的那个停掉。
+- 录制和回放都要求已加载标定：没有标定，归一化的张开度算不出来。
+
 ## 六个动作接口
 
 要让夹爪动起来就用这六个。每一个都会自己校验结果再报成功，所以调用方不必再重写斜坡和
