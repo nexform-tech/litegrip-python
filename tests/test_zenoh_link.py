@@ -17,6 +17,7 @@ import time
 import unittest
 
 import _sdkpath  # noqa: F401
+from litegrip.teleop import DEFAULT_GRIP_PORT, TeleopError, teleop_topic
 
 try:
     import zenoh  # noqa: F401
@@ -25,7 +26,6 @@ except ImportError:                                   # pragma: no cover
     HAVE_ZENOH = False
 
 if HAVE_ZENOH:
-    from litegrip.teleop import (DEFAULT_GRIP_PORT, TeleopError, teleop_topic)
     from litegrip.zenoh_link import (Connector, LatestSlot, Listener,
                                      ZenohTeleopTransport, _base_config)
 
