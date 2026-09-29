@@ -109,6 +109,58 @@ its own fails loudly (`False`, then `CommandError` from the motions) instead of
 silently adopting `can0`'s direction. Set `LITEGRIP_CALIB` to pin one explicit
 path for every channel instead.
 
+## Leader/follower teleoperation
+
+Two grippers can be linked so one follows the other. The **master** (leader) motor goes slack —
+you push its jaws by hand — and it publishes how far open it is at the loop rate. The **slave**
+(follower) receives that and drives its own jaws to match. What travels over the wire is a
+normalized opening in `[0, 1]`, not an angle, so the two ends do not need the same calibration,
+mount, or zero point.
+
+```python
+from litegrip import LiteGrip
+
+# Leader: publish this gripper's opening to the follower at 192.168.1.20.
+with LiteGrip("can0") as master:
+    master.load_calibration()
+    master.enable()
+    master.teleop_start("master", host="192.168.1.20")
+
+# Follower: bind, align to the first frame, then follow.
+with LiteGrip("can0") as slave:
+    slave.load_calibration()
+    slave.enable()
+    slave.teleop_start("slave", host="0.0.0.0")
+    while True:
+        print(slave.teleop_status())   # frames, openness, loop_hz, stale, ...
+```
+
+`examples/teleop.py` runs one end from the command line:
+
+```bash
+# Machine A — the leader you push by hand:
+python3 examples/teleop.py --mode master --channel can0 --host 192.168.1.20
+# Machine B — the follower:
+python3 examples/teleop.py --mode slave  --channel can0 --host 0.0.0.0
+```
+
+Both ends must share `master_id` (default `master`) and be connected and enabled first. Teleop is
+exclusive: the background loop owns the CAN I/O, so do not drive the gripper from the caller until
+`teleop_stop()`. `teleop_start` returns the initial `teleop_status()` snapshot; `teleop_status()`
+reports `active`, `mode`, `topic`, `frames`, `last_frame_age_ms`, `stale`, `openness`, `loop_hz`.
+
+- **The transport is plain UDP**, with no authentication or encryption. Use it only on a trusted
+  network. Pass `transport=` a `TeleopTransport` to supply your own; an injected one is never closed
+  by the SDK.
+- **A follower that loses the leader holds its position, it does not go slack.** After
+  `watchdog_s` (default `0.2`) without a fresh frame it keeps commanding its last target under the
+  follow gains, so `stale` goes true but the jaws stay put — and can hold whatever is between them.
+- **The follower clamps the incoming opening to `[0, 1]`**, i.e. to its own calibrated travel, so a
+  bad frame cannot command it past a limit.
+- **Stopping leaves the gripper holding**, not slack: the master leaves zero-gravity mode on
+  `teleop_stop()`, so its jaws hold under the configured gains.
+- Follow gains default to `kp=100.0`, `kd=2.0`; override with `kp=` / `kd=`.
+
 ## The six actions
 
 These are the supported entry points for moving the gripper. Each one verifies its own
