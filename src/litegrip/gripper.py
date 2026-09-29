@@ -1899,10 +1899,15 @@ class LiteGrip:
             if transport is None:
                 if link == "zenoh":
                     if mode == "master":
+                        # ⚠ 常驻 publisher **不登记**成 per-session transport：登记了
+                        #    `teleop_stop` 就会 close 它，而 `_teleop_pub` 仍指向这个
+                        #    已死的端点 ⇒ 此后每一轮都在往死会话里 put。（真机实测：
+                        #    第一次配对正常，之后每次从端 0 帧。）常驻端点的生命周期
+                        #    只归 `disconnect()` → `_close_teleop_pub()`。
                         transport = self._open_teleop_pub(port, key)
                     else:
                         transport = _zenoh_transport("slave", key, port, host)
-                    created_transport = transport
+                        created_transport = transport
                 elif link == "udp":
                     if host is None:
                         raise ValueError("host is required for the udp link")

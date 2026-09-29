@@ -349,6 +349,56 @@ class LiteGripTeleopApiTest(unittest.TestCase):
             with self.assertRaises(ImportError):
                 g.teleop_start("master")
 
+    def test_master_keeps_its_resident_publisher_across_sessions(self):
+        """A stop must not close the leader's resident zenoh publisher.
+
+        Registering it as the per-session transport made ``teleop_stop`` close
+        it, while ``_teleop_pub`` kept pointing at the dead endpoint — so every
+        session after the first published into nothing.  On hardware the first
+        pairing delivered frames and every later one delivered none, while the
+        leader's own frame counter kept climbing.
+        """
+        g, _ = make_gripper()
+        from litegrip import gripper as gripper_mod
+        built = []
+
+        class _FakeLink:
+            def __init__(self):
+                self.closed = False
+                self.puts = 0
+
+            def pub(self, topic, payload):
+                self.puts += 1
+
+            def close(self):
+                self.closed = True
+
+        def _factory(role, key, port, host):
+            built.append(_FakeLink())
+            return built[-1]
+
+        with unittest.mock.patch.object(gripper_mod, "_zenoh_transport",
+                                        _factory):
+            g.teleop_start("master", rate_hz=200.0)
+            g.teleop_stop()
+            resident = g._teleop_pub
+            self.assertIsInstance(resident, _FakeLink)
+            self.assertFalse(
+                resident.closed,
+                "teleop_stop must not close the resident publisher")
+            self.assertTrue(_wait_until(lambda: resident.puts > 0))
+
+            g.teleop_start("master", rate_hz=200.0)
+            self.assertIs(g._teleop_pub, resident)
+            self.assertEqual(len(built), 1,
+                             "the listener is built once, not per session")
+            g.teleop_stop()
+            self.assertFalse(resident.closed)
+
+            g.disconnect()
+            self.assertTrue(resident.closed,
+                            "disconnect() owns the resident publisher")
+
 
 class ReadinessTest(unittest.TestCase):
     """The three preconditions that must hold before anything is enabled."""
