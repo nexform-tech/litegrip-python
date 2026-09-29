@@ -40,7 +40,7 @@ _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from litegrip import (DEFAULT_GRIP_ID, DEFAULT_GRIP_PORT,  # noqa: E402
+from litegrip import (DEFAULT_DQ_MAX, DEFAULT_GRIP_ID, DEFAULT_GRIP_PORT,  # noqa: E402
                       LiteGrip, LiteGripError)
 
 
@@ -84,6 +84,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="follower: hold position after this many seconds without a "
              "fresh frame (default: 0.2)")
     parser.add_argument(
+        "--dq-max", type=float, default=DEFAULT_DQ_MAX,
+        help="follower: ceiling in rad/s on the leader velocity fed forward "
+             f"(default: {DEFAULT_DQ_MAX:.0f}; 0 disables the feedforward)")
+    parser.add_argument(
         "--rate", type=float, default=50.0, help="loop rate in Hz (default: 50)")
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -107,7 +111,8 @@ def _print_status(status: dict) -> None:
         extra += f" fault={status['fault']}"
     print(f"frames={status.get('frames', 0):>7} "
           f"age_ms={age_txt} stale={str(status.get('stale', False)):>5} "
-          f"openness={open_txt} "          f"loop_hz={status.get('loop_hz', 0.0):4.1f}"
+          f"openness={open_txt} dq={status.get('dq_cmd', 0.0):+5.2f} "
+          f"loop_hz={status.get('loop_hz', 0.0):4.1f}"
           f"{extra}", flush=True)
 
 
@@ -143,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     status = gripper.teleop_start(
         args.mode, link=args.link, host=args.host, port=args.port,
         grip_id=args.grip_id, kp=args.kp, kd=args.kd, align=not args.no_align,
-        watchdog_s=args.watchdog, rate_hz=args.rate)
+        watchdog_s=args.watchdog, dq_max=args.dq_max, rate_hz=args.rate)
     print(f"teleop {args.mode} running; Ctrl+C to stop")
     _print_status(status)
 

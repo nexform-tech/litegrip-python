@@ -42,7 +42,7 @@ from .actions import (
     MoveProgress,
     MoveResult,
 )
-from .teleop import DEFAULT_GRIP_ID, DEFAULT_GRIP_PORT
+from .teleop import DEFAULT_DQ_MAX, DEFAULT_GRIP_ID, DEFAULT_GRIP_PORT
 
 
 def _zenoh_transport(role: str, key: str, port: int,
@@ -1790,6 +1790,7 @@ class LiteGrip:
         kd: Optional[float] = None,
         align: bool = True,
         watchdog_s: float = 0.2,
+        dq_max: float = DEFAULT_DQ_MAX,
         rate_hz: float = 50.0,
     ) -> dict:
         """Start leader/follower teleoperation on this gripper.
@@ -1820,6 +1821,8 @@ class LiteGrip:
                 following.
             watchdog_s: Slave only — hold position after this long without a
                 fresh frame.
+            dq_max: Slave only — ceiling in rad/s on the leader velocity fed
+                forward to the follower.  ``0`` disables the feedforward.
             rate_hz: Loop rate.
 
         Returns:
@@ -1866,7 +1869,8 @@ class LiteGrip:
 
         manager = GripperTeleop(
             self, transport, mode, key,
-            rate_hz=rate_hz, kp=kp, kd=kd, align=align, watchdog_s=watchdog_s)
+            rate_hz=rate_hz, kp=kp, kd=kd, align=align, watchdog_s=watchdog_s,
+            dq_max=dq_max)
         manager.start()
         self._teleop = manager
         self._teleop_transport = created_transport
