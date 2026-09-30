@@ -2201,8 +2201,9 @@ class LiteGrip:
             kp, kd: Gains for the replay frames; ``None`` uses the configured ones.
             loop: Restart at the end instead of stopping.  A one-sample
                 trajectory is a pose, so looping it holds that opening.
-            align: Move to the trajectory's first opening before following, so
-                the first frame is not a step from wherever the jaws are.
+            align: Walk to the trajectory's first opening before following, at
+                ``motion_config.speed_mm_s`` and under its lead cap, so the first
+                frame is not a full-torque step from wherever the jaws are.
 
         Returns:
             The initial :meth:`trajectory_status` snapshot.
@@ -2269,6 +2270,7 @@ class LiteGrip:
                 early — a send failed, or the sampling clock stalled.
             NotInitializedError: not connected or not enabled.
         """
+        from .teleop import travel_mm
         from .trajectory import TrajectoryError
 
         if loop:
@@ -2278,9 +2280,16 @@ class LiteGrip:
         self.play_start(trajectory, speed=speed, kp=kp, kd=kd, loop=False,
                         align=align)
         player = self._trajectory_player
-        # Wall-clock pacing plus one align move; the margin covers a slow first
-        # frame.  A stall guard of its own, so a stopped clock cannot hang here.
-        budget = abs(float(trajectory.duration)) / float(speed) * 1.5 + 4.0
+        # Wall-clock pacing, plus the align walk and a margin for a slow first
+        # frame.  The align is a bounded-speed move over up to the whole travel,
+        # so budget its worst case rather than a flat second.  A stall guard of
+        # its own, so a stopped clock cannot hang here.
+        align_s = 0.0
+        align_speed_mm_s = float(getattr(self.motion_config, "speed_mm_s", 0.0) or 0.0)
+        if align and align_speed_mm_s > 0.0:
+            align_s = travel_mm(self._config) / align_speed_mm_s
+        budget = (abs(float(trajectory.duration)) / float(speed) * 1.5
+                  + align_s + 4.0)
         try:
             finished = player.wait(budget)
         except BaseException:
