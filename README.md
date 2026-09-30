@@ -164,13 +164,24 @@ python3 examples/teleop.py --mode master --channel can0
 python3 examples/teleop.py --mode slave  --channel can0 --host 192.168.1.20
 ```
 
+To bench a **single** gripper, `--fake-leader` replaces the leader with a synthetic one on an
+in-process bus: it sweeps its opening open → closed → open, so the follower can be driven into a
+hard stop and its torque guard watched tripping and re-arming with no second gripper and no
+network. Put a rigid object between the jaws first — with nothing to press against, the follower
+closes freely and the guard has nothing to demonstrate.
+
+```bash
+python3 examples/teleop.py --mode slave --channel can0 --fake-leader --torque-limit 1.0
+```
+
 Both ends must share `grip_id` (default `gripA`) and be connected and enabled first. Teleop is
 exclusive: the background loop owns the CAN I/O, so do not drive the gripper from the caller until
 `teleop_stop()`. `teleop_start` returns the initial `teleop_status()` snapshot; `teleop_status()`
 reports `active`, `mode`, `topic`, `frames`, `last_frame_age_ms`, `stale`, `openness`,
-`position_mm`, `force_n`, `dq_cmd`, `loop_hz`, `rejected`, `send_failed`, `fault`, and (master)
-`matching`. `position_mm` and `force_n` are the master's own state, or the leader's values from
-the frame the slave followed — a caller can show the jaws without opening a second CAN reader.
+`position_mm`, `force_n`, `dq_cmd`, `loop_hz`, `rejected`, `send_failed`, `fault`, `torque_nm`,
+`over_torque`, `torque_trips`, and (master) `matching`. `position_mm` and `force_n` are the
+master's own state, or the leader's values from the frame the slave followed — a caller can show
+the jaws without opening a second CAN reader.
 
 - **The follower feeds the leader's velocity forward.** The wire frame carries only the opening, so
   the follower recovers a velocity by differencing successive frames and sends it as the motor's
@@ -182,6 +193,17 @@ the frame the slave followed — a caller can show the jaws without opening a se
 - **A follower that loses the leader holds its position, it does not go slack.** After
   `watchdog_s` (default `0.2`) without a fresh frame it keeps commanding its last target under the
   follow gains, so `stale` goes true but the jaws stay put — and can hold whatever is between them.
+- **An optional torque guard releases a follower that is pressing too hard.** Set
+  `torque_limit_nm` and the follower watches its own torque (the motor reports no raw current, and
+  torque is derived from coil current) every cycle; held at or over the limit for
+  `TORQUE_TRIP_CYCLES` (3, i.e. 60 ms at 50 Hz) it goes to zero stiffness and damping **in place**
+  — the jaws stop pushing without the loop stopping, and keep streaming so the motor does not latch
+  a comm-loss fault. It re-arms only once the leader has reopened by `TORQUE_REARM_OPENNESS` (0.05),
+  so it lets go instead of chattering against the same obstruction. The default is `0` — the guard
+  is **off** unless you ask for it. Pick the value per machine: it depends on how fragile the part
+  between the jaws is, and because the follow gain is in Nm/rad (`kp` is `100.0` by default) a low
+  limit corresponds to a very small position error — watch `torque_nm` under a real press before
+  trusting a number. `over_torque` and `torque_trips` in `teleop_status()` report the state.
 - **Non-finite frames are dropped, never clamped.** A NaN opening would pass a `[0, 1]` clamp and
   then fold onto a hard stop, silently driving the follower closed. Both ends reject NaN / ±inf at
   the wire boundary — including the first frame used for the align — count them in `rejected`, and
@@ -191,7 +213,9 @@ the frame the slave followed — a caller can show the jaws without opening a se
   `error_code` other than "enabled" is reported in `fault` — neither is swallowed.
 - **Stopping leaves the gripper holding**, not slack: the master leaves zero-gravity mode on
   `teleop_stop()` and the follower sends one final frame at its current angle, so both hold under
-  the configured gains and neither disables.
+  the configured gains and neither disables. The one exception is a follower that has tripped the
+  torque guard: its final frame keeps the zero gains, because re-applying them would press the very
+  thing the guard just let go of.
 - Teleop refuses to start on an uncalibrated gripper, a zero-travel one, or one with
   `rad_to_mm == 0` (`TeleopNotReady`), before anything is enabled or driven.
 - Follow gains default to the calibration's `kp` / `kd` (`100.0` / `2.0` out of the box); override

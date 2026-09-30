@@ -152,8 +152,18 @@ python3 examples/teleop.py --mode slave  --channel can0 --host 192.168.1.20
 读写，在 `teleop_stop()` 之前不要再从调用方驱动夹爪。`teleop_start` 返回初始的
 `teleop_status()`；`teleop_status()` 报告 `active`、`mode`、`topic`、`frames`、
 `last_frame_age_ms`、`stale`、`openness`、`position_mm`、`force_n`、`dq_cmd`、`loop_hz`、
-`rejected`、`send_failed`、`fault`，主端另有 `matching`。`position_mm` 与 `force_n` 是主端自
-己的状态，或从端刚刚跟随的那一帧里主端的值 —— 调用方不必再开一路 CAN 读就能显示夹爪。
+`rejected`、`send_failed`、`fault`、`torque_nm`、`over_torque`、`torque_trips`，主端另有
+`matching`。`position_mm` 与 `force_n` 是主端自己的状态，或从端刚刚跟随的那一帧里主端的值 ——
+调用方不必再开一路 CAN 读就能显示夹爪。
+
+只想验**一个**夹爪时，`--fake-leader` 用一个进程内总线上的假主端替掉远端：它的张开度按
+张开 → 闭合 → 再张开 扫，于是可以拿单个夹爪去顶一个硬物，观察力矩保护跳闸与重新武装 —— 不需
+要第二个夹爪，也不需要网络。先往两指之间放个硬物：没有东西可顶时从端会自由闭合，保护没有可
+演示的对象。
+
+```bash
+python3 examples/teleop.py --mode slave --channel can0 --fake-leader --torque-limit 1.0
+```
 
 - **从端把主端的速度前馈下去。** 线上帧只带 openness，所以从端用相邻两帧的差分还原出速度，作为
   电机的 `dq` 目标下发 —— 机械臂遥操是直接发 `dq` 的。没有这一项，从端只能靠位置误差出力，会
@@ -163,13 +173,22 @@ python3 examples/teleop.py --mode slave  --channel can0 --host 192.168.1.20
 - **从端与主端失联时是「持位」，不是「卸力」。** 超过 `watchdog_s`（默认 `0.2`）没有新帧后，
   它仍按跟随增益顶着上一个目标继续发帧 —— 于是 `stale` 变真，但爪子停在原地，可能夹住中间的
   东西。
+- **可选的力矩保护会让顶得太狠的从端就地卸力。** 设了 `torque_limit_nm` 后，从端每拍都看自己
+  的力矩（电机不上报原始电流，力矩由线圈电流导出）；达到或超过上限连续 `TORQUE_TRIP_CYCLES`
+  （3 拍，50 Hz 下 60 ms）就把刚度和阻尼**就地**归零 —— 爪子不再顶，但循环不停、帧照发，电机
+  不会因此锁存断流故障。要等主端**重新张开** `TORQUE_REARM_OPENNESS`（0.05）才重新武装，所以
+  是「松手」而不是对着同一个障碍反复蹭。默认值是 `0`，也就是**不设防、要显式打开**。数值要按
+  机器定：它取决于两指之间那个件有多脆，而且跟随增益是 Nm/rad（`kp` 默认 `100.0`），所以很低
+  的上限只对应一点点位置误差 —— 先在真实顶压时看 `torque_nm`，再定这个数。`teleop_status()`
+  里的 `over_torque` 与 `torque_trips` 报告状态。
 - **非有限值帧一律丢弃，绝不夹位。** NaN 会原样穿过 `[0, 1]` 的钳位，再被折到某个端点 —— 静默
   地把从端指到全闭限位。两端都在**协议边界**上拒收 NaN / ±inf（包括对齐用的首帧），计入
   `rejected`，并改为持位。
 - **从端每拍都把目标夹进自己的标定行程**，并且会看 SDK 的返回值：`send_mit_frame` 返回 `False`
   会计入 `send_failed`，夹爪自报的 `error_code` 不是「已使能」会记进 `fault` —— 都不吞掉。
 - **停止后是持位**，不是卸力：主端在 `teleop_stop()` 时退出零重力模式，从端在收尾时按当前角度
-  补发一帧 —— 两边都按配置增益持位，都不失能。
+  补发一帧 —— 两边都按配置增益持位，都不失能。唯一的例外是刚触发过力矩保护的从端：它的收尾帧
+  保持零增益，因为重新加上增益就会去顶它刚刚松开的那个东西。
 - 未标定、行程为零、或 `rad_to_mm == 0` 的夹爪会**拒绝启动**（`TeleopNotReady`），且在使能或
   驱动之前就拒掉。
 - 跟随增益默认取标定里的 `kp` / `kd`（出厂是 `100.0` / `2.0`），用 `kp=` / `kd=` 覆盖。
