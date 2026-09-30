@@ -137,7 +137,7 @@ with LiteGrip("can0") as master:
     master.enable()
     master.teleop_start("master")                      # zenoh，gripA，端口 17448
 
-# 从端：连到主端，先对齐首帧，然后跟随。
+# 从端：连到主端，按固定速度走到首帧，然后跟随。
 with LiteGrip("can0") as slave:
     slave.load_calibration()
     slave.enable()
@@ -176,6 +176,18 @@ python3 examples/teleop.py --mode slave  --channel can0 --host 192.168.1.20
 python3 examples/teleop.py --mode slave --channel can0 --fake-leader --torque-limit 1.0
 ```
 
+- **对齐是一段限速斜坡，而且对齐时任何一帧的指令都不会领先实测位置超过 `lead_cap_mm`。**
+  对齐原本是一次 `goto_rad(..., duration=1.0)`。`duration` 看着像斜坡，但 CAN 层从**第一帧**起
+  就发 `q = q_target`，只是在截止时间前一直重发，所以那一帧要求的力矩是 `kp` 乘上整个误差 ——
+  出厂 `kp = 100.0` Nm/rad 下，误差超过约 0.1 rad 就把 DM4310 顶到饱和；真机上一次从端就是
+  这样冲进闭合硬限位、把打印限位撞断的。现在的对齐是按 `align_speed_mm_s`（默认 `50` mm/s 行程
+  速度）的匀速 schedule，并把同一速度前馈成 `dq`；其中每一帧都过一层领先上限：指令位置最多
+  领先实测位置 `lead_cap_mm`（默认 `4` mm）。力矩是 `kp * (q_cmd - q_measured)`，所以这从构造上
+  就给出了对齐的力矩上限 —— 出厂参数下约 5.4 Nm。封顶不等于慢下来：夹爪照样走，只是在追赶期间
+  顶的力有界。**跟随环则故意不封顶** —— 它直接把主端的 openness 发出去，跟手才好；跟随的过载
+  保护是 `torque_limit_nm`。`lead_cap_mm=0` 关闭对齐的封顶；`align_speed_mm_s` 必须 > 0。
+  命令行对应 `--align-speed` 与 `--lead-cap`。对齐现在也走循环自己的发帧路径，所以
+  `torque_limit_nm` 覆盖得到它 —— 对齐途中卡住会就地卸载，而不是一直顶到动作结束。
 - **主端带增益顶着爪子，直到从端报告就绪。** 从端对齐上首帧、且不再 `stale`、未跳闸、并且与
   该帧目标相距不超过 `ready_tolerance_mm`（默认 `2.0`）之后，会在
   `litearm/v4/{grip_id}/gripper_ready` 上宣布自己就绪；主端直到这时才卸力进入零重力。它**全程

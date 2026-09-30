@@ -18,11 +18,13 @@ import unittest
 import unittest.mock
 
 import _sdkpath  # noqa: F401
-from litegrip import (DEFAULT_DQ_MAX, DEFAULT_READY_TOLERANCE_MM, FRAME_SIZE,
-                      READY_FRAME_SIZE, GripperTeleop, InProcTeleopTransport,
-                      TeleopBusyError, TeleopError, TeleopNotReady,
-                      UdpTeleopTransport, decode_frame, decode_ready_frame,
-                      encode_frame, encode_ready_frame, ready_topic,
+from litegrip import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX,
+                      DEFAULT_LEAD_CAP_MM, DEFAULT_READY_TOLERANCE_MM,
+                      FRAME_SIZE, READY_FRAME_SIZE, GripperTeleop,
+                      InProcTeleopTransport, TeleopBusyError, TeleopError,
+                      TeleopNotReady, UdpTeleopTransport, decode_frame,
+                      decode_ready_frame, encode_frame, encode_ready_frame,
+                      ready_topic,
                       teleop_topic)
 from litegrip.teleop import (MAX_FRAME_GAP_S, TORQUE_REARM_OPENNESS,
                              TORQUE_TRIP_CYCLES, clamp_to_calibrated, check_ready,
@@ -302,15 +304,23 @@ class SlaveLoopTest(unittest.TestCase):
         finally:
             mgr.stop()
 
-    def test_align_uses_first_frame_before_following(self):
+    def test_align_ramps_to_the_first_frame_instead_of_stepping(self):
+        # The align target arrives in a single frame.  Commanding it outright —
+        # what ``goto_rad(..., duration=1.0)`` did, because ``duration`` is a
+        # deadline and not a ramp — demands ``kp`` times the whole error on the
+        # first CAN frame.  At the shipped kp that is a full-torque step
+        # wherever the jaws start, which is how a follower broke its own hard
+        # stop.  So: the first frame is one schedule step, not the target.
         g, fake, transport, mgr = self._slave(align=True, watchdog_s=5.0)
-        # Queued before start; the align step must be the first CAN traffic.
         transport.pub(TOPIC, encode_frame(0.5, 60.0, 0.0, 0.0))
         expected = openness_to_rad(0.5, g.config)
         mgr.start()
         try:
             self.assertTrue(_wait_until(lambda: len(fake.frames) > 0))
-            self.assertAlmostEqual(fake.frames[0].q, expected)
+            self.assertNotAlmostEqual(fake.frames[0].q, expected, places=3)
+            # It still gets there — over a ramp, not a step.
+            self.assertTrue(_wait_until(
+                lambda: any(abs(f.q - expected) < 1e-9 for f in fake.frames)))
         finally:
             mgr.stop()
 
@@ -828,7 +838,7 @@ class TorqueGuardTest(unittest.TestCase):
     derived from coil current — never the leader's ``force_n`` on the wire.
     Position is deliberately not consulted: a jam partway through the travel is
     indistinguishable from slow motion.  The guard is opt-in (``0`` disables it),
-    so the loop tests elsewhere keep their full-stroke steps.
+    so the loop tests elsewhere run with it off.
     """
 
     def _mgr(self, **kwargs):
@@ -955,6 +965,25 @@ class TorqueGuardTest(unittest.TestCase):
         finally:
             mgr.stop()
 
+    def test_align_releases_in_place_when_the_guard_trips(self):
+        # The align used to run inside a blocking ``goto_rad``, outside the
+        # guard's reach: ``torque_limit_nm`` did not cover it, and a jam during
+        # the align pressed until the move finished.  It now sends through the
+        # loop's own path, so the guard sees it.
+        block = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2.0
+        g, fake = make_gripper(start_rad=POS_OPEN_RAD, block_rad=block)
+        transport = _PreSubTransport()
+        mgr = GripperTeleop(g, transport, "slave", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep, align=True, watchdog_s=5.0,
+                            torque_limit_nm=1.0)
+        transport.pub(TOPIC, encode_frame(0.0, 0.0, 0.0, 0.0))
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(
+                lambda: any(f.kp == 0.0 for f in fake.frames)))
+        finally:
+            mgr.stop()
+
     def test_slave_releases_in_place_on_the_handoff(self):
         block = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2.0
         g, fake = make_gripper(start_rad=POS_OPEN_RAD, block_rad=block)
@@ -971,6 +1000,85 @@ class TorqueGuardTest(unittest.TestCase):
         # The final frame must not re-apply the gains and press again.
         self.assertEqual(fake.frames[-1].kp, 0.0)
         self.assertEqual(fake.frames[-1].kd, 0.0)
+
+
+class LeadCapTest(unittest.TestCase):
+    """The align command never leads the measurement by more than the cap.
+
+    Torque is ``kp * (q_cmd - q_measured)``, so bounding the lead bounds the
+    commanded torque by construction.  This is what keeps the align ramp from
+    demanding ``kp`` times a whole-stroke error in a single frame.  The follow
+    loop is deliberately *not* capped, so the follower stays responsive — see
+    :meth:`test_first_follow_frame_commands_the_target`.
+    """
+
+    def _slave(self, **kwargs):
+        return SlaveLoopTest()._slave(**kwargs)
+
+    @staticmethod
+    def _cap_rad(g) -> float:
+        return DEFAULT_LEAD_CAP_MM / g.config.rad_to_mm
+
+    @staticmethod
+    def _max_lead(fake, start_rad: float) -> float:
+        """Largest distance any command led the position it was sent from."""
+        worst, pos = 0.0, start_rad
+        for frame in fake.frames:
+            worst = max(worst, abs(frame.q - pos))
+            pos = frame.pos_after
+        return worst
+
+    def test_align_never_leads_more_than_the_cap(self):
+        g, fake, transport, mgr = self._slave(align=True, watchdog_s=5.0)
+        transport.pub(TOPIC, encode_frame(1.0, 120.0, 0.0, 0.0))
+        target = openness_to_rad(1.0, g.config)
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(
+                lambda: any(abs(f.q - target) < 1e-9 for f in fake.frames)))
+            self.assertLessEqual(self._max_lead(fake, POS_CLOSED_RAD),
+                                 self._cap_rad(g) + 1e-9)
+            # The step this replaces was an order of magnitude past the cap.
+            self.assertGreater(abs(target - POS_CLOSED_RAD),
+                               10.0 * self._cap_rad(g))
+        finally:
+            mgr.stop()
+
+    def test_first_follow_frame_commands_the_target(self):
+        # The follow loop is deliberately uncapped: it commands the leader's
+        # whole opening from the first frame, exactly as it did before the align
+        # ramp was added.  Capping it would bound the follow torque but blunt the
+        # follower's response, which is not what the align fix was for.
+        g, fake, transport, mgr = self._slave(align=False, watchdog_s=5.0)
+        transport.pub(TOPIC, encode_frame(1.0, 120.0, 0.0, 0.0))
+        target = openness_to_rad(1.0, g.config)
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 0))
+            self.assertAlmostEqual(fake.frames[0].q, target)
+        finally:
+            mgr.stop()
+
+    def test_zero_cap_disables_it(self):
+        # Same opt-out shape as ``dq_max`` and ``torque_limit_nm``: 0 turns the
+        # align's cap off, passing the command through untouched.  The align is
+        # still a bounded-speed ramp — that is ``align_speed_mm_s``, a separate
+        # knob.
+        _g, _fake, _transport, mgr = self._slave(lead_cap_mm=0.0)
+        self.assertEqual(mgr._cap_lead(1.0, 0.0), 1.0)
+        self.assertEqual(mgr._cap_lead(-1.0, 0.0), -1.0)
+
+    def test_rejects_a_negative_cap(self):
+        g, _ = make_gripper()
+        with self.assertRaises(ValueError):
+            GripperTeleop(g, InProcTeleopTransport(), "slave", TOPIC,
+                          lead_cap_mm=-1.0)
+
+    def test_rejects_a_non_positive_align_speed(self):
+        g, _ = make_gripper()
+        with self.assertRaises(ValueError):
+            GripperTeleop(g, InProcTeleopTransport(), "slave", TOPIC,
+                          align_speed_mm_s=0.0)
 
 
 class VelocityFeedforwardTest(unittest.TestCase):
@@ -1018,8 +1126,8 @@ class VelocityFeedforwardTest(unittest.TestCase):
 
     def test_slave_sends_the_leader_velocity_as_dq(self):
         # Paced by the real clock, so consecutive frames land a realistic
-        # interval apart.  The step is then far past ``dq_max`` and clamps,
-        # which is stable against the exact timing.
+        # interval apart — the recovered velocity is then far past ``dq_max``
+        # and clamps, which is stable against the exact timing.
         g, fake = make_gripper(start_rad=POS_CLOSED_RAD, reverse=False)
         transport = _PreSubTransport()
         mgr = GripperTeleop(g, transport, "slave", TOPIC, rate_hz=100.0,
@@ -1027,19 +1135,20 @@ class VelocityFeedforwardTest(unittest.TestCase):
         transport.pub(TOPIC, encode_frame(0.2, 24.0, 0.0, 0.0))
         mgr.start()
         try:
-            q1 = openness_to_rad(0.2, g.config)
-            self.assertTrue(_wait_until(
-                lambda: fake.frames and abs(fake.frames[-1].q - q1) < 1e-9))
-            # Nothing to difference against yet: a pure position hold.
-            self.assertEqual(fake.frames[-1].dq, 0.0)
+            # The first frame has nothing to difference against: a position
+            # command with the feed-forward at zero.
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 0))
+            self.assertEqual(fake.frames[0].dq, 0.0)
+            # A frame far away, one loop period later.  Opening up drives the
+            # normal-mount jaw toward a smaller angle, so the fed-forward
+            # velocity is negative — and bounded by ``dq_max``.
             transport.pub(TOPIC, encode_frame(0.8, 96.0, 0.0, 0.0))
+            self.assertTrue(_wait_until(
+                lambda: any(f.dq == -DEFAULT_DQ_MAX for f in fake.frames)))
+            # The target is still reached; the cap only paces the approach.
             q2 = openness_to_rad(0.8, g.config)
             self.assertTrue(_wait_until(
                 lambda: any(abs(f.q - q2) < 1e-9 for f in fake.frames)))
-            # Opening up drives the normal-mount jaw toward a smaller angle, so
-            # the fed-forward velocity is negative — and bounded.
-            self.assertTrue(any(abs(f.q - q2) < 1e-9 and f.dq == -DEFAULT_DQ_MAX
-                                for f in fake.frames))
         finally:
             mgr.stop()
 

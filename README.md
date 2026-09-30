@@ -155,7 +155,7 @@ with LiteGrip("can0") as master:
     master.enable()
     master.teleop_start("master")                      # zenoh, gripA, port 17448
 
-# Follower: connect to the leader, align to the first frame, then follow.
+# Follower: connect to the leader, ramp to the first frame, then follow.
 with LiteGrip("can0") as slave:
     slave.load_calibration()
     slave.enable()
@@ -197,6 +197,23 @@ reports `active`, `mode`, `topic`, `frames`, `last_frame_age_ms`, `stale`, `open
 master's own state, or the leader's values from the frame the slave followed — a caller can show
 the jaws without opening a second CAN reader.
 
+- **The align move is a bounded-speed ramp, and no align command ever leads the measurement by more
+  than `lead_cap_mm`.** The align used to be a single `goto_rad(..., duration=1.0)`. The `duration`
+  reads like a ramp, but the CAN layer sends `q = q_target` from the very first frame and merely
+  holds it until the deadline, so that first frame demanded `kp` times the whole error — at the
+  shipped `kp` of `100.0` Nm/rad any error past ~0.1 rad saturates the DM4310, which is how a
+  follower drove into its closed hard stop hard enough to break the printed limit. The align is now
+  a constant-speed schedule at `align_speed_mm_s` (default `50` mm/s of jaw travel) with that same
+  speed fed forward as `dq`, and each of its frames stays within a lead cap: the commanded position
+  may lead the measured one by at most `lead_cap_mm` (default `4` mm). Torque is
+  `kp * (q_cmd - q_measured)`, so that bounds the align's commanded torque by construction — about
+  5.4 Nm out of the box. Capping does not make the move slower for free: the jaws still travel, they
+  just press with a bounded torque while they catch up. The **follow loop is deliberately not
+  capped** — it commands the leader's opening outright so the follower stays responsive, and
+  `torque_limit_nm` is what protects it under load. `lead_cap_mm=0` disables the align's cap;
+  `align_speed_mm_s` must be > 0. On the command line these are `--align-speed` and `--lead-cap`.
+  The align also now runs through the loop's own send path, so `torque_limit_nm` covers it — a jam
+  during the align releases in place instead of pressing until the move ends.
 - **The leader holds its jaws under gain until the follower reports ready.** The follower announces
   itself on `litearm/v4/{grip_id}/gripper_ready` once it has aligned to a frame and is no longer
   stale, not tripped, and within `ready_tolerance_mm` (default `2.0`) of the frame's target; the
