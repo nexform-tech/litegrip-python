@@ -22,6 +22,19 @@ and the follower holds its position on a leader dropout rather than going
 slack, so it can clamp whatever is between the fingers. Keep a hand on the
 power switch.
 
+``--fake-leader`` replaces the leader with a synthetic one, so a **single
+gripper** can be benched alone — no second gripper, no second machine, no
+network.  The frames go over an in-process bus, and the synthetic leader sweeps
+its opening open → closed → open so the follower can be driven into a hard stop
+and its torque guard (``--torque-limit``) watched tripping and re-arming::
+
+    python3 examples/teleop.py --mode slave --channel can0 \
+        --fake-leader --torque-limit 1.0
+
+⚠ Put a **rigid object** between the jaws first.  With nothing to press against,
+the follower closes freely, its torque never rises, and there is nothing for the
+guard to demonstrate.  ``--torque-limit 0`` (the default) turns the guard off.
+
 It runs from a source checkout as well as from an installed package: ``src/`` is
 put on the import path below if ``litegrip`` is not installed yet.
 """
@@ -31,6 +44,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 import time
 
 # Like tests/_sdkpath.py: import the SDK straight out of the checkout, so the
@@ -41,7 +55,8 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from litegrip import (DEFAULT_DQ_MAX, DEFAULT_GRIP_ID, DEFAULT_GRIP_PORT,  # noqa: E402
-                      LiteGrip, LiteGripError)
+                      DEFAULT_TORQUE_LIMIT_NM, InProcTeleopTransport, LiteGrip,
+                      LiteGripError, encode_frame, teleop_topic)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -90,6 +105,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rate", type=float, default=50.0, help="loop rate in Hz (default: 50)")
     parser.add_argument(
+        "--torque-limit", type=float, default=DEFAULT_TORQUE_LIMIT_NM,
+        help="follower: ceiling in Nm on the follower's own torque; held over "
+             "it the follower releases in place and re-arms once the leader "
+             f"reopens (default: {DEFAULT_TORQUE_LIMIT_NM:g} = guard off)")
+    parser.add_argument(
+        "--fake-leader", action="store_true",
+        help="bench one gripper alone: drive the follower from a synthetic "
+             "leader on an in-process bus instead of a second gripper "
+             "(implies --mode slave; ignores --link/--host/--port)")
+    parser.add_argument(
+        "--openness-rate", type=float, default=0.3,
+        help="fake leader: how fast its opening sweeps, in openness per second "
+             "(default: 0.3, a full stroke in ~3.3 s)")
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="print the resolved plan and exit without touching hardware")
     return parser
@@ -109,6 +138,12 @@ def _print_status(status: dict) -> None:
         extra += f" send_failed={status['send_failed']}"
     if status.get("fault"):
         extra += f" fault={status['fault']}"
+    if status.get("mode") == "slave":
+        # The follower's own torque and the guard's state — the whole point of
+        # --torque-limit, so print them rather than hide them in the counters.
+        extra += f" torque={status.get('torque_nm', 0.0):+5.2f}"
+        if status.get("over_torque"):
+            extra += f" OVER_TORQUE(trips={status.get('torque_trips', 0)})"
     print(f"frames={status.get('frames', 0):>7} "
           f"age_ms={age_txt} stale={str(status.get('stale', False)):>5} "
           f"openness={open_txt} dq={status.get('dq_cmd', 0.0):+5.2f} "
@@ -116,8 +151,90 @@ def _print_status(status: dict) -> None:
           f"{extra}", flush=True)
 
 
+class _FakeLeader:
+    """A synthetic leader, so one gripper can be benched without a second one.
+
+    Teleoperation needs a leader *and* a follower — two grippers, or two
+    machines.  This stands in for the leader and publishes on an
+    :class:`~litegrip.InProcTeleopTransport`, so a single gripper can be run as
+    the follower.  Drive it into a hard stop and its torque guard can be
+    watched tripping and re-arming, with no second gripper and no network.
+
+    The opening sweeps as a triangle, ``start`` → ``stop`` → ``start``: down to
+    the closed stop (the follower presses, the guard trips and releases), back
+    up (the follower re-arms once the leader has reopened), and down again.
+    """
+
+    def __init__(self, bus, topic: str, travel_mm: float, rate_hz: float,
+                 openness_rate: float, start: float = 1.0,
+                 stop: float = 0.0) -> None:
+        self._bus = bus
+        self._topic = topic
+        self._travel_mm = travel_mm
+        self._dt = 1.0 / rate_hz
+        self._step = openness_rate * self._dt
+        self._start = start
+        self._stop = stop
+        self._openness = start
+        self._direction = -1.0
+        self._abort = threading.Event()
+        self._thread = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="fake-leader",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._abort.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._abort.is_set():
+            t0 = time.monotonic()
+            self._publish()
+            # Schedule against the clock: a bare sleep(dt) would add the publish
+            # cost every cycle and slow the sweep below --openness-rate.
+            time.sleep(max(0.0, self._dt - (time.monotonic() - t0)))
+
+    def _publish(self) -> None:
+        # Publish *before* stepping: the first frame is the starting opening, so
+        # the follower's align sits on its own position instead of jumping a
+        # step away and tripping the guard on the transient.
+        # position_mm and force_n are diagnostic only — the follower follows
+        # ``openness``.  A synthetic leader has no sensor, so force is honestly
+        # 0 and position is the opening scaled by this gripper's own travel.
+        self._bus.pub(self._topic, encode_frame(
+            self._openness, self._openness * self._travel_mm, 0.0,
+            time.time()))
+        nxt = self._openness + self._direction * self._step
+        if nxt <= self._stop:
+            nxt, self._direction = self._stop, 1.0
+        elif nxt >= self._start:
+            nxt, self._direction = self._start, -1.0
+        self._openness = nxt
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.fake_leader and args.mode != "slave":
+        print("error: --fake-leader drives a follower, so it needs --mode slave",
+              file=sys.stderr)
+        return 2
+    if args.openness_rate <= 0.0:
+        print(f"error: --openness-rate must be > 0, got {args.openness_rate}",
+              file=sys.stderr)
+        return 2
+    if args.torque_limit < 0.0:
+        print(f"error: --torque-limit must be >= 0 (0 turns the guard off), "
+              f"got {args.torque_limit}", file=sys.stderr)
+        return 2
+    if args.fake_leader and args.torque_limit == 0.0:
+        print("warning: --fake-leader with the torque guard off (--torque-limit 0) "
+              "has nothing to demonstrate; pass a limit to watch it trip",
+              file=sys.stderr)
 
     gripper = LiteGrip(channel=args.channel, can_id=args.can_id)
     if args.mount is not None:
@@ -127,10 +244,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"mount={gripper.mount} closed={gripper.config.pos_closed_rad:+.4f} "
           f"open={gripper.config.pos_open_rad:+.4f} rad_to_mm={gripper.config.rad_to_mm}")
 
-    target = f"{args.host}:{args.port}" if args.host else f"*:{args.port}"
+    # A fake leader replaces the whole remote end: the frames go over an
+    # in-process bus, so none of --link/--host/--port apply.
+    bus = InProcTeleopTransport() if args.fake_leader else None
+    target = "in-process bus" if bus is not None else (
+        f"{args.host}:{args.port}" if args.host else f"*:{args.port}")
     if args.dry_run:
         print(f"dry run: would start {args.mode} on {args.channel} over "
-              f"{args.link} at {target} "
+              f"{'inproc' if bus is not None else args.link} at {target} "
               f"(topic litearm/v4/{args.grip_id}/gripper_teleop)")
         return 0
 
@@ -146,11 +267,28 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     status = gripper.teleop_start(
-        args.mode, link=args.link, host=args.host, port=args.port,
+        args.mode, transport=bus, link=args.link, host=args.host, port=args.port,
         grip_id=args.grip_id, kp=args.kp, kd=args.kd, align=not args.no_align,
-        watchdog_s=args.watchdog, dq_max=args.dq_max, rate_hz=args.rate)
+        watchdog_s=args.watchdog, dq_max=args.dq_max, rate_hz=args.rate,
+        torque_limit_nm=args.torque_limit)
+    if args.mode == "slave":
+        guard = "off" if args.torque_limit == 0.0 else f"{args.torque_limit:.2f} Nm"
+        print(f"torque guard: {guard} "
+              "(follower releases in place when its own torque reaches it)")
     print(f"teleop {args.mode} running; Ctrl+C to stop")
     _print_status(status)
+
+    # Started *after* teleop_start so the follower's subscription exists before
+    # the first frame — otherwise the opening sweep is missed and `align` waits
+    # out its timeout for a frame that was already sent.
+    leader = None
+    if bus is not None:
+        cfg = gripper.config
+        travel = (abs(float(cfg.pos_open_rad) - float(cfg.pos_closed_rad))
+                  * float(cfg.rad_to_mm))
+        leader = _FakeLeader(bus, teleop_topic(args.grip_id), travel, args.rate,
+                             args.openness_rate)
+        leader.start()
 
     try:
         while True:
@@ -159,6 +297,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\nstopping")
     finally:
+        if leader is not None:
+            leader.stop()
         gripper.teleop_stop()
         gripper.disconnect()
     return 0
