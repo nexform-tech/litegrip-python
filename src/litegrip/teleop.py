@@ -29,8 +29,15 @@ litearm implementation so the two can interoperate::
 Safety notes
 ------------
 * ``openness`` is clamped to ``[0, 1]``, which keeps every commanded target
-  inside the calibrated travel.  That clamp is the only limit this layer
-  applies; there is no red-line logic here.
+  inside the calibrated travel.  That clamp bounds *where* the follower may go;
+  ``torque_limit_nm`` bounds *how hard* it may push.
+* When ``torque_limit_nm`` is set (``0``, the default, disables it) the follower
+  watches its own torque and releases when it stays over the limit for
+  :data:`TORQUE_TRIP_CYCLES` cycles — see
+  :meth:`GripperTeleop._update_torque_guard`.  Position is deliberately not used
+  for this: a jam partway through the travel is indistinguishable from slow
+  motion, and the calibrated travel comes from two hand-measured limits, which
+  makes it the least trustworthy number in the loop.
 * A **non-finite** frame (NaN / ±inf) is *dropped*, never clamped.  ``_clamp01``
   passes NaN through and ``min(hi, NaN)`` returns ``hi``, so clamping a NaN
   target silently commands the follower to its closed stop.  Bad readings are
@@ -38,7 +45,8 @@ Safety notes
   the safe side.
 * A ``slave`` whose leader goes quiet **holds** its last target at the follow
   gains (it does not relax to zero torque).  The jaws therefore keep pressing
-  whatever is between them — the same behaviour as the litearm original.
+  whatever is between them — the same behaviour as the litearm original.  A
+  tripped torque guard overrides that and stays released.
 * Teleoperation is exclusive: stop any motion you started elsewhere before
   calling :meth:`~litegrip.LiteGrip.teleop_start`.
 * :class:`UdpTeleopTransport` is plain, unauthenticated UDP.  Use it only on a
@@ -86,6 +94,29 @@ DEFAULT_DQ_MAX = 10.0
 #: Past this the "velocity" would be an average across a dropout — refuse it and
 #: fall back to position-only control for that cycle.
 MAX_FRAME_GAP_S = 0.05
+
+#: Default ceiling on the follower's own torque, in Nm.  ``0`` disables the guard,
+#: which is the default: it changes the follower's behaviour under load, so a
+#: caller opts in rather than inheriting it.
+#:
+#: Exceeding the limit means the jaws are pressing harder than a normal grasp,
+#: which on a printed jaw or mount is how parts break.  The status frame reports
+#: torque (there is no raw milliamp field); the motor derives it from its coil
+#: current, so that is the current signal to judge on.  Pick the value from
+#: observed torque on the machine: the 0.5 Nm ``grasp_torque_threshold`` and the
+#: 2.0 Nm calibration probe ceiling bracket the useful range, and the follow
+#: gains set how much position error that much torque corresponds to.
+DEFAULT_TORQUE_LIMIT_NM = 0.0
+
+#: Consecutive over-limit cycles before the guard trips.  At the 50 Hz default
+#: this is 60 ms, which rides out a single noisy sample without leaving a real
+#: jam pressing for long.
+TORQUE_TRIP_CYCLES = 3
+
+#: Opening the leader must recover, in normalised openness, before a tripped
+#: follower re-arms.  Without it the release would re-engage on the next cycle
+#: and press again — the guard would chatter instead of letting go.
+TORQUE_REARM_OPENNESS = 0.05
 
 
 def encode_frame(openness: float, position_mm: float, force_n: float,
@@ -437,6 +468,11 @@ class GripperTeleop:
             as the follower's ``dq`` target.  ``0`` disables the feedforward, in
             which case the follower biases on position error alone and trails a
             moving leader.  See :meth:`_estimate_dq`.
+        torque_limit_nm: Slave only — ceiling in Nm on the follower's own torque.
+            Held over the limit for :data:`TORQUE_TRIP_CYCLES` cycles it
+            releases in place and stays released until the leader reopens by
+            :data:`TORQUE_REARM_OPENNESS`.  ``0`` disables the guard.  See
+            :meth:`_update_torque_guard`.
         sub_transport: Slave only — a separate transport to subscribe on when
             the leader is remote (the master's transport is local-only).
         sleep_fn, time_fn: Timing seams for tests.  ``time_fn`` must be
@@ -455,6 +491,7 @@ class GripperTeleop:
         align: bool = True,
         watchdog_s: float = 0.2,
         dq_max: float = DEFAULT_DQ_MAX,
+        torque_limit_nm: float = DEFAULT_TORQUE_LIMIT_NM,
         sub_transport: Optional[TeleopTransport] = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         time_fn: Callable[[], float] = time.monotonic,
@@ -465,6 +502,10 @@ class GripperTeleop:
             raise ValueError("rate_hz must be > 0")
         if not watchdog_s > 0.0:
             raise ValueError("watchdog_s must be > 0")
+        if float(torque_limit_nm) < 0.0:
+            raise ValueError(
+                f"torque_limit_nm must be >= 0 (0 disables the guard), "
+                f"got {torque_limit_nm!r}")
         self._g = gripper
         self._tp = transport
         self._mode = mode
@@ -475,6 +516,7 @@ class GripperTeleop:
         self._align = align
         self._watchdog_s = watchdog_s
         self._dq_max = float(dq_max)
+        self._torque_limit_nm = float(torque_limit_nm)
         self._sub_tp = sub_transport
         self._sleep_fn = sleep_fn
         self._time_fn = time_fn
@@ -501,6 +543,15 @@ class GripperTeleop:
         self._rejected = 0
         self._send_failed = 0
         self._fault = ""
+        #: Torque guard (slave).  ``_torque_nm`` is the last torque read;
+        #: ``_over_torque`` is latched once the limit is held for
+        #: ``TORQUE_TRIP_CYCLES`` cycles and clears on re-arm.  See
+        #: :meth:`_update_torque_guard`.
+        self._torque_nm = 0.0
+        self._over_torque = False
+        self._torque_trips = 0
+        self._torque_over_cycles = 0
+        self._trip_openness = 0.0
         #: Leader velocity fed forward as this cycle's ``dq`` target, and the
         #: two samples it is differenced from.  Seeded on the first good frame;
         #: see :meth:`_estimate_dq`.
@@ -557,7 +608,12 @@ class GripperTeleop:
         log.info("teleop stopped: mode=%s frames=%d", self._mode, self._frames)
 
     def _handoff(self) -> None:
-        """Leave the gripper holding position — never disable (§8 rule 4/6)."""
+        """Leave the gripper holding position — never disable (§8 rule 4/6).
+
+        A tripped torque guard is the exception: re-applying the follow gains
+        would press the very thing the guard just let go of, so the final frame
+        stays at zero torque.
+        """
         try:
             if self._mode == "master":
                 # Internally one frame at the current angle under the config
@@ -566,7 +622,10 @@ class GripperTeleop:
             else:
                 q = clamp_to_calibrated(
                     self._g.config, self._g.get_state(wait=False).position_rad)
-                self._send(q, self._resolve_kp(), self._resolve_kd())
+                if self._over_torque:
+                    self._send(q, 0.0, 0.0)
+                else:
+                    self._send(q, self._resolve_kp(), self._resolve_kd())
         except Exception as e:  # noqa: BLE001
             log.debug("hand-off on stop failed: %s", e)
 
@@ -597,6 +656,11 @@ class GripperTeleop:
             "send_failed": self._send_failed,
             # The gripper's own error_code was not "enabled".
             "fault": self._fault,
+            # Slave only: the follower's own torque (Nm), and whether the guard
+            # has released it.  ``torque_trips`` counts trips this session.
+            "torque_nm": round(self._torque_nm, 4),
+            "over_torque": self._over_torque,
+            "torque_trips": self._torque_trips,
             # Master only: whether a subscriber is matched.
             "matching": matching if isinstance(matching, bool) else None,
         }
@@ -717,9 +781,21 @@ class GripperTeleop:
                 q_cmd = clamp_to_calibrated(cfg, q_cmd)
                 self._dq_cmd = dq_cmd
                 try:
-                    self._send(q_cmd, self._resolve_kp(), self._resolve_kd(),
-                               dq=dq_cmd)
-                    self._note_grip_fault(self._g.get_state(wait=False))
+                    # Read the state first: this cycle's send is decided from
+                    # this cycle's torque.  The read is the same cached poll the
+                    # fault check always did, so the guard costs no extra traffic
+                    # and runs at the loop rate.
+                    state = self._g.get_state(wait=False)
+                    self._note_grip_fault(state)
+                    self._update_torque_guard(state)
+                    if self._over_torque:
+                        # Released in place: zero stiffness and damping, but the
+                        # frames keep flowing so the motor does not latch its
+                        # comm-loss fault.
+                        self._send(q_cmd, 0.0, 0.0)
+                    else:
+                        self._send(q_cmd, self._resolve_kp(), self._resolve_kd(),
+                                   dq=dq_cmd)
                 except Exception:  # noqa: BLE001
                     log.exception("[slave] CAN error; loop exiting")
                     break
@@ -826,6 +902,47 @@ class GripperTeleop:
                            + (" (disabled)" if code == 0 else " (fault)")
                            + " — still streaming hold frames")
             log.warning("[%s] %s", self._mode, self._fault)
+
+    def _update_torque_guard(self, state: Any) -> None:
+        """Release the follower when its torque stays over the limit.
+
+        Torque is the follower's own reading, not the leader's ``force_n`` on the
+        wire: the jaws press whatever is between them, and the status frame's
+        ``tau`` (derived from coil current) is the only signal that sees it.
+        Position is not used — a jam partway through the travel looks like slow
+        motion, and the calibrated limits are the loop's least trustworthy
+        numbers.
+
+        Latching matters: releasing in place drops the torque to zero, so a
+        non-latching guard would re-engage on the very next cycle and chatter.
+        The follower re-arms only once the leader has reopened by
+        :data:`TORQUE_REARM_OPENNESS`, i.e. once the operator has backed off.
+
+        ``torque_limit_nm == 0`` disables the guard entirely.
+        """
+        self._torque_nm = float(getattr(state, "torque_nm", 0.0) or 0.0)
+        if self._torque_limit_nm <= 0.0:
+            return
+        if self._over_torque:
+            if (self._last_openness - self._trip_openness) >= TORQUE_REARM_OPENNESS:
+                self._over_torque = False
+                self._torque_over_cycles = 0
+                log.info("[%s] torque guard re-armed (leader reopened to %.3f)",
+                         self._mode, self._last_openness)
+            return
+        if abs(self._torque_nm) >= self._torque_limit_nm:
+            self._torque_over_cycles += 1
+            if self._torque_over_cycles >= TORQUE_TRIP_CYCLES:
+                self._over_torque = True
+                self._torque_trips += 1
+                self._trip_openness = self._last_openness
+                log.warning(
+                    "[%s] torque %.3f Nm >= limit %.3f Nm for %d cycles — "
+                    "releasing in place (open the leader by %.0f%% to re-arm)",
+                    self._mode, self._torque_nm, self._torque_limit_nm,
+                    TORQUE_TRIP_CYCLES, TORQUE_REARM_OPENNESS * 100.0)
+        else:
+            self._torque_over_cycles = 0
 
     def _resolve_kp(self) -> float:
         """Follow gain: the explicit one, else the calibration's ``kp``."""

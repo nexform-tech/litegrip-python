@@ -22,7 +22,8 @@ from litegrip import (DEFAULT_DQ_MAX, FRAME_SIZE, GripperTeleop,
                       InProcTeleopTransport, TeleopBusyError, TeleopNotReady,
                       UdpTeleopTransport, decode_frame, encode_frame,
                       teleop_topic)
-from litegrip.teleop import (MAX_FRAME_GAP_S, clamp_to_calibrated, check_ready,
+from litegrip.teleop import (MAX_FRAME_GAP_S, TORQUE_REARM_OPENNESS,
+                             TORQUE_TRIP_CYCLES, clamp_to_calibrated, check_ready,
                              openness_to_rad, rad_to_openness, travel_mm)
 
 from fake_can import POS_CLOSED_RAD, POS_OPEN_RAD, RAD_TO_MM, make_gripper
@@ -311,6 +312,25 @@ class LiteGripTeleopApiTest(unittest.TestCase):
         self.assertFalse(stopped["active"])
         self.assertEqual(g.teleop_status(), {"active": False, "mode": None})
 
+    def test_start_passes_the_torque_limit_through(self):
+        g, _ = make_gripper()
+        transport = InProcTeleopTransport()
+        g.teleop_start("slave", transport=transport, align=False,
+                       torque_limit_nm=2.5)
+        try:
+            self.assertEqual(g._teleop._torque_limit_nm, 2.5)
+        finally:
+            g.teleop_stop()
+
+    def test_start_defaults_to_the_guard_disabled(self):
+        g, _ = make_gripper()
+        transport = InProcTeleopTransport()
+        g.teleop_start("slave", transport=transport, align=False)
+        try:
+            self.assertEqual(g._teleop._torque_limit_nm, 0.0)
+        finally:
+            g.teleop_stop()
+
     def test_rejects_unknown_mode(self):
         g, _ = make_gripper()
         with self.assertRaises(ValueError):
@@ -534,6 +554,120 @@ class SlaveGuardTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             GripperTeleop(g, InProcTeleopTransport(), "slave", TOPIC,
                           watchdog_s=0.0)
+
+
+class TorqueGuardTest(unittest.TestCase):
+    """The follower releases when its own torque stays over the limit.
+
+    Torque here is the follower's own reading — the status frame's ``tau``,
+    derived from coil current — never the leader's ``force_n`` on the wire.
+    Position is deliberately not consulted: a jam partway through the travel is
+    indistinguishable from slow motion.  The guard is opt-in (``0`` disables it),
+    so the loop tests elsewhere keep their full-stroke steps.
+    """
+
+    def _mgr(self, **kwargs):
+        g, _ = make_gripper()
+        return GripperTeleop(g, InProcTeleopTransport(), "slave", TOPIC,
+                             sleep_fn=_nop_sleep, **kwargs)
+
+    @staticmethod
+    def _torque(value: float):
+        return types.SimpleNamespace(torque_nm=value)
+
+    def test_trips_only_after_consecutive_over_limit_cycles(self):
+        mgr = self._mgr(torque_limit_nm=1.0)
+        for _ in range(TORQUE_TRIP_CYCLES - 1):
+            mgr._update_torque_guard(self._torque(1.5))
+        self.assertFalse(mgr.status()["over_torque"])
+        mgr._update_torque_guard(self._torque(1.5))
+        self.assertTrue(mgr.status()["over_torque"])
+        self.assertEqual(mgr.status()["torque_trips"], 1)
+
+    def test_a_sample_under_the_limit_resets_the_run(self):
+        mgr = self._mgr(torque_limit_nm=1.0)
+        for _ in range(TORQUE_TRIP_CYCLES - 1):
+            mgr._update_torque_guard(self._torque(1.5))
+        mgr._update_torque_guard(self._torque(0.1))
+        for _ in range(TORQUE_TRIP_CYCLES - 1):
+            mgr._update_torque_guard(self._torque(1.5))
+        self.assertFalse(mgr.status()["over_torque"])
+
+    def test_latches_until_the_leader_reopens(self):
+        mgr = self._mgr(torque_limit_nm=1.0)
+        mgr._last_openness = 0.1
+        for _ in range(TORQUE_TRIP_CYCLES):
+            mgr._update_torque_guard(self._torque(2.0))
+        self.assertTrue(mgr.status()["over_torque"])
+        # Releasing drops the torque to zero, but that alone must not re-arm —
+        # otherwise the guard would chatter.
+        mgr._update_torque_guard(self._torque(0.0))
+        self.assertTrue(mgr.status()["over_torque"])
+        mgr._last_openness = 0.1 + TORQUE_REARM_OPENNESS / 2.0
+        mgr._update_torque_guard(self._torque(0.0))
+        self.assertTrue(mgr.status()["over_torque"])
+        mgr._last_openness = 0.1 + TORQUE_REARM_OPENNESS
+        mgr._update_torque_guard(self._torque(0.0))
+        self.assertFalse(mgr.status()["over_torque"])
+
+    def test_reports_the_torque_it_saw(self):
+        mgr = self._mgr(torque_limit_nm=1.0)
+        mgr._update_torque_guard(self._torque(0.42))
+        self.assertAlmostEqual(mgr.status()["torque_nm"], 0.42, places=4)
+
+    def test_zero_limit_disables_the_guard(self):
+        mgr = self._mgr(torque_limit_nm=0.0)
+        for _ in range(TORQUE_TRIP_CYCLES * 3):
+            mgr._update_torque_guard(self._torque(9.0))
+        self.assertFalse(mgr.status()["over_torque"])
+        self.assertEqual(mgr.status()["torque_trips"], 0)
+
+    def test_rejects_a_negative_limit(self):
+        g, _ = make_gripper()
+        with self.assertRaises(ValueError):
+            GripperTeleop(g, InProcTeleopTransport(), "slave", TOPIC,
+                          torque_limit_nm=-0.1)
+
+    def test_slave_releases_in_place_and_keeps_streaming(self):
+        # A block partway through the travel, under a command to close: the
+        # follower presses it and its torque climbs past the limit.
+        block = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2.0
+        g, fake = make_gripper(start_rad=POS_OPEN_RAD, block_rad=block)
+        transport = _PreSubTransport()
+        mgr = GripperTeleop(g, transport, "slave", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep, align=False, watchdog_s=5.0,
+                            torque_limit_nm=1.0)
+        transport.pub(TOPIC, encode_frame(0.0, 0.0, 0.0, 0.0))
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: mgr.status()["over_torque"]))
+            tripped = len(fake.frames)
+            # Released in place: zero stiffness, zero damping.
+            self.assertTrue(_wait_until(
+                lambda: fake.frames and fake.frames[-1].kp == 0.0
+                and fake.frames[-1].kd == 0.0))
+            # Still streaming, so the motor does not latch comm loss.
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > tripped + 5))
+            self.assertEqual(fake.frames[-1].kp, 0.0)
+        finally:
+            mgr.stop()
+
+    def test_slave_releases_in_place_on_the_handoff(self):
+        block = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2.0
+        g, fake = make_gripper(start_rad=POS_OPEN_RAD, block_rad=block)
+        transport = _PreSubTransport()
+        mgr = GripperTeleop(g, transport, "slave", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep, align=False, watchdog_s=5.0,
+                            torque_limit_nm=1.0)
+        transport.pub(TOPIC, encode_frame(0.0, 0.0, 0.0, 0.0))
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: mgr.status()["over_torque"]))
+        finally:
+            mgr.stop()
+        # The final frame must not re-apply the gains and press again.
+        self.assertEqual(fake.frames[-1].kp, 0.0)
+        self.assertEqual(fake.frames[-1].kd, 0.0)
 
 
 class VelocityFeedforwardTest(unittest.TestCase):

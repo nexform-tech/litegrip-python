@@ -42,7 +42,8 @@ from .actions import (
     MoveProgress,
     MoveResult,
 )
-from .teleop import DEFAULT_DQ_MAX, DEFAULT_GRIP_ID, DEFAULT_GRIP_PORT
+from .teleop import (DEFAULT_DQ_MAX, DEFAULT_GRIP_ID, DEFAULT_GRIP_PORT,
+                     DEFAULT_TORQUE_LIMIT_NM)
 
 
 def _zenoh_transport(role: str, key: str, port: int,
@@ -1831,6 +1832,7 @@ class LiteGrip:
         align: bool = True,
         watchdog_s: float = 0.2,
         dq_max: float = DEFAULT_DQ_MAX,
+        torque_limit_nm: float = DEFAULT_TORQUE_LIMIT_NM,
         rate_hz: float = 50.0,
     ) -> dict:
         """Start leader/follower teleoperation on this gripper.
@@ -1863,6 +1865,9 @@ class LiteGrip:
                 fresh frame.
             dq_max: Slave only — ceiling in rad/s on the leader velocity fed
                 forward to the follower.  ``0`` disables the feedforward.
+            torque_limit_nm: Slave only — ceiling in Nm on the follower's own
+                torque; held over it the follower releases in place.  ``0``
+                disables the guard.  See :class:`~litegrip.GripperTeleop`.
             rate_hz: Loop rate.
 
         Returns:
@@ -1872,6 +1877,7 @@ class LiteGrip:
             TeleopNotReady: uncalibrated, zero travel, or ``rad_to_mm == 0``.
             TeleopBusyError: teleoperation is already running.
             NotInitializedError: not connected or not enabled.
+            ValueError: ``torque_limit_nm`` is negative.
         """
         from .teleop import (GripperTeleop, TeleopBusyError, check_ready,
                              teleop_topic)
@@ -1924,7 +1930,8 @@ class LiteGrip:
             manager = GripperTeleop(
                 self, transport, mode, key,
                 rate_hz=rate_hz, kp=kp, kd=kd, align=align,
-                watchdog_s=watchdog_s, dq_max=dq_max)
+                watchdog_s=watchdog_s, dq_max=dq_max,
+                torque_limit_nm=torque_limit_nm)
             manager.start()
         except BaseException:
             self._release_session("teleop")
