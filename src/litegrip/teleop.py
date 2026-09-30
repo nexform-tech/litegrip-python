@@ -115,7 +115,10 @@ TORQUE_TRIP_CYCLES = 3
 
 #: Opening the leader must recover, in normalised openness, before a tripped
 #: follower re-arms.  Without it the release would re-engage on the next cycle
-#: and press again — the guard would chatter instead of letting go.
+#: and press again — the guard would chatter instead of letting go.  A trip
+#: within this distance of the open stop has no travel left to reopen into, so
+#: there the requirement is the open stop itself; see
+#: :meth:`GripperTeleop._update_torque_guard`.
 TORQUE_REARM_OPENNESS = 0.05
 
 
@@ -918,17 +921,26 @@ class GripperTeleop:
         The follower re-arms only once the leader has reopened by
         :data:`TORQUE_REARM_OPENNESS`, i.e. once the operator has backed off.
 
+        That target is capped at the open stop.  A trip within the margin of
+        full open has no travel left to reopen into, and an uncapped target
+        there is unreachable: the guard stayed off for the rest of the session
+        while its own log line asked for a movement the stroke does not allow.
+        Capped, such a trip re-arms when the leader reaches the open stop —
+        the most back-off that exists at that end.
+
         ``torque_limit_nm == 0`` disables the guard entirely.
         """
         self._torque_nm = float(getattr(state, "torque_nm", 0.0) or 0.0)
         if self._torque_limit_nm <= 0.0:
             return
         if self._over_torque:
-            if (self._last_openness - self._trip_openness) >= TORQUE_REARM_OPENNESS:
+            reopen_needed = min(self._trip_openness + TORQUE_REARM_OPENNESS, 1.0)
+            if self._last_openness >= reopen_needed:
                 self._over_torque = False
                 self._torque_over_cycles = 0
-                log.info("[%s] torque guard re-armed (leader reopened to %.3f)",
-                         self._mode, self._last_openness)
+                log.info("[%s] torque guard re-armed (leader reopened to %.3f; "
+                         "needed %.3f)", self._mode, self._last_openness,
+                         reopen_needed)
             return
         if abs(self._torque_nm) >= self._torque_limit_nm:
             self._torque_over_cycles += 1
@@ -938,9 +950,10 @@ class GripperTeleop:
                 self._trip_openness = self._last_openness
                 log.warning(
                     "[%s] torque %.3f Nm >= limit %.3f Nm for %d cycles — "
-                    "releasing in place (open the leader by %.0f%% to re-arm)",
+                    "releasing in place (reopen the leader to %.2f to re-arm)",
                     self._mode, self._torque_nm, self._torque_limit_nm,
-                    TORQUE_TRIP_CYCLES, TORQUE_REARM_OPENNESS * 100.0)
+                    TORQUE_TRIP_CYCLES,
+                    min(self._last_openness + TORQUE_REARM_OPENNESS, 1.0))
         else:
             self._torque_over_cycles = 0
 

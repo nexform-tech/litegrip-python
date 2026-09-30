@@ -199,7 +199,9 @@ the jaws without opening a second CAN reader.
   `TORQUE_TRIP_CYCLES` (3, i.e. 60 ms at 50 Hz) it goes to zero stiffness and damping **in place**
   — the jaws stop pushing without the loop stopping, and keep streaming so the motor does not latch
   a comm-loss fault. It re-arms only once the leader has reopened by `TORQUE_REARM_OPENNESS` (0.05),
-  so it lets go instead of chattering against the same obstruction. The default is `0` — the guard
+  so it lets go instead of chattering against the same obstruction. A trip within 0.05 of full open
+  has no travel left to reopen into, so there the target is the open stop itself; without that cap
+  such a trip latched the guard off for the rest of the session. The default is `0` — the guard
   is **off** unless you ask for it. Pick the value per machine: it depends on how fragile the part
   between the jaws is, and because the follow gain is in Nm/rad (`kp` is `100.0` by default) a low
   limit corresponds to a very small position error — watch `torque_nm` under a real press before

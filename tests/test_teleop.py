@@ -610,6 +610,44 @@ class TorqueGuardTest(unittest.TestCase):
         mgr._update_torque_guard(self._torque(0.0))
         self.assertFalse(mgr.status()["over_torque"])
 
+    def test_a_trip_near_full_open_re_arms_at_the_open_stop(self):
+        # A trip above ``1 - TORQUE_REARM_OPENNESS`` has no travel left to
+        # reopen into, so the uncapped target (trip + margin) is unreachable
+        # and the guard latched off for the rest of the session — while its own
+        # log line asked for a movement the stroke does not allow.  There the
+        # open stop is the target: the most back-off that end has.
+        mgr = self._mgr(torque_limit_nm=1.0)
+        mgr._last_openness = 0.97
+        for _ in range(TORQUE_TRIP_CYCLES):
+            mgr._update_torque_guard(self._torque(2.0))
+        self.assertTrue(mgr.status()["over_torque"])
+        # Releasing drops the torque to zero, but that alone must not re-arm.
+        mgr._update_torque_guard(self._torque(0.0))
+        self.assertTrue(mgr.status()["over_torque"])
+        # 0.97 + 0.05 = 1.02 is past the end of the stroke; anything short of
+        # the open stop is still latched.
+        mgr._last_openness = 0.99
+        mgr._update_torque_guard(self._torque(0.0))
+        self.assertTrue(mgr.status()["over_torque"])
+        mgr._last_openness = 1.0
+        mgr._update_torque_guard(self._torque(0.0))
+        self.assertFalse(mgr.status()["over_torque"])
+
+    def test_a_trip_mid_travel_still_needs_the_full_margin(self):
+        # The cap only bites near the open stop: a jam partway through the
+        # travel still waits for the margin, so backing off barely does not
+        # re-engage into the same obstruction.
+        mgr = self._mgr(torque_limit_nm=1.0)
+        mgr._last_openness = 0.50
+        for _ in range(TORQUE_TRIP_CYCLES):
+            mgr._update_torque_guard(self._torque(2.0))
+        mgr._last_openness = 0.50 + TORQUE_REARM_OPENNESS / 2.0
+        mgr._update_torque_guard(self._torque(0.0))
+        self.assertTrue(mgr.status()["over_torque"])
+        mgr._last_openness = 0.50 + TORQUE_REARM_OPENNESS
+        mgr._update_torque_guard(self._torque(0.0))
+        self.assertFalse(mgr.status()["over_torque"])
+
     def test_reports_the_torque_it_saw(self):
         mgr = self._mgr(torque_limit_nm=1.0)
         mgr._update_torque_guard(self._torque(0.42))
