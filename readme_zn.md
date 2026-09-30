@@ -105,12 +105,19 @@ with LiteGrip("can1", mount="reverse") as gripper:
 它按循环频率把「张开程度」发出去；**从夹爪**（follower）收到后驱动自己的爪子跟到位。线上传的
 是归一化到 `[0, 1]` 的张开度，不是角度，所以两端不需要相同的标定、装法或零点。
 
+主端并不是一上来就卸力：它先**带着增益顶着**自己的爪子，并从第一拍就照常发布张开度，直到从端
+报告「已就位」。这样操作者就无法在一个还在移动的从端下面把目标推走。
+
 ### 传输
 
 链路是**点对点 zenoh** —— 与真机上跑的遥操同一套结构。两端都是 `mode="peer"`，**关掉全部
 发现机制**（无多播、无 gossip），所以两端只能靠显式端点互相找到：主端监听一个 TCP 端口，从端
 连到主端的地址。话题是共用的 litearm 命名空间 `litearm/v4/{grip_id}/gripper_teleop`，帧格式
 与 litearm 那套逐字节相同 ⇒ 两边可以互通。
+
+就绪握手走同一个会话上的**第二个兄弟话题** —— `litearm/v4/{grip_id}/gripper_ready`，只带一个
+字节 —— 于是遥操帧仍与 litearm 那套逐字节相同。发布方是从端，订阅方是主端：主端本来就监听，
+所以反向通道不需要新端口。
 
 zenoh 是**可选依赖**，基础 SDK 仍是「标准库 + SocketCAN」：
 
@@ -148,11 +155,15 @@ python3 examples/teleop.py --mode master --channel can0
 python3 examples/teleop.py --mode slave  --channel can0 --host 192.168.1.20
 ```
 
+脚本走同一套握手：主端带增益保持到从端报到为止，`--ready-timeout` 给这段等待封顶（`0` 表示
+一直等），`--no-require-ready` 退回「立即交还手控」。
+
 两端必须共用 `grip_id`（默认 `gripA`），且都已连接、已使能。遥操是互斥的：后台循环独占 CAN
 读写，在 `teleop_stop()` 之前不要再从调用方驱动夹爪。`teleop_start` 返回初始的
 `teleop_status()`；`teleop_status()` 报告 `active`、`mode`、`topic`、`frames`、
 `last_frame_age_ms`、`stale`、`openness`、`position_mm`、`force_n`、`dq_cmd`、`loop_hz`、
-`rejected`、`send_failed`、`fault`、`torque_nm`、`over_torque`、`torque_trips`，主端另有
+`rejected`、`send_failed`、`fault`、`torque_nm`、`over_torque`、`torque_trips`、`ready`、
+`ready_rx`、`ready_pubs`、`ready_timed_out`，主端另有
 `matching`。`position_mm` 与 `force_n` 是主端自己的状态，或从端刚刚跟随的那一帧里主端的值 ——
 调用方不必再开一路 CAN 读就能显示夹爪。
 
@@ -177,6 +188,14 @@ python3 examples/teleop.py --mode slave --channel can0 --fake-leader --torque-li
   保护是 `torque_limit_nm`。`lead_cap_mm=0` 关闭对齐的封顶；`align_speed_mm_s` 必须 > 0。
   命令行对应 `--align-speed` 与 `--lead-cap`。对齐现在也走循环自己的发帧路径，所以
   `torque_limit_nm` 覆盖得到它 —— 对齐途中卡住会就地卸载，而不是一直顶到动作结束。
+- **主端带增益顶着爪子，直到从端报告就绪。** 从端对齐上首帧、且不再 `stale`、未跳闸、并且与
+  该帧目标相距不超过 `ready_tolerance_mm`（默认 `2.0`）之后，会在
+  `litearm/v4/{grip_id}/gripper_ready` 上宣布自己就绪；主端直到这时才卸力进入零重力。它**全程
+  照常发布张开度** —— 那些帧正是从端对齐的对象，不发就会把握手卡死 —— 被门控的只是「交还
+  手控」这一步。`require_ready=False` 退回「立即卸力」，`ready_timeout_s`（默认 `10.0`；`0`
+  表示一直等）给等待封顶，这样从不宣告就绪的旧版从端不会把主端卡住：超时后主端告警并照样卸力。
+  传输无法订阅的主端会关掉这道门、和以前一样立刻卸力，明文 UDP 没有反向通路，门在那里等于
+  失效。`teleop_status()` 里的 `ready`、`ready_rx`、`ready_pubs`、`ready_timed_out` 报告状态。
 - **从端把主端的速度前馈下去。** 线上帧只带 openness，所以从端用相邻两帧的差分还原出速度，作为
   电机的 `dq` 目标下发 —— 机械臂遥操是直接发 `dq` 的。没有这一项，从端只能靠位置误差出力，会
   明显拖在运动中的主端后面（滞后量 ≈ 速度 / `kp`）。因为 `kd * dq` 是实打实的力矩项，这个估计

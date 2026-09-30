@@ -118,6 +118,10 @@ you push its jaws by hand — and it publishes how far open it is at the loop ra
 normalized opening in `[0, 1]`, not an angle, so the two ends do not need the same calibration,
 mount, or zero point.
 
+The leader does not go slack the instant it starts: it first holds its jaws **under gain**, and
+publishes the opening from its very first cycle, until the follower reports it has arrived. That
+way the operator cannot push the target out from under a follower that is still travelling.
+
 ### Transport
 
 The link is a **point-to-point zenoh** session — the same structure the field teleoperation runs
@@ -126,6 +130,11 @@ way they find each other is an explicit endpoint: the leader listens on a TCP po
 connects to the leader's address. The topic is the shared litearm namespace,
 `litearm/v4/{grip_id}/gripper_teleop`, and the frame is byte-identical to the litearm stack's, so
 the two interoperate.
+
+The readiness handshake rides a second, sibling topic on the same session —
+`litearm/v4/{grip_id}/gripper_ready`, carrying a single byte — so the teleop frame stays
+byte-identical to the litearm stack's. It is the follower that publishes there and the leader that
+subscribes: the leader's endpoint listens, so the reverse direction needs no new port.
 
 zenoh is an optional dependency — the base SDK stays stdlib + SocketCAN:
 
@@ -174,12 +183,17 @@ closes freely and the guard has nothing to demonstrate.
 python3 examples/teleop.py --mode slave --channel can0 --fake-leader --torque-limit 1.0
 ```
 
+The script follows the same handshake: the leader holds under gain until the follower announces
+itself, `--ready-timeout` bounds that wait (`0` waits indefinitely), and `--no-require-ready`
+restores the immediate hand-back.
+
 Both ends must share `grip_id` (default `gripA`) and be connected and enabled first. Teleop is
 exclusive: the background loop owns the CAN I/O, so do not drive the gripper from the caller until
 `teleop_stop()`. `teleop_start` returns the initial `teleop_status()` snapshot; `teleop_status()`
 reports `active`, `mode`, `topic`, `frames`, `last_frame_age_ms`, `stale`, `openness`,
 `position_mm`, `force_n`, `dq_cmd`, `loop_hz`, `rejected`, `send_failed`, `fault`, `torque_nm`,
-`over_torque`, `torque_trips`, and (master) `matching`. `position_mm` and `force_n` are the
+`over_torque`, `torque_trips`, `ready`, `ready_rx`, `ready_pubs`, `ready_timed_out`, and (master)
+`matching`. `position_mm` and `force_n` are the
 master's own state, or the leader's values from the frame the slave followed — a caller can show
 the jaws without opening a second CAN reader.
 
@@ -200,6 +214,17 @@ the jaws without opening a second CAN reader.
   `align_speed_mm_s` must be > 0. On the command line these are `--align-speed` and `--lead-cap`.
   The align also now runs through the loop's own send path, so `torque_limit_nm` covers it — a jam
   during the align releases in place instead of pressing until the move ends.
+- **The leader holds its jaws under gain until the follower reports ready.** The follower announces
+  itself on `litearm/v4/{grip_id}/gripper_ready` once it has aligned to a frame and is no longer
+  stale, not tripped, and within `ready_tolerance_mm` (default `2.0`) of the frame's target; the
+  leader only then relaxes into zero-gravity. It **keeps publishing the opening the whole time** —
+  the frames are what the follower aligns to, so withholding them would deadlock the handshake —
+  only the hand-back is gated. `require_ready=False` restores the immediate relax, and
+  `ready_timeout_s` (default `10.0`; `0` waits indefinitely) bounds the wait so an older follower
+  that never announces cannot stall the leader: on timeout it warns and relaxes anyway. A leader
+  whose transport cannot subscribe disables the gate and goes slack as before, and plain UDP has no
+  reverse path, so the gate is inert there. `ready`, `ready_rx`, `ready_pubs`, and
+  `ready_timed_out` in `teleop_status()` report the state.
 - **The follower feeds the leader's velocity forward.** The wire frame carries only the opening, so
   the follower recovers a velocity by differencing successive frames and sends it as the motor's
   `dq` target — the arm teleoperation sends `dq` outright. Without it the follower biases on

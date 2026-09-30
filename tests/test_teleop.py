@@ -19,9 +19,12 @@ import unittest.mock
 
 import _sdkpath  # noqa: F401
 from litegrip import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX,
-                      DEFAULT_LEAD_CAP_MM, FRAME_SIZE, GripperTeleop,
-                      InProcTeleopTransport, TeleopBusyError, TeleopNotReady,
-                      UdpTeleopTransport, decode_frame, encode_frame,
+                      DEFAULT_LEAD_CAP_MM, DEFAULT_READY_TOLERANCE_MM,
+                      FRAME_SIZE, READY_FRAME_SIZE, GripperTeleop,
+                      InProcTeleopTransport, TeleopBusyError, TeleopError,
+                      TeleopNotReady, UdpTeleopTransport, decode_frame,
+                      decode_ready_frame, encode_frame, encode_ready_frame,
+                      ready_topic,
                       teleop_topic)
 from litegrip.teleop import (MAX_FRAME_GAP_S, TORQUE_REARM_OPENNESS,
                              TORQUE_TRIP_CYCLES, clamp_to_calibrated, check_ready,
@@ -30,6 +33,7 @@ from litegrip.teleop import (MAX_FRAME_GAP_S, TORQUE_REARM_OPENNESS,
 from fake_can import POS_CLOSED_RAD, POS_OPEN_RAD, RAD_TO_MM, make_gripper
 
 TOPIC = teleop_topic("gripA")
+READY = ready_topic("gripA")
 
 # Far longer than the stub-sleep loop needs; a timeout here means the loop is
 # not running at all, not that the machine is slow.
@@ -77,6 +81,30 @@ class FrameCodecTest(unittest.TestCase):
     def test_decode_rejects_wrong_size(self):
         with self.assertRaises(ValueError):
             decode_frame(b"\x00" * (FRAME_SIZE - 1))
+
+    def test_ready_topic_is_a_sibling_of_the_teleop_topic(self):
+        self.assertEqual(READY, "litearm/v4/gripA/gripper_ready")
+        self.assertEqual(ready_topic(), "litearm/v4/gripA/gripper_ready")
+        self.assertNotEqual(ready_topic(), teleop_topic())
+
+    def test_ready_frame_is_one_byte(self):
+        self.assertEqual(READY_FRAME_SIZE, 1)
+        self.assertEqual(len(encode_ready_frame(False)), READY_FRAME_SIZE)
+
+    def test_ready_roundtrip(self):
+        self.assertIs(decode_ready_frame(encode_ready_frame(True)), True)
+        self.assertIs(decode_ready_frame(encode_ready_frame(False)), False)
+
+    def test_a_nonzero_byte_reads_as_ready(self):
+        # A stray value must not look like "not ready" — the leader would hold
+        # for a signal that did arrive.
+        self.assertTrue(decode_ready_frame(b"\x02"))
+
+    def test_ready_decode_rejects_wrong_size(self):
+        with self.assertRaises(ValueError):
+            decode_ready_frame(b"")
+        with self.assertRaises(ValueError):
+            decode_ready_frame(b"\x01\x00")
 
 
 class ConversionTest(unittest.TestCase):
@@ -155,6 +183,17 @@ class UdpTransportTest(unittest.TestCase):
     def test_requires_an_address(self):
         with self.assertRaises(ValueError):
             UdpTeleopTransport()
+
+    def test_pub_only_cannot_subscribe(self):
+        # Such a transport holds a socket, but it was never bound and is still
+        # in blocking mode: a recv on it would block the caller forever rather
+        # than report "nothing yet", so subscribing must be refused.
+        sender = UdpTeleopTransport(pub_addr=("127.0.0.1", 1))
+        try:
+            with self.assertRaises(TeleopError):
+                sender.sub(TOPIC)
+        finally:
+            sender.close()
 
 
 class MasterLoopTest(unittest.TestCase):
@@ -340,6 +379,37 @@ class LiteGripTeleopApiTest(unittest.TestCase):
         finally:
             g.teleop_stop()
 
+    def test_start_wires_the_ready_topic(self):
+        g, _ = make_gripper()
+        transport = InProcTeleopTransport()
+        g.teleop_start("slave", transport=transport, align=False)
+        try:
+            self.assertEqual(g._teleop._ready_topic, READY)
+            self.assertTrue(g._teleop._require_ready)
+            self.assertEqual(g._teleop._ready_tolerance_mm,
+                             DEFAULT_READY_TOLERANCE_MM)
+        finally:
+            g.teleop_stop()
+
+    def test_start_can_opt_out_of_the_gate(self):
+        g, _ = make_gripper()
+        transport = InProcTeleopTransport()
+        g.teleop_start("master", transport=transport, require_ready=False,
+                       ready_timeout_s=0.0)
+        try:
+            self.assertFalse(g._teleop._require_ready)
+            self.assertEqual(g._teleop._ready_timeout_s, 0.0)
+        finally:
+            g.teleop_stop()
+
+    def test_start_rejects_a_negative_ready_timeout(self):
+        g, _ = make_gripper()
+        with self.assertRaises(ValueError):
+            g.teleop_start("master", transport=InProcTeleopTransport(),
+                           ready_timeout_s=-1.0)
+        # The claimed session must be released again, or every later start fails.
+        self.assertEqual(g.teleop_status(), {"active": False, "mode": None})
+
     def test_rejects_unknown_mode(self):
         g, _ = make_gripper()
         with self.assertRaises(ValueError):
@@ -402,20 +472,22 @@ class LiteGripTeleopApiTest(unittest.TestCase):
             def close(self):
                 self.closed = True
 
-        def _factory(role, key, port, host):
+        def _factory(role, key, port, host, ready_key=None):
             built.append(_FakeLink())
             return built[-1]
 
         with unittest.mock.patch.object(gripper_mod, "_zenoh_transport",
                                         _factory):
             g.teleop_start("master", rate_hz=200.0)
-            g.teleop_stop()
             resident = g._teleop_pub
             self.assertIsInstance(resident, _FakeLink)
+            # Wait while the session runs: an immediate stop can land before the
+            # loop's first cycle, which would test nothing.
+            self.assertTrue(_wait_until(lambda: resident.puts > 0))
+            g.teleop_stop()
             self.assertFalse(
                 resident.closed,
                 "teleop_stop must not close the resident publisher")
-            self.assertTrue(_wait_until(lambda: resident.puts > 0))
 
             g.teleop_start("master", rate_hz=200.0)
             self.assertIs(g._teleop_pub, resident)
@@ -563,6 +635,200 @@ class SlaveGuardTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             GripperTeleop(g, InProcTeleopTransport(), "slave", TOPIC,
                           watchdog_s=0.0)
+
+
+class ReadinessHandshakeTest(unittest.TestCase):
+    """The follower -> leader readiness channel.
+
+    The follower announces ready once it has arrived; the leader holds its own
+    jaws under gain — *not* hand-movable — until it hears that, so the operator
+    cannot drag the target out from under a follower that is still travelling.
+    Frames flow from the first cycle either way: the gate withholds the
+    hand-back, never the frames.
+    """
+
+    @staticmethod
+    def _newest_ready(sub) -> bool:
+        payload = sub.drain_latest()
+        return payload is not None and decode_ready_frame(payload)
+
+    def _slave(self, **kwargs):
+        """A follower with the ready channel wired and observed."""
+        g, fake = make_gripper(start_rad=POS_CLOSED_RAD, reverse=False)
+        transport = _PreSubTransport()
+        ready_sub = transport.sub(READY)     # before start, so nothing is missed
+        mgr = GripperTeleop(g, transport, "slave", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep, ready_topic=READY, **kwargs)
+        return g, fake, transport, ready_sub, mgr
+
+    def _master(self, **kwargs):
+        """A leader with the ready channel wired; its jaw is frozen in place."""
+        g, fake = make_gripper(start_rad=POS_OPEN_RAD)
+        # A real slack jaw does not move under zero gain; the fake one is purely
+        # kinematic, so freeze it or the relax step would drag it closed.
+        fake.motor.step = lambda *a, **k: None
+        transport = InProcTeleopTransport()
+        mgr = GripperTeleop(g, transport, "master", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep, ready_topic=READY, **kwargs)
+        return g, fake, transport, mgr
+
+    # ── follower ──────────────────────────────────────────────────────
+
+    def test_slave_announces_ready_once_it_has_arrived(self):
+        g, fake, transport, ready_sub, mgr = self._slave(
+            align=False, watchdog_s=5.0)
+        transport.pub(TOPIC, encode_frame(0.5, 60.0, 0.0, 0.0))
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: self._newest_ready(ready_sub)))
+            self.assertTrue(mgr.status()["ready"])
+        finally:
+            mgr.stop()
+
+    def test_slave_announces_ready_only_when_it_is_at_the_target(self):
+        # A frozen jaw takes no steps, so it never reaches the commanded
+        # opening: "it got a frame" must not be enough to announce ready.
+        g, fake = make_gripper(start_rad=POS_CLOSED_RAD, reverse=False)
+        fake.motor.step = lambda *a, **k: None
+        transport = _PreSubTransport()
+        ready_sub = transport.sub(READY)
+        mgr = GripperTeleop(g, transport, "slave", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep, ready_topic=READY,
+                            align=False, watchdog_s=5.0)
+        transport.pub(TOPIC, encode_frame(1.0, 120.0, 0.0, 0.0))
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 5))
+            self.assertFalse(self._newest_ready(ready_sub))
+            self.assertFalse(mgr.status()["ready"])
+        finally:
+            mgr.stop()
+
+    def test_slave_withdraws_ready_when_the_leader_goes_quiet(self):
+        g, fake, transport, ready_sub, mgr = self._slave(
+            align=False, watchdog_s=0.05)
+        transport.pub(TOPIC, encode_frame(0.5, 60.0, 0.0, 0.0))
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: self._newest_ready(ready_sub)))
+            self.assertTrue(_wait_until(lambda: mgr.status()["stale"]))
+            self.assertTrue(_wait_until(
+                lambda: not self._newest_ready(ready_sub)))
+        finally:
+            mgr.stop()
+
+    def test_slave_announces_not_ready_on_stop(self):
+        g, fake, transport, ready_sub, mgr = self._slave(
+            align=False, watchdog_s=5.0)
+        transport.pub(TOPIC, encode_frame(0.5, 60.0, 0.0, 0.0))
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: self._newest_ready(ready_sub)))
+        finally:
+            mgr.stop()
+        # A leader still up between sessions must not read the last "ready" as
+        # this session's.
+        self.assertFalse(self._newest_ready(ready_sub))
+
+    def test_slave_without_a_ready_topic_stays_off_the_channel(self):
+        g, fake, transport, mgr = SlaveLoopTest()._slave(
+            align=False, watchdog_s=5.0)
+        ready_sub = transport.sub(READY)
+        transport.pub(TOPIC, encode_frame(0.5, 60.0, 0.0, 0.0))
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 5))
+            self.assertIsNone(ready_sub.drain_latest())
+        finally:
+            mgr.stop()
+
+    # ── leader ────────────────────────────────────────────────────────
+
+    def test_master_holds_under_gain_until_ready_then_relaxes(self):
+        g, fake, transport, mgr = self._master()
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 0))
+            # Holding: a real position command at the config gains — the jaws
+            # are not hand-movable yet.
+            self.assertEqual(fake.frames[-1].kp, g.config.kp)
+            self.assertFalse(mgr.status()["ready"])
+            transport.pub(READY, encode_ready_frame(True))
+            self.assertTrue(_wait_until(lambda: mgr.status()["ready"]))
+            self.assertTrue(_wait_until(
+                lambda: fake.frames[-1].kp == 0.0 and fake.frames[-1].kd == 0.0))
+        finally:
+            mgr.stop()
+
+    def test_master_still_publishes_frames_while_it_holds(self):
+        # The gate must never withhold the frames: they are what the follower
+        # aligns to, so blocking on them would deadlock the pair.
+        g, fake, transport, mgr = self._master()
+        sub = transport.sub(TOPIC)
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(
+                lambda: (sub.drain_latest() or b"") != b""))
+        finally:
+            mgr.stop()
+
+    def test_master_without_the_gate_relaxes_at_once(self):
+        g, fake, transport, mgr = self._master(require_ready=False)
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 0))
+            self.assertEqual((fake.frames[-1].kp, fake.frames[-1].kd), (0.0, 0.0))
+        finally:
+            mgr.stop()
+
+    def test_master_proceeds_after_the_ready_timeout(self):
+        # An older follower never announces.  The wait must be bounded, or a new
+        # leader would hold forever against a peer that cannot answer.
+        g, fake, transport, mgr = self._master(ready_timeout_s=0.02)
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: mgr.status()["ready_timed_out"]))
+            self.assertTrue(_wait_until(lambda: fake.frames[-1].kp == 0.0))
+            self.assertFalse(mgr.status()["ready"])   # never actually heard
+        finally:
+            mgr.stop()
+
+    def test_master_does_not_gate_without_a_subscribable_transport(self):
+        # A publish-only UDP master has no receive path at all: treating that as
+        # "not ready" would hold it under gain for the whole timeout.
+        g, fake = make_gripper(start_rad=POS_OPEN_RAD)
+        fake.motor.step = lambda *a, **k: None
+        transport = UdpTeleopTransport(pub_addr=("127.0.0.1", 1))
+        mgr = GripperTeleop(g, transport, "master", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep, ready_topic=READY)
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 0))
+            self.assertEqual(fake.frames[-1].kp, 0.0)
+            self.assertFalse(mgr.status()["ready_timed_out"])
+        finally:
+            mgr.stop()
+            transport.close()
+
+    # ── validation ────────────────────────────────────────────────────
+
+    def test_rejects_a_negative_ready_timeout(self):
+        g, _ = make_gripper()
+        with self.assertRaises(ValueError):
+            GripperTeleop(g, InProcTeleopTransport(), "master", TOPIC,
+                          ready_topic=READY, ready_timeout_s=-0.1)
+
+    def test_rejects_a_negative_tolerance(self):
+        g, _ = make_gripper()
+        with self.assertRaises(ValueError):
+            GripperTeleop(g, InProcTeleopTransport(), "slave", TOPIC,
+                          ready_topic=READY, ready_tolerance_mm=-0.1)
+
+    def test_rejects_a_non_positive_period(self):
+        g, _ = make_gripper()
+        with self.assertRaises(ValueError):
+            GripperTeleop(g, InProcTeleopTransport(), "slave", TOPIC,
+                          ready_topic=READY, ready_period_s=0.0)
 
 
 class TorqueGuardTest(unittest.TestCase):

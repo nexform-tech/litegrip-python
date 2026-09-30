@@ -44,11 +44,12 @@ from .actions import (
 )
 from .teleop import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX, DEFAULT_GRIP_ID,
                      DEFAULT_GRIP_PORT, DEFAULT_LEAD_CAP_MM,
-                     DEFAULT_TORQUE_LIMIT_NM)
+                     DEFAULT_READY_PERIOD_S, DEFAULT_READY_TIMEOUT_S,
+                     DEFAULT_READY_TOLERANCE_MM, DEFAULT_TORQUE_LIMIT_NM)
 
 
-def _zenoh_transport(role: str, key: str, port: int,
-                     host: Optional[str]) -> "TeleopTransport":
+def _zenoh_transport(role: str, key: str, port: int, host: Optional[str],
+                     ready_key: Optional[str] = None) -> "TeleopTransport":
     """Build a point-to-point zenoh transport, or explain how to get one.
 
     zenoh is an optional dependency, so a bare ``import`` failure is turned into
@@ -61,7 +62,8 @@ def _zenoh_transport(role: str, key: str, port: int,
         raise ImportError(
             "the zenoh teleoperation link needs the optional zenoh dependency — "
             "install it with `pip install litegrip[zenoh]`") from e
-    return ZenohTeleopTransport(role, key, port=port, host=host)
+    return ZenohTeleopTransport(role, key, port=port, host=host,
+                                ready_key=ready_key)
 
 
 # Path to built-in factory calibration (ships with the package, read-only fallback).
@@ -1836,13 +1838,18 @@ class LiteGrip:
         dq_max: float = DEFAULT_DQ_MAX,
         torque_limit_nm: float = DEFAULT_TORQUE_LIMIT_NM,
         lead_cap_mm: float = DEFAULT_LEAD_CAP_MM,
+        require_ready: bool = True,
+        ready_timeout_s: float = DEFAULT_READY_TIMEOUT_S,
+        ready_tolerance_mm: float = DEFAULT_READY_TOLERANCE_MM,
+        ready_period_s: float = DEFAULT_READY_PERIOD_S,
         rate_hz: float = 50.0,
     ) -> dict:
         """Start leader/follower teleoperation on this gripper.
 
-        ``mode="master"`` (leader) makes the motor slack — the jaws can be
-        pushed by hand — and publishes the opening.  ``mode="slave"``
-        (follower) receives the opening and follows it.
+        ``mode="master"`` (leader) publishes the opening and, once the follower
+        reports ready, makes the motor slack — the jaws can be pushed by hand.
+        ``mode="slave"`` (follower) receives the opening, follows it, and
+        announces when it has arrived.
 
         Both ends must agree on ``grip_id``.  Teleoperation is exclusive: the
         background loop owns the CAN I/O until :meth:`teleop_stop`, so do not
@@ -1876,6 +1883,16 @@ class LiteGrip:
             lead_cap_mm: Slave only — ceiling in mm on how far the *align*
                 command may lead the measured position, which bounds the align
                 torque.  The follow loop is not capped.  ``0`` disables the cap.
+            require_ready: Master only — hold the jaws under gain (not
+                hand-movable) until the follower announces it has arrived,
+                rather than going slack from the first cycle.
+            ready_timeout_s: Master only — seconds to wait for that
+                announcement before releasing the hand-back anyway with a
+                warning; ``0`` waits indefinitely.  A bounded default keeps an
+                older follower that never announces from stalling a new leader.
+            ready_tolerance_mm: Slave only — arrival tolerance for announcing
+                ready, in mm of travel.
+            ready_period_s: Slave only — how often to republish the ready state.
             rate_hz: Loop rate.
 
         Returns:
@@ -1885,11 +1902,13 @@ class LiteGrip:
             TeleopNotReady: uncalibrated, zero travel, or ``rad_to_mm == 0``.
             TeleopBusyError: teleoperation is already running.
             NotInitializedError: not connected or not enabled.
-            ValueError: ``torque_limit_nm`` or ``lead_cap_mm`` is negative, or
-                ``align_speed_mm_s`` is not positive.
+            ValueError: a negative ``torque_limit_nm`` / ``lead_cap_mm`` /
+                ``ready_timeout_s`` / ``ready_tolerance_mm``, a non-positive
+                ``ready_period_s``, or an ``align_speed_mm_s`` that is not
+                positive.
         """
         from .teleop import (GripperTeleop, TeleopBusyError, check_ready,
-                             teleop_topic)
+                             ready_topic, teleop_topic)
         from .teleop import UdpTeleopTransport
 
         self._check_connected()
@@ -1910,6 +1929,7 @@ class LiteGrip:
         # record and replay in turn.
         try:
             key = teleop_topic(grip_id)
+            ready_key = ready_topic(grip_id)
             created_transport = None
             if transport is None:
                 if link == "zenoh":
@@ -1919,15 +1939,21 @@ class LiteGrip:
                         #    已死的端点 ⇒ 此后每一轮都在往死会话里 put。（真机实测：
                         #    第一次配对正常，之后每次从端 0 帧。）常驻端点的生命周期
                         #    只归 `disconnect()` → `_close_teleop_pub()`。
-                        transport = self._open_teleop_pub(port, key)
+                        transport = self._open_teleop_pub(port, key, ready_key)
                     else:
-                        transport = _zenoh_transport("slave", key, port, host)
+                        transport = _zenoh_transport("slave", key, port, host,
+                                                     ready_key)
                         created_transport = transport
                 elif link == "udp":
                     if host is None:
                         raise ValueError("host is required for the udp link")
                     addr = f"{host}:{port}"
                     if mode == "master":
+                        # Publish-only: with no bind there is no receive path, so
+                        # the readiness gate disables itself (see
+                        # ``GripperTeleop._open_ready_sub``) and the leader goes
+                        # slack as it always did.  Carrying ready over UDP would
+                        # need a second port for the reverse direction.
                         transport = UdpTeleopTransport(pub_addr=addr)
                     else:
                         transport = UdpTeleopTransport(bind_addr=addr)
@@ -1941,7 +1967,11 @@ class LiteGrip:
                 rate_hz=rate_hz, kp=kp, kd=kd, align=align,
                 align_speed_mm_s=align_speed_mm_s,
                 watchdog_s=watchdog_s, dq_max=dq_max,
-                torque_limit_nm=torque_limit_nm, lead_cap_mm=lead_cap_mm)
+                torque_limit_nm=torque_limit_nm, lead_cap_mm=lead_cap_mm,
+                ready_topic=ready_key, require_ready=require_ready,
+                ready_timeout_s=ready_timeout_s,
+                ready_tolerance_mm=ready_tolerance_mm,
+                ready_period_s=ready_period_s)
             manager.start()
         except BaseException:
             self._release_session("teleop")
@@ -1950,16 +1980,20 @@ class LiteGrip:
         self._teleop_transport = created_transport
         return manager.status()
 
-    def _open_teleop_pub(self, port: int, key: str) -> "TeleopTransport":
+    def _open_teleop_pub(self, port: int, key: str,
+                         ready_key: Optional[str] = None) -> "TeleopTransport":
         """Return the leader's resident publisher, building it on first use.
 
         ⚠ **Resident, not per session.**  Rebuilding the zenoh listener on every
         session leaves the port bound and makes publisher↔subscriber matching
         fail intermittently; keeping one for the life of the gripper removes
-        both.
+        both.  The consequence is that the zenoh keys are fixed by the first
+        session — a later session with a different ``grip_id`` would mismatch
+        them, which the transport reports rather than silently ignoring.
         """
         if self._teleop_pub is None:
-            self._teleop_pub = _zenoh_transport("master", key, port, None)
+            self._teleop_pub = _zenoh_transport("master", key, port, None,
+                                                ready_key)
         return self._teleop_pub
 
     def _close_teleop_pub(self) -> None:
