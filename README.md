@@ -146,7 +146,7 @@ with LiteGrip("can0") as master:
     master.enable()
     master.teleop_start("master")                      # zenoh, gripA, port 17448
 
-# Follower: connect to the leader, align to the first frame, then follow.
+# Follower: connect to the leader, ramp to the first frame, then follow.
 with LiteGrip("can0") as slave:
     slave.load_calibration()
     slave.enable()
@@ -183,6 +183,21 @@ reports `active`, `mode`, `topic`, `frames`, `last_frame_age_ms`, `stale`, `open
 master's own state, or the leader's values from the frame the slave followed — a caller can show
 the jaws without opening a second CAN reader.
 
+- **The align move is a bounded-speed ramp, and no command ever leads the measurement by more than
+  `lead_cap_mm`.** The align used to be a single `goto_rad(..., duration=1.0)`. The `duration` reads
+  like a ramp, but the CAN layer sends `q = q_target` from the very first frame and merely holds it
+  until the deadline, so that first frame demanded `kp` times the whole error — at the shipped `kp`
+  of `100.0` Nm/rad any error past ~0.1 rad saturates the DM4310, which is how a follower drove into
+  its closed hard stop hard enough to break the printed limit. The align is now a constant-speed
+  schedule at `align_speed_mm_s` (default `50` mm/s of jaw travel) with that same speed fed forward
+  as `dq`, and both it and every follow cycle pass through a lead cap: the commanded position may
+  lead the measured one by at most `lead_cap_mm` (default `4` mm). Torque is
+  `kp * (q_cmd - q_measured)`, so that bounds the commanded torque by construction — about 5.4 Nm
+  out of the box. Capping does not make the move slower for free: the follower still travels, it
+  just presses with a bounded torque while it catches up. `lead_cap_mm=0` disables the cap;
+  `align_speed_mm_s` must be > 0. On the command line these are `--align-speed` and `--lead-cap`.
+  The align also now runs through the loop's own send path, so `torque_limit_nm` covers it — a jam
+  during the align releases in place instead of pressing until the move ends.
 - **The follower feeds the leader's velocity forward.** The wire frame carries only the opening, so
   the follower recovers a velocity by differencing successive frames and sends it as the motor's
   `dq` target — the arm teleoperation sends `dq` outright. Without it the follower biases on

@@ -42,7 +42,8 @@ from .actions import (
     MoveProgress,
     MoveResult,
 )
-from .teleop import (DEFAULT_DQ_MAX, DEFAULT_GRIP_ID, DEFAULT_GRIP_PORT,
+from .teleop import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX, DEFAULT_GRIP_ID,
+                     DEFAULT_GRIP_PORT, DEFAULT_LEAD_CAP_MM,
                      DEFAULT_TORQUE_LIMIT_NM)
 
 
@@ -1830,9 +1831,11 @@ class LiteGrip:
         kp: Optional[float] = None,
         kd: Optional[float] = None,
         align: bool = True,
+        align_speed_mm_s: float = DEFAULT_ALIGN_SPEED_MM_S,
         watchdog_s: float = 0.2,
         dq_max: float = DEFAULT_DQ_MAX,
         torque_limit_nm: float = DEFAULT_TORQUE_LIMIT_NM,
+        lead_cap_mm: float = DEFAULT_LEAD_CAP_MM,
         rate_hz: float = 50.0,
     ) -> dict:
         """Start leader/follower teleoperation on this gripper.
@@ -1861,6 +1864,8 @@ class LiteGrip:
             kp, kd: Follow gains (slave).  ``None`` uses the calibration's own.
             align: Slave only — align to the first received frame before
                 following.
+            align_speed_mm_s: Slave only — speed of that align move, in mm/s of
+                jaw travel.  Must be > 0.
             watchdog_s: Slave only — hold position after this long without a
                 fresh frame.
             dq_max: Slave only — ceiling in rad/s on the leader velocity fed
@@ -1868,6 +1873,9 @@ class LiteGrip:
             torque_limit_nm: Slave only — ceiling in Nm on the follower's own
                 torque; held over it the follower releases in place.  ``0``
                 disables the guard.  See :class:`~litegrip.GripperTeleop`.
+            lead_cap_mm: Slave only — ceiling in mm on how far the follower's
+                commanded position may lead its measured one, which bounds the
+                commanded torque.  ``0`` disables the cap.
             rate_hz: Loop rate.
 
         Returns:
@@ -1877,7 +1885,8 @@ class LiteGrip:
             TeleopNotReady: uncalibrated, zero travel, or ``rad_to_mm == 0``.
             TeleopBusyError: teleoperation is already running.
             NotInitializedError: not connected or not enabled.
-            ValueError: ``torque_limit_nm`` is negative.
+            ValueError: ``torque_limit_nm`` or ``lead_cap_mm`` is negative, or
+                ``align_speed_mm_s`` is not positive.
         """
         from .teleop import (GripperTeleop, TeleopBusyError, check_ready,
                              teleop_topic)
@@ -1930,8 +1939,9 @@ class LiteGrip:
             manager = GripperTeleop(
                 self, transport, mode, key,
                 rate_hz=rate_hz, kp=kp, kd=kd, align=align,
+                align_speed_mm_s=align_speed_mm_s,
                 watchdog_s=watchdog_s, dq_max=dq_max,
-                torque_limit_nm=torque_limit_nm)
+                torque_limit_nm=torque_limit_nm, lead_cap_mm=lead_cap_mm)
             manager.start()
         except BaseException:
             self._release_session("teleop")
