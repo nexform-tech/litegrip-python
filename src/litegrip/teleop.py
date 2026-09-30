@@ -11,8 +11,9 @@ Topology::
     leader  (zero-gravity, hand-back-driven)  --pub-->  follower (MIT follow)
 
 ``master`` streams zero-torque frames so the jaws can be pushed by hand, and
-publishes its normalised opening at ``rate_hz``.  ``slave`` subscribes, aligns
-once, then streams MIT position frames toward the received opening.
+publishes its normalised opening at ``rate_hz``.  ``slave`` subscribes, ramps
+once to the first frame's opening, then streams MIT position frames toward the
+received opening.
 
 Why the wire carries ``openness`` and not radians
 -------------------------------------------------
@@ -30,7 +31,16 @@ Safety notes
 ------------
 * ``openness`` is clamped to ``[0, 1]``, which keeps every commanded target
   inside the calibrated travel.  That clamp bounds *where* the follower may go;
-  ``torque_limit_nm`` bounds *how hard* it may push.
+  ``lead_cap_mm`` bounds *how hard* the align may push, and ``torque_limit_nm``
+  is the backstop for the follow.
+* The align move goes out through :meth:`GripperTeleop._ramp_to`, which caps how
+  far each frame's command may lead the measured position
+  (:meth:`GripperTeleop._cap_lead`).  Torque is ``kp * (q_cmd - q_measured)``, so
+  bounding the lead bounds the commanded torque by construction — without it the
+  first align frame demands ``kp`` times the whole error, and at the shipped
+  ``kp`` of 100 Nm/rad anything past ~0.1 rad saturates the DM4310.  The *follow*
+  loop is deliberately left uncapped so the follower stays responsive; the
+  ``torque_limit_nm`` guard is what protects it under load.
 * When ``torque_limit_nm`` is set (``0``, the default, disables it) the follower
   watches its own torque and releases when it stays over the limit for
   :data:`TORQUE_TRIP_CYCLES` cycles — see
@@ -94,6 +104,22 @@ DEFAULT_DQ_MAX = 10.0
 #: Past this the "velocity" would be an average across a dropout — refuse it and
 #: fall back to position-only control for that cycle.
 MAX_FRAME_GAP_S = 0.05
+
+#: Speed the follower travels at when it aligns to the leader's opening, in mm/s
+#: of jaw travel.  It used to travel at whatever stiffness would get it there:
+#: ``goto_rad(..., duration=1.0)`` sends ``q = q_target`` from the first frame,
+#: so the whole error was commanded at once.  Same number
+#: ``actions.MotionConfig.speed_mm_s`` gives ``open``/``close``.  Must be > 0.
+DEFAULT_ALIGN_SPEED_MM_S = 50.0
+
+#: Ceiling on how far the *align* command may lead the measured position, in mm
+#: of jaw travel.  Torque is ``kp * (q_cmd - q_measured)``, so bounding the lead
+#: bounds the commanded torque by construction.  4 mm is 0.054 rad at the shipped
+#: ``rad_to_mm`` of ~83, i.e. ~5.4 Nm at ``kp`` 100 — the bracket ``open``/
+#: ``close`` already travel with (``MotionConfig.max_lead_mm``).  ``0`` disables
+#: the cap.  The follow loop does not use this: it commands the leader's opening
+#: outright so it stays responsive.
+DEFAULT_LEAD_CAP_MM = 4.0
 
 #: Default ceiling on the follower's own torque, in Nm.  ``0`` disables the guard,
 #: which is the default: it changes the follower's behaviour under load, so a
@@ -443,10 +469,12 @@ class GripperTeleop:
     """One side of a gripper teleoperation, driven by a background thread.
 
     ``mode="master"`` streams zero-torque frames (so the jaws can be moved by
-    hand) and publishes the opening.  ``mode="slave"`` subscribes, aligns to
-    the first frame with a single :meth:`~litegrip.LiteGrip.goto_rad`, then
-    follows every fresh sample with ``send_mit_frame``, feeding the leader's
-    finite-difference velocity forward as ``dq`` (:meth:`_estimate_dq`).
+    hand) and publishes the opening.  ``mode="slave"`` subscribes, ramps to the
+    first frame (:meth:`_ramp_to`), then follows every fresh sample with
+    ``send_mit_frame``, feeding the leader's finite-difference velocity forward
+    as ``dq`` (:meth:`_estimate_dq`).  The ramp caps how far each frame's command
+    may lead the measurement (:meth:`_cap_lead`); the follow loop is uncapped so
+    it tracks the leader sample-for-sample.
 
     One loop thread per side, sampling and sending in the same cycle — no
     shared buffers and no contention, which is all a single-DOF gripper needs
@@ -463,6 +491,8 @@ class GripperTeleop:
         kp, kd: Follow gains (slave).  ``None`` uses the calibration's ``kp`` /
             ``kd``, falling back to ``100.0`` / ``2.0``.
         align: Slave only — align to the first frame before following.
+        align_speed_mm_s: Slave only — speed of that align move, in mm/s of jaw
+            travel.  Must be > 0.  See :meth:`_ramp_to`.
         watchdog_s: Slave only — seconds without a fresh frame before the
             follower is considered stale and starts holding.  Must be > 0: a
             non-positive watchdog makes the follower permanently stale, which is
@@ -471,6 +501,10 @@ class GripperTeleop:
             as the follower's ``dq`` target.  ``0`` disables the feedforward, in
             which case the follower biases on position error alone and trails a
             moving leader.  See :meth:`_estimate_dq`.
+        lead_cap_mm: Slave only — ceiling in mm on how far the *align* command
+            may lead the measured position, which bounds the align torque at
+            ``kp * lead_cap_mm / rad_to_mm``.  The follow loop is not capped.
+            ``0`` disables the cap.  See :meth:`_cap_lead`.
         torque_limit_nm: Slave only — ceiling in Nm on the follower's own torque.
             Held over the limit for :data:`TORQUE_TRIP_CYCLES` cycles it
             releases in place and stays released until the leader reopens by
@@ -492,9 +526,11 @@ class GripperTeleop:
         kp: Optional[float] = None,
         kd: Optional[float] = None,
         align: bool = True,
+        align_speed_mm_s: float = DEFAULT_ALIGN_SPEED_MM_S,
         watchdog_s: float = 0.2,
         dq_max: float = DEFAULT_DQ_MAX,
         torque_limit_nm: float = DEFAULT_TORQUE_LIMIT_NM,
+        lead_cap_mm: float = DEFAULT_LEAD_CAP_MM,
         sub_transport: Optional[TeleopTransport] = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         time_fn: Callable[[], float] = time.monotonic,
@@ -505,10 +541,17 @@ class GripperTeleop:
             raise ValueError("rate_hz must be > 0")
         if not watchdog_s > 0.0:
             raise ValueError("watchdog_s must be > 0")
+        if not float(align_speed_mm_s) > 0.0:
+            raise ValueError(
+                f"align_speed_mm_s must be > 0, got {align_speed_mm_s!r}")
         if float(torque_limit_nm) < 0.0:
             raise ValueError(
                 f"torque_limit_nm must be >= 0 (0 disables the guard), "
                 f"got {torque_limit_nm!r}")
+        if float(lead_cap_mm) < 0.0:
+            raise ValueError(
+                f"lead_cap_mm must be >= 0 (0 disables the cap), "
+                f"got {lead_cap_mm!r}")
         self._g = gripper
         self._tp = transport
         self._mode = mode
@@ -517,9 +560,11 @@ class GripperTeleop:
         self._kp = kp
         self._kd = kd
         self._align = align
+        self._align_speed_mm_s = float(align_speed_mm_s)
         self._watchdog_s = watchdog_s
         self._dq_max = float(dq_max)
         self._torque_limit_nm = float(torque_limit_nm)
+        self._lead_cap_mm = float(lead_cap_mm)
         self._sub_tp = sub_transport
         self._sleep_fn = sleep_fn
         self._time_fn = time_fn
@@ -725,20 +770,18 @@ class GripperTeleop:
         if self._align:
             first = self._wait_first_frame(sub, timeout_s=5.0, hold_q=q_cmd)
             if first is not None:
+                # ``q_cmd`` becomes the align target *before* the ramp so the
+                # follow loop keeps holding it if the leader then goes quiet;
+                # leaving it at the pre-align position would drive the jaws back
+                # the moment the ramp finished.
                 q_cmd = clamp_to_calibrated(
                     cfg, openness_to_rad(_clamp01(first[0]), cfg))
-                log.info("[slave] aligning to first frame: openness=%.3f -> %+.4f rad",
-                         _clamp01(first[0]), q_cmd)
-                try:
-                    self._g.goto_rad(q_cmd, kp=self._resolve_kp(),
-                                     kd=self._resolve_kd(), duration=1.0)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("[slave] align goto_rad failed: %s", e)
                 self._last_frame_ts = self._time_fn()
                 self._ever_received = True
                 self._last_openness = _clamp01(first[0])
                 self._last_position_mm = float(first[1])
                 self._last_force_n = float(first[2])
+                self._ramp_to(q_cmd)
             else:
                 log.warning("[slave] no frame within align timeout; "
                             "holding current position")
@@ -797,6 +840,10 @@ class GripperTeleop:
                         # comm-loss fault.
                         self._send(q_cmd, 0.0, 0.0)
                     else:
+                        # Deliberately uncapped: the follower commands the
+                        # leader's opening outright so it stays responsive.  Only
+                        # the align ramp caps its lead (:meth:`_ramp_to`); the
+                        # guard above is what protects the follow under load.
                         self._send(q_cmd, self._resolve_kp(), self._resolve_kd(),
                                    dq=dq_cmd)
                 except Exception:  # noqa: BLE001
@@ -813,7 +860,7 @@ class GripperTeleop:
         """Wait for the first frame, holding position while we wait.
 
         ⚠ A **non-finite** frame is skipped and the wait continues, never
-        returned: this value feeds ``goto_rad``, and a NaN folds onto an end
+        returned: this value feeds the align ramp, and a NaN folds onto an end
         stop — one bad frame would pull the follower to the closed limit, on the
         ``align=True`` default path, before the loop's own guard could see it.
         ⚠ The wait **keeps sending hold frames**: staying silent for up to 5 s
@@ -839,6 +886,107 @@ class GripperTeleop:
                 return None
             self._sleep_fn(0.01)
         return None
+
+    def _lead_cap_rad(self) -> float:
+        """The lead cap in radians, or ``0.0`` when it is disabled.
+
+        ``rad_to_mm`` is the only conversion the cap needs and teleop already
+        refuses to start without it (``check_ready``); treating a missing or zero
+        one as "disabled" keeps this from dividing by zero on a caller that
+        bypassed that check.
+        """
+        rad_to_mm = float(getattr(self._g.config, "rad_to_mm", 0.0) or 0.0)
+        if self._lead_cap_mm <= 0.0 or rad_to_mm <= 0.0:
+            return 0.0
+        return self._lead_cap_mm / rad_to_mm
+
+    def _cap_lead(self, q_target: float, pos_rad: float) -> float:
+        """Pull a position command back to within the lead cap of the measurement.
+
+        The follower is a position loop whose gain is in Nm/rad, so the torque it
+        commands is ``kp * (q_target - pos_rad)``.  Bounding that difference
+        bounds the torque by construction, which is the point: the align's first
+        frame hands over the leader's whole opening at once, and an uncapped one
+        would demand ``kp`` times the full error — at the shipped ``kp`` of 100
+        an error over ~0.1 rad saturates the DM4310 (10 Nm).  Capping does not
+        slow the move down for free: the jaws still travel, they just press with
+        a bounded torque while they catch up.  Only the align ramp calls this.
+        """
+        cap = self._lead_cap_rad()
+        if cap <= 0.0:
+            return q_target
+        lead = q_target - pos_rad
+        if lead > cap:
+            return pos_rad + cap
+        if lead < -cap:
+            return pos_rad - cap
+        return q_target
+
+    def _ramp_to(self, target_rad: float) -> None:
+        """Travel to ``target_rad`` at :attr:`_align_speed_mm_s`, capped every frame.
+
+        The align used to be one ``goto_rad(..., duration=1.0)``.  ``duration``
+        reads like a ramp, but the CAN layer sends ``q = q_target`` from the
+        first frame and merely holds it until the deadline
+        (``protocols/can_bus.py``'s ``control_mit_stream``), so the first frame
+        demanded ``kp`` times the whole error — a full-torque step wherever the
+        jaws happened to start, which drove a follower into the closed hard stop
+        hard enough to break its printed limit.  Instead this is the profile
+        ``open``/``close`` already travel with (``actions.MotionConfig``): a
+        constant-speed schedule, the same speed fed forward as ``dq``, and
+        :meth:`_cap_lead` on every frame.
+
+        Sending through this module's own path also puts the align under
+        :meth:`_update_torque_guard`, which the blocking ``goto_rad`` was outside
+        of — a jam during the align now releases like any other.
+        """
+        cfg = self._g.config
+        try:
+            state = self._g.get_state(wait=False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("[slave] align state read failed: %s", e)
+            return
+        start = clamp_to_calibrated(cfg, state.position_rad)
+        dist_rad = target_rad - start
+        rad_to_mm = float(getattr(cfg, "rad_to_mm", 0.0) or 0.0)
+        speed_mm_s = self._align_speed_mm_s
+        if rad_to_mm <= 0.0 or abs(dist_rad) < 1e-9:
+            # Nothing to schedule against.  One capped frame still bounds the
+            # torque; an uncapped one would be the bug this method exists to fix.
+            self._send(self._cap_lead(target_rad, state.position_rad),
+                       self._resolve_kp(), self._resolve_kd())
+            return
+        speed_rad_s = speed_mm_s / rad_to_mm
+        sign = 1.0 if dist_rad >= 0.0 else -1.0
+        steps = max(1, int(round(abs(dist_rad) / speed_rad_s / self._dt)))
+        log.info("[slave] aligning: %+.4f -> %+.4f rad at %.1f mm/s "
+                 "(%d frames, cap %.4f rad)",
+                 start, target_rad, speed_mm_s, steps, self._lead_cap_rad())
+        for i in range(1, steps + 1):
+            if not self._running:
+                return
+            t0 = self._time_fn()
+            try:
+                state = self._g.get_state(wait=False)
+                self._note_grip_fault(state)
+                self._update_torque_guard(state)
+                if self._over_torque:
+                    # Released in place, exactly as the follow loop would.  Hold
+                    # where the jaws are; do not keep driving into whatever
+                    # tripped the guard.
+                    self._send(clamp_to_calibrated(cfg, state.position_rad),
+                               0.0, 0.0)
+                    return
+                q_sched = start + dist_rad * (i / steps)
+                self._send(self._cap_lead(q_sched, state.position_rad),
+                           self._resolve_kp(), self._resolve_kd(),
+                           dq=sign * speed_rad_s)
+            except Exception:  # noqa: BLE001
+                log.exception("[slave] CAN error during align; loop exiting")
+                return
+            rest = self._dt - (self._time_fn() - t0)
+            if rest > 0.0:
+                self._sleep_fn(rest)
 
     def _estimate_dq(self, q: float, rx_ts: float) -> float:
         """Leader velocity in rad/s, differenced from the previous good frame.

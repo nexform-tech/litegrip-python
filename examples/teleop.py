@@ -54,7 +54,8 @@ _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from litegrip import (DEFAULT_DQ_MAX, DEFAULT_GRIP_ID, DEFAULT_GRIP_PORT,  # noqa: E402
+from litegrip import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX,  # noqa: E402
+                      DEFAULT_GRIP_ID, DEFAULT_GRIP_PORT, DEFAULT_LEAD_CAP_MM,
                       DEFAULT_TORQUE_LIMIT_NM, InProcTeleopTransport, LiteGrip,
                       LiteGripError, encode_frame, teleop_topic)
 
@@ -95,6 +96,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-align", action="store_true",
         help="follower: skip the one-shot align to the first frame")
     parser.add_argument(
+        "--align-speed", type=float, default=DEFAULT_ALIGN_SPEED_MM_S,
+        help="follower: speed of the align move in mm/s of jaw travel "
+             f"(default: {DEFAULT_ALIGN_SPEED_MM_S:g})")
+    parser.add_argument(
         "--watchdog", type=float, default=0.2,
         help="follower: hold position after this many seconds without a "
              "fresh frame (default: 0.2)")
@@ -102,6 +107,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--dq-max", type=float, default=DEFAULT_DQ_MAX,
         help="follower: ceiling in rad/s on the leader velocity fed forward "
              f"(default: {DEFAULT_DQ_MAX:.0f}; 0 disables the feedforward)")
+    parser.add_argument(
+        "--lead-cap", type=float, default=DEFAULT_LEAD_CAP_MM,
+        help="follower: ceiling in mm on how far the align's commanded "
+             "position may lead the measured one, which bounds the align "
+             f"torque (default: {DEFAULT_LEAD_CAP_MM:g}; 0 disables the cap)")
     parser.add_argument(
         "--rate", type=float, default=50.0, help="loop rate in Hz (default: 50)")
     parser.add_argument(
@@ -231,6 +241,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: --torque-limit must be >= 0 (0 turns the guard off), "
               f"got {args.torque_limit}", file=sys.stderr)
         return 2
+    if args.align_speed <= 0.0:
+        print(f"error: --align-speed must be > 0, got {args.align_speed}",
+              file=sys.stderr)
+        return 2
+    if args.lead_cap < 0.0:
+        print(f"error: --lead-cap must be >= 0 (0 turns the cap off), "
+              f"got {args.lead_cap}", file=sys.stderr)
+        return 2
     if args.fake_leader and args.torque_limit == 0.0:
         print("warning: --fake-leader with the torque guard off (--torque-limit 0) "
               "has nothing to demonstrate; pass a limit to watch it trip",
@@ -269,12 +287,18 @@ def main(argv: list[str] | None = None) -> int:
     status = gripper.teleop_start(
         args.mode, transport=bus, link=args.link, host=args.host, port=args.port,
         grip_id=args.grip_id, kp=args.kp, kd=args.kd, align=not args.no_align,
-        watchdog_s=args.watchdog, dq_max=args.dq_max, rate_hz=args.rate,
-        torque_limit_nm=args.torque_limit)
+        align_speed_mm_s=args.align_speed, watchdog_s=args.watchdog,
+        dq_max=args.dq_max, rate_hz=args.rate,
+        torque_limit_nm=args.torque_limit, lead_cap_mm=args.lead_cap)
     if args.mode == "slave":
         guard = "off" if args.torque_limit == 0.0 else f"{args.torque_limit:.2f} Nm"
         print(f"torque guard: {guard} "
               "(follower releases in place when its own torque reaches it)")
+        cap = ("off" if args.lead_cap == 0.0
+               else f"{args.lead_cap:g} mm")
+        print(f"align: {'off' if args.no_align else f'{args.align_speed:g} mm/s'}, "
+              f"lead cap: {cap} "
+              "(bounds the align's commanded torque; the follow is uncapped)")
     print(f"teleop {args.mode} running; Ctrl+C to stop")
     _print_status(status)
 
