@@ -628,12 +628,24 @@ class PlayerTest(unittest.TestCase):
         self.assertAlmostEqual(commanded[0], 0.0, places=9)
         self.assertAlmostEqual(commanded[-1], 1.0, places=9)
 
-    def test_aligning_moves_to_the_first_sample_before_following(self):
+    def test_aligning_walks_to_the_first_sample_without_a_full_torque_step(self):
         g, fake = make_gripper()
         _use_clock(g)
         g.play(_trajectory([0.25, 1.0], dt=0.5), align=True)
-        self.assertAlmostEqual(
-            rad_to_openness(fake.frames[0].q, g.config), 0.25, places=6)
+
+        cap_rad = g.motion_config.max_lead_mm / g.config.rad_to_mm
+        target = openness_to_rad(0.25, g.config)
+        # The align used to command the whole target on its first frame — a
+        # full-torque step from wherever the jaws happened to be.  It now walks
+        # there: the first frame is one capped step off the start, with the
+        # travel speed fed forward as dq.
+        self.assertLessEqual(abs(fake.frames[0].q - POS_OPEN_RAD), cap_rad + 1e-9)
+        self.assertAlmostEqual(fake.frames[0].dq,
+                               g.motion_config.speed_mm_s / g.config.rad_to_mm)
+        # The gap it covers is far past the cap — that is the step this replaces.
+        self.assertGreater(abs(target - POS_OPEN_RAD), 10.0 * cap_rad)
+        # ...and it still arrives before the replay takes over.
+        self.assertTrue(any(abs(f.q - target) < 1e-9 for f in fake.frames))
 
     def test_speed_scales_how_long_the_replay_takes(self):
         """Half speed means twice the frames for the same trajectory."""
