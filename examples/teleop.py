@@ -109,9 +109,9 @@ def build_parser() -> argparse.ArgumentParser:
              f"(default: {DEFAULT_DQ_MAX:.0f}; 0 disables the feedforward)")
     parser.add_argument(
         "--lead-cap", type=float, default=DEFAULT_LEAD_CAP_MM,
-        help="follower: ceiling in mm on how far the commanded position may "
-             "lead the measured one, which bounds the commanded torque "
-             f"(default: {DEFAULT_LEAD_CAP_MM:g}; 0 disables the cap)")
+        help="follower: ceiling in mm on how far the align's commanded "
+             "position may lead the measured one, which bounds the align "
+             f"torque (default: {DEFAULT_LEAD_CAP_MM:g}; 0 disables the cap)")
     parser.add_argument(
         "--rate", type=float, default=50.0, help="loop rate in Hz (default: 50)")
     parser.add_argument(
@@ -298,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
                else f"{args.lead_cap:g} mm")
         print(f"align: {'off' if args.no_align else f'{args.align_speed:g} mm/s'}, "
               f"lead cap: {cap} "
-              "(bounds the follower's commanded torque)")
+              "(bounds the align's commanded torque; the follow is uncapped)")
     print(f"teleop {args.mode} running; Ctrl+C to stop")
     _print_status(status)
 

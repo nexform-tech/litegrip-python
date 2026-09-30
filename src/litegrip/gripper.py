@@ -1873,9 +1873,9 @@ class LiteGrip:
             torque_limit_nm: Slave only — ceiling in Nm on the follower's own
                 torque; held over it the follower releases in place.  ``0``
                 disables the guard.  See :class:`~litegrip.GripperTeleop`.
-            lead_cap_mm: Slave only — ceiling in mm on how far the follower's
-                commanded position may lead its measured one, which bounds the
-                commanded torque.  ``0`` disables the cap.
+            lead_cap_mm: Slave only — ceiling in mm on how far the *align*
+                command may lead the measured position, which bounds the align
+                torque.  The follow loop is not capped.  ``0`` disables the cap.
             rate_hz: Loop rate.
 
         Returns:

@@ -737,12 +737,13 @@ class TorqueGuardTest(unittest.TestCase):
 
 
 class LeadCapTest(unittest.TestCase):
-    """The command never leads the measurement by more than the cap.
+    """The align command never leads the measurement by more than the cap.
 
     Torque is ``kp * (q_cmd - q_measured)``, so bounding the lead bounds the
-    commanded torque by construction.  This is what keeps the align ramp — and
-    the first follow frame, which ``align=False`` does not avoid — from demanding
-    ``kp`` times a whole-stroke error in a single frame.
+    commanded torque by construction.  This is what keeps the align ramp from
+    demanding ``kp`` times a whole-stroke error in a single frame.  The follow
+    loop is deliberately *not* capped, so the follower stays responsive — see
+    :meth:`test_first_follow_frame_commands_the_target`.
     """
 
     def _slave(self, **kwargs):
@@ -777,28 +778,12 @@ class LeadCapTest(unittest.TestCase):
         finally:
             mgr.stop()
 
-    def test_first_follow_frame_is_capped_with_align_off(self):
+    def test_first_follow_frame_commands_the_target(self):
+        # The follow loop is deliberately uncapped: it commands the leader's
+        # whole opening from the first frame, exactly as it did before the align
+        # ramp was added.  Capping it would bound the follow torque but blunt the
+        # follower's response, which is not what the align fix was for.
         g, fake, transport, mgr = self._slave(align=False, watchdog_s=5.0)
-        transport.pub(TOPIC, encode_frame(1.0, 120.0, 0.0, 0.0))
-        target = openness_to_rad(1.0, g.config)
-        mgr.start()
-        try:
-            self.assertTrue(_wait_until(lambda: len(fake.frames) > 0))
-            self.assertAlmostEqual(fake.frames[0].q, POS_CLOSED_RAD - self._cap_rad(g))
-            self.assertTrue(_wait_until(
-                lambda: any(abs(f.q - target) < 1e-9 for f in fake.frames)))
-            self.assertLessEqual(self._max_lead(fake, POS_CLOSED_RAD),
-                                 self._cap_rad(g) + 1e-9)
-        finally:
-            mgr.stop()
-
-    def test_zero_cap_disables_it(self):
-        # Same opt-out shape as ``dq_max`` and ``torque_limit_nm``: 0 turns the
-        # cap off.  The align is still a bounded-speed ramp — that is
-        # ``align_speed_mm_s``, a separate knob — but the follow command goes out
-        # uncapped, commanding the target in one frame exactly as it used to.
-        g, fake, transport, mgr = self._slave(align=False, watchdog_s=5.0,
-                                              lead_cap_mm=0.0)
         transport.pub(TOPIC, encode_frame(1.0, 120.0, 0.0, 0.0))
         target = openness_to_rad(1.0, g.config)
         mgr.start()
@@ -807,6 +792,15 @@ class LeadCapTest(unittest.TestCase):
             self.assertAlmostEqual(fake.frames[0].q, target)
         finally:
             mgr.stop()
+
+    def test_zero_cap_disables_it(self):
+        # Same opt-out shape as ``dq_max`` and ``torque_limit_nm``: 0 turns the
+        # align's cap off, passing the command through untouched.  The align is
+        # still a bounded-speed ramp — that is ``align_speed_mm_s``, a separate
+        # knob.
+        _g, _fake, _transport, mgr = self._slave(lead_cap_mm=0.0)
+        self.assertEqual(mgr._cap_lead(1.0, 0.0), 1.0)
+        self.assertEqual(mgr._cap_lead(-1.0, 0.0), -1.0)
 
     def test_rejects_a_negative_cap(self):
         g, _ = make_gripper()

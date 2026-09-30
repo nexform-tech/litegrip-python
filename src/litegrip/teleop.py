@@ -31,14 +31,16 @@ Safety notes
 ------------
 * ``openness`` is clamped to ``[0, 1]``, which keeps every commanded target
   inside the calibrated travel.  That clamp bounds *where* the follower may go;
-  ``lead_cap_mm`` bounds *how hard* it may push, and ``torque_limit_nm`` is the
-  backstop.
-* Every position command goes out through :meth:`GripperTeleop._cap_lead`, which
-  bounds the command's distance ahead of the measured position.  Torque is
-  ``kp * (q_cmd - q_measured)``, so the cap bounds the commanded torque by
-  construction — without it, a target that arrives in a single frame (the first
-  align frame, or a leader that jumps) demands ``kp`` times the whole error.  At
-  the shipped ``kp`` of 100 Nm/rad anything past ~0.1 rad saturates the DM4310.
+  ``lead_cap_mm`` bounds *how hard* the align may push, and ``torque_limit_nm``
+  is the backstop for the follow.
+* The align move goes out through :meth:`GripperTeleop._ramp_to`, which caps how
+  far each frame's command may lead the measured position
+  (:meth:`GripperTeleop._cap_lead`).  Torque is ``kp * (q_cmd - q_measured)``, so
+  bounding the lead bounds the commanded torque by construction — without it the
+  first align frame demands ``kp`` times the whole error, and at the shipped
+  ``kp`` of 100 Nm/rad anything past ~0.1 rad saturates the DM4310.  The *follow*
+  loop is deliberately left uncapped so the follower stays responsive; the
+  ``torque_limit_nm`` guard is what protects it under load.
 * When ``torque_limit_nm`` is set (``0``, the default, disables it) the follower
   watches its own torque and releases when it stays over the limit for
   :data:`TORQUE_TRIP_CYCLES` cycles — see
@@ -110,12 +112,13 @@ MAX_FRAME_GAP_S = 0.05
 #: ``actions.MotionConfig.speed_mm_s`` gives ``open``/``close``.  Must be > 0.
 DEFAULT_ALIGN_SPEED_MM_S = 50.0
 
-#: Ceiling on how far the follower's *command* may lead its measured position,
-#: in mm of jaw travel.  Torque is ``kp * (q_cmd - q_measured)``, so bounding the
-#: lead bounds the commanded torque by construction.  4 mm is 0.054 rad at the
-#: shipped ``rad_to_mm`` of ~83, i.e. ~5.4 Nm at ``kp`` 100 — the bracket
-#: ``open``/``close`` already travel with (``MotionConfig.max_lead_mm``).  ``0``
-#: disables the cap, restoring a follower that commands the target outright.
+#: Ceiling on how far the *align* command may lead the measured position, in mm
+#: of jaw travel.  Torque is ``kp * (q_cmd - q_measured)``, so bounding the lead
+#: bounds the commanded torque by construction.  4 mm is 0.054 rad at the shipped
+#: ``rad_to_mm`` of ~83, i.e. ~5.4 Nm at ``kp`` 100 — the bracket ``open``/
+#: ``close`` already travel with (``MotionConfig.max_lead_mm``).  ``0`` disables
+#: the cap.  The follow loop does not use this: it commands the leader's opening
+#: outright so it stays responsive.
 DEFAULT_LEAD_CAP_MM = 4.0
 
 #: Default ceiling on the follower's own torque, in Nm.  ``0`` disables the guard,
@@ -469,9 +472,9 @@ class GripperTeleop:
     hand) and publishes the opening.  ``mode="slave"`` subscribes, ramps to the
     first frame (:meth:`_ramp_to`), then follows every fresh sample with
     ``send_mit_frame``, feeding the leader's finite-difference velocity forward
-    as ``dq`` (:meth:`_estimate_dq`).  Both the ramp and the follow cycles cap
-    how far the command may lead the measurement (:meth:`_cap_lead`), which is
-    what keeps the commanded torque bounded.
+    as ``dq`` (:meth:`_estimate_dq`).  The ramp caps how far each frame's command
+    may lead the measurement (:meth:`_cap_lead`); the follow loop is uncapped so
+    it tracks the leader sample-for-sample.
 
     One loop thread per side, sampling and sending in the same cycle — no
     shared buffers and no contention, which is all a single-DOF gripper needs
@@ -498,10 +501,10 @@ class GripperTeleop:
             as the follower's ``dq`` target.  ``0`` disables the feedforward, in
             which case the follower biases on position error alone and trails a
             moving leader.  See :meth:`_estimate_dq`.
-        lead_cap_mm: Slave only — ceiling in mm on how far the commanded
-            position may lead the measured one, which bounds the commanded
-            torque at ``kp * lead_cap_mm / rad_to_mm``.  ``0`` disables it.  See
-            :meth:`_cap_lead`.
+        lead_cap_mm: Slave only — ceiling in mm on how far the *align* command
+            may lead the measured position, which bounds the align torque at
+            ``kp * lead_cap_mm / rad_to_mm``.  The follow loop is not capped.
+            ``0`` disables the cap.  See :meth:`_cap_lead`.
         torque_limit_nm: Slave only — ceiling in Nm on the follower's own torque.
             Held over the limit for :data:`TORQUE_TRIP_CYCLES` cycles it
             releases in place and stays released until the leader reopens by
@@ -837,8 +840,11 @@ class GripperTeleop:
                         # comm-loss fault.
                         self._send(q_cmd, 0.0, 0.0)
                     else:
-                        self._send(self._cap_lead(q_cmd, state.position_rad),
-                                   self._resolve_kp(), self._resolve_kd(),
+                        # Deliberately uncapped: the follower commands the
+                        # leader's opening outright so it stays responsive.  Only
+                        # the align ramp caps its lead (:meth:`_ramp_to`); the
+                        # guard above is what protects the follow under load.
+                        self._send(q_cmd, self._resolve_kp(), self._resolve_kd(),
                                    dq=dq_cmd)
                 except Exception:  # noqa: BLE001
                     log.exception("[slave] CAN error; loop exiting")
@@ -899,12 +905,12 @@ class GripperTeleop:
 
         The follower is a position loop whose gain is in Nm/rad, so the torque it
         commands is ``kp * (q_target - pos_rad)``.  Bounding that difference
-        bounds the torque by construction, which is the point: a target that
-        arrives in one frame — the align, or a leader that jumped — would
-        otherwise demand ``kp`` times the full error, and at the shipped ``kp``
-        of 100 an error over ~0.1 rad saturates the DM4310 (10 Nm).  Capping does
-        not slow the move down for free: the follower still travels, it just
-        presses with a bounded torque while it catches up.
+        bounds the torque by construction, which is the point: the align's first
+        frame hands over the leader's whole opening at once, and an uncapped one
+        would demand ``kp`` times the full error — at the shipped ``kp`` of 100
+        an error over ~0.1 rad saturates the DM4310 (10 Nm).  Capping does not
+        slow the move down for free: the jaws still travel, they just press with
+        a bounded torque while they catch up.  Only the align ramp calls this.
         """
         cap = self._lead_cap_rad()
         if cap <= 0.0:
