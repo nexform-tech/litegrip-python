@@ -17,6 +17,14 @@ selects plain UDP instead, which carries no authentication or encryption — kee
 either on a trusted network. Press Ctrl+C on either end to stop; the gripper
 holds its position and does not disable.
 
+On the zenoh link the follower also announces when it has aligned
+(``litearm/v4/{grip-id}/gripper_ready``), and the leader holds its jaws under
+gain — *not* hand-movable — until it hears that, so the operator cannot push the
+target out from under a follower that is still travelling. ``--no-require-ready``
+restores the immediate hand-back, and ``--ready-timeout`` bounds the wait (a
+follower that never announces must not stall the leader forever). Plain UDP has
+no reverse path, so the gate is inert there and the leader goes slack at once.
+
 This script talks to real hardware. It does not detect an object in the jaws,
 and the follower holds its position on a leader dropout rather than going
 slack, so it can clamp whatever is between the fingers. Keep a hand on the
@@ -55,8 +63,9 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from litegrip import (DEFAULT_DQ_MAX, DEFAULT_GRIP_ID, DEFAULT_GRIP_PORT,  # noqa: E402
-                      DEFAULT_TORQUE_LIMIT_NM, InProcTeleopTransport, LiteGrip,
-                      LiteGripError, encode_frame, teleop_topic)
+                      DEFAULT_READY_TIMEOUT_S, DEFAULT_TORQUE_LIMIT_NM,
+                      InProcTeleopTransport, LiteGrip, LiteGripError,
+                      encode_frame, teleop_topic)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -110,6 +119,15 @@ def build_parser() -> argparse.ArgumentParser:
              "it the follower releases in place and re-arms once the leader "
              f"reopens (default: {DEFAULT_TORQUE_LIMIT_NM:g} = guard off)")
     parser.add_argument(
+        "--ready-timeout", type=float, default=DEFAULT_READY_TIMEOUT_S,
+        help="master: hold under gain for the follower's ready signal this "
+             "long before releasing anyway (default: "
+             f"{DEFAULT_READY_TIMEOUT_S:g}s; 0 waits indefinitely)")
+    parser.add_argument(
+        "--no-require-ready", action="store_true",
+        help="master: do not wait for the follower — go hand-movable from the "
+             "first cycle (the pre-handshake behaviour)")
+    parser.add_argument(
         "--fake-leader", action="store_true",
         help="bench one gripper alone: drive the follower from a synthetic "
              "leader on an in-process bus instead of a second gripper "
@@ -144,6 +162,11 @@ def _print_status(status: dict) -> None:
         extra += f" torque={status.get('torque_nm', 0.0):+5.2f}"
         if status.get("over_torque"):
             extra += f" OVER_TORQUE(trips={status.get('torque_trips', 0)})"
+        extra += f" ready={str(status.get('ready', False)):>5}"
+    elif status.get("mode") == "master":
+        extra += f" follower_ready={str(status.get('ready', False)):>5}"
+        if status.get("ready_timed_out"):
+            extra += " READY_TIMEOUT"
     print(f"frames={status.get('frames', 0):>7} "
           f"age_ms={age_txt} stale={str(status.get('stale', False)):>5} "
           f"openness={open_txt} dq={status.get('dq_cmd', 0.0):+5.2f} "
@@ -231,6 +254,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: --torque-limit must be >= 0 (0 turns the guard off), "
               f"got {args.torque_limit}", file=sys.stderr)
         return 2
+    if args.ready_timeout < 0.0:
+        print(f"error: --ready-timeout must be >= 0 (0 waits indefinitely), "
+              f"got {args.ready_timeout}", file=sys.stderr)
+        return 2
     if args.fake_leader and args.torque_limit == 0.0:
         print("warning: --fake-leader with the torque guard off (--torque-limit 0) "
               "has nothing to demonstrate; pass a limit to watch it trip",
@@ -252,7 +279,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print(f"dry run: would start {args.mode} on {args.channel} over "
               f"{'inproc' if bus is not None else args.link} at {target} "
-              f"(topic litearm/v4/{args.grip_id}/gripper_teleop)")
+              f"(topics litearm/v4/{args.grip_id}/gripper_teleop + "
+              f".../gripper_ready)")
         return 0
 
     gripper.connect()
@@ -270,11 +298,21 @@ def main(argv: list[str] | None = None) -> int:
         args.mode, transport=bus, link=args.link, host=args.host, port=args.port,
         grip_id=args.grip_id, kp=args.kp, kd=args.kd, align=not args.no_align,
         watchdog_s=args.watchdog, dq_max=args.dq_max, rate_hz=args.rate,
-        torque_limit_nm=args.torque_limit)
+        torque_limit_nm=args.torque_limit, require_ready=not args.no_require_ready,
+        ready_timeout_s=args.ready_timeout)
     if args.mode == "slave":
         guard = "off" if args.torque_limit == 0.0 else f"{args.torque_limit:.2f} Nm"
         print(f"torque guard: {guard} "
               "(follower releases in place when its own torque reaches it)")
+        print("ready: the follower announces itself once it has aligned; the "
+              "leader stays under gain until it does")
+    elif args.no_require_ready:
+        print("ready: gate off — the leader is hand-movable from the first cycle")
+    else:
+        wait = ("indefinitely" if args.ready_timeout == 0.0
+                else f"for {args.ready_timeout:g}s")
+        print(f"ready: holding under gain {wait} for the follower to announce "
+              "it has aligned, then handing back zero-gravity")
     print(f"teleop {args.mode} running; Ctrl+C to stop")
     _print_status(status)
 

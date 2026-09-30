@@ -21,7 +21,8 @@ import unittest
 from pathlib import Path
 
 import _sdkpath  # noqa: F401
-from litegrip import GripperTeleop, InProcTeleopTransport, decode_frame, teleop_topic
+from litegrip import (DEFAULT_READY_TIMEOUT_S, GripperTeleop,
+                      InProcTeleopTransport, decode_frame, teleop_topic)
 
 from fake_can import POS_CLOSED_RAD, POS_OPEN_RAD, make_gripper
 
@@ -70,11 +71,19 @@ class ArgvValidationTest(unittest.TestCase):
         # 0 is legal (guard off); only a negative limit is nonsense.
         self.assertEqual(_run_main(["--mode", "slave", "--torque-limit", "-1"]), 2)
 
+    def test_ready_timeout_must_not_be_negative(self):
+        # 0 is legal (wait indefinitely); only a negative timeout is nonsense.
+        self.assertEqual(_run_main(["--mode", "master", "--ready-timeout", "-1"]), 2)
+
     def test_defaults_match_the_sdk(self):
         args = example.build_parser().parse_args(["--mode", "slave"])
         self.assertFalse(args.fake_leader)
         self.assertEqual(args.torque_limit, 0.0)   # guard off by default
         self.assertEqual(args.openness_rate, 0.3)
+        # The readiness gate is on by default: the leader holds under gain for
+        # the follower rather than going hand-movable at once.
+        self.assertFalse(args.no_require_ready)
+        self.assertEqual(args.ready_timeout, DEFAULT_READY_TIMEOUT_S)
 
 
 class FakeLeaderTest(unittest.TestCase):
