@@ -61,6 +61,7 @@ class FakeMotor:
     TAU_MAX = 10.0
     VMAX = 5.0          # rad/s
     GAIN = 50.0         # 1/s，纯跟随增益
+    KP_NOMINAL = 100.0  # GAIN 对应的位置刚度
 
     def __init__(self, pos: float = 0.0, block_rad: Optional[float] = None,
                  sticky_rad: float = 0.0, err: int = 1,
@@ -80,12 +81,20 @@ class FakeMotor:
         self._block_dir = 0.0
         if block_rad is not None:
             self._block_dir = 1.0 if block_rad > pos else -1.0
+        # 编码器置零（CMD 0xFE）后的偏置：上报值 = 物理 pos − 偏置。
+        # 0xFE 把当下读数记成 0，所以置零时设成当时的 pos。
+        self.zero_offset = 0.0
+
+    def set_zero(self) -> None:
+        """把当前读数记成 0（模拟 0xFE）—— 不改物理位置，只改上报偏置。"""
+        self.zero_offset = self.pos
 
     def reported_pos(self) -> float:
         """上报位置（可量化 —— 模拟闭合侧约 0.0103 rad 的粘滑死区）。"""
+        p = self.pos - self.zero_offset
         if self.sticky_rad > 0:
-            return round(self.pos / self.sticky_rad) * self.sticky_rad
-        return self.pos
+            return round(p / self.sticky_rad) * self.sticky_rad
+        return p
 
     def set_block(self, block_rad: Optional[float]) -> None:
         """在当前位置的前方装/拆机械挡块。"""
@@ -94,7 +103,9 @@ class FakeMotor:
                            else (1.0 if block_rad > self.pos else -1.0))
 
     def step(self, q: float, kp: float, dq: float, tau_ff: float, dt: float) -> None:
-        v = dq + self.GAIN * (q - self.pos)
+        # 位置项按 kp 缩放：kp=0（失力 / stop）时不产生任何跟随速度 —— 真电机
+        # 零刚度就是这样，可被外力推动。kp=KP_NOMINAL 时与原来完全一致。
+        v = dq + self.GAIN * (kp / self.KP_NOMINAL) * (q - self.pos)
         v = max(-self.VMAX, min(self.VMAX, v))
         new = self.pos + v * dt
         if self.block_rad is not None:
@@ -178,6 +189,11 @@ class FakeLiteGripCAN:
     # ── 使能 ───────────────────────────────────────────────────────────
     def disable(self) -> bool:
         self.motor.err = 0
+        return True
+
+    def set_zero(self) -> bool:
+        """0xFE：把当前读数记成 0（只改偏置，不改物理位置）。"""
+        self.motor.set_zero()
         return True
 
     def clear_fault(self) -> bool:

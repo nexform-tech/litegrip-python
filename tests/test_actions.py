@@ -6,7 +6,7 @@ import unittest
 
 import _sdkpath  # noqa: F401
 from litegrip import (CommandError, GraspResult, MotionConfig, limit_target,
-                      press_target)
+                      press_target, work_limit_target)
 from litegrip.actions import GripperActions
 
 from fake_can import (DT, POS_CLOSED_RAD, POS_OPEN_RAD, RAD_TO_MM,
@@ -467,6 +467,131 @@ class TestDisableOnDisconnect(unittest.TestCase):
         fake.disconnect = lambda disable=True: seen.update(disable=disable)
         g.disconnect()
         self.assertEqual(seen, {"disable": False})
+
+
+class TestWorkLimitTarget(unittest.TestCase):
+    """工作行程目标：停在张开限位**内侧**的工作点。"""
+
+    def test_target_sits_below_the_open_stop(self):
+        g, _ = make_gripper()
+        target, limit, work_rad = work_limit_target(g.config, 80.0)
+
+        self.assertAlmostEqual(limit, POS_OPEN_RAD)
+        self.assertAlmostEqual(work_rad, 80.0 / RAD_TO_MM)
+        self.assertAlmostEqual(target, POS_CLOSED_RAD - work_rad)
+        self.assertGreater(target, POS_OPEN_RAD)      # 在限位内侧，没到停点
+
+    def test_clamps_to_the_mechanical_travel(self):
+        g, _ = make_gripper()
+        travel_mm = TRAVEL_RAD * RAD_TO_MM
+        target, _, work_rad = work_limit_target(g.config, travel_mm + 50.0)
+
+        self.assertAlmostEqual(work_rad, TRAVEL_RAD)
+        self.assertAlmostEqual(target, POS_OPEN_RAD)
+
+    def test_reverse_mount_mirrors(self):
+        g, _ = make_gripper(reverse=True)
+        target, limit, work_rad = work_limit_target(g.config, 80.0)
+        self.assertAlmostEqual(limit, POS_CLOSED_RAD)   # 反装张开在数值大的一侧
+        self.assertAlmostEqual(target, POS_OPEN_RAD + work_rad)
+        self.assertLess(target, POS_CLOSED_RAD)
+
+    def test_uncalibrated_raises(self):
+        g, _ = make_gripper()
+        g.config.calibrated = False
+        with self.assertRaises(CommandError):
+            work_limit_target(g.config, 80.0)
+
+
+class TestOpenWorkStroke(unittest.TestCase):
+    """open() 带工作行程时停在限位内侧，不带则照旧顶停点。"""
+
+    def test_open_stops_short_when_work_stroke_is_set(self):
+        g, fake = make_gripper(start_rad=POS_CLOSED_RAD, stops=True)
+        g.config.work_stroke_mm = 80.0
+        res = g.open(SPEED_MM_S)
+
+        target, _, _ = work_limit_target(g.config, 80.0)
+        self.assertTrue(res.ok, res)
+        self.assertTrue(res.reached, res)
+        self.assertFalse(res.stalled, res)
+        self.assertAlmostEqual(res.limit_rad, POS_OPEN_RAD)
+        self.assertAlmostEqual(fake.motor.pos, target, places=3)
+        self.assertGreater(fake.motor.pos, POS_OPEN_RAD)   # 没顶到张开停点
+
+    def test_open_presses_onto_the_stop_without_a_work_stroke(self):
+        g, fake = make_gripper(start_rad=POS_CLOSED_RAD, stops=True)
+        res = g.open(SPEED_MM_S)
+        self.assertTrue(res.stalled, res)
+        self.assertAlmostEqual(fake.motor.pos, POS_OPEN_RAD, places=6)
+
+    def test_work_stroke_at_or_over_the_travel_falls_back_to_press(self):
+        g, fake = make_gripper(start_rad=POS_CLOSED_RAD, stops=True)
+        g.config.work_stroke_mm = TRAVEL_RAD * RAD_TO_MM   # = 满行程 ⇒ 等同没设
+        res = g.open(SPEED_MM_S)
+        self.assertTrue(res.stalled, res)
+        self.assertAlmostEqual(fake.motor.pos, POS_OPEN_RAD, places=6)
+
+
+class TestStallTorqueProtection(unittest.TestCase):
+    """行进段力矩保护（≈7 N）：只在「没进压紧段 + 没跟上」时触发并失力。"""
+
+    def test_mid_travel_block_trips_protection(self):
+        g, fake = make_gripper(block_rad=POS_OPEN_RAD + 0.01)
+        res = g.close(SPEED_MM_S)
+
+        self.assertTrue(res.protected, res)
+        self.assertTrue(res.stalled, res)
+        self.assertFalse(res.ok, res)
+
+    def test_protection_releases_the_jaws(self):
+        g, fake = make_gripper(block_rad=POS_OPEN_RAD + 0.01)
+        res = g.close(SPEED_MM_S)
+
+        # res.steps 是触发那一帧；其后应全是失力帧（kp=kd=tau=0，位置不动）
+        tail = fake.frames[res.steps:]
+        self.assertTrue(tail, "触发后没有失力帧")
+        for f in tail:
+            self.assertEqual(f.kp, 0.0)
+            self.assertEqual(f.kd, 0.0)
+            self.assertEqual(f.dq, 0.0)
+            self.assertEqual(f.tau_ff, 0.0)
+            self.assertEqual(f.tau_nm, 0.0)
+        self.assertAlmostEqual(fake.motor.pos, POS_OPEN_RAD + 0.01, places=6)
+
+    def test_press_zone_does_not_trip_protection(self):
+        # 顶到标定限位：压紧段领先已收窄，本来就该顶着力矩 —— 不触发
+        g, fake = make_gripper(stops=True)
+        res = g.close(SPEED_MM_S)
+
+        self.assertFalse(res.protected, res)
+        self.assertTrue(res.ok, res)
+
+    def test_cruise_high_torque_but_tracking_does_not_trip(self):
+        # 阈值压到极低让巡航力矩也过阈；夹爪还在按指令速度跟进（rate 不慢）
+        # ⇒ 不触发。「没跟上」这一条件是防误触发的关键。
+        g, fake = make_gripper(stops=True)
+        g.motion_config.stop_torque_nm = 0.01
+        res = g.close(SPEED_MM_S)
+
+        self.assertFalse(res.protected, res)
+        self.assertTrue(res.ok, res)
+        over = [f for f in fake.frames
+                if abs(f.tau_nm) >= g.motion_config.stop_torque_nm]
+        self.assertTrue(over, "巡航段本该有超过阈值的力矩帧")
+
+    def test_grasp_close_is_exempt(self):
+        # grasp 的闭合段（press=False）要能夹住工件后转到保力 —— 不走力矩保护，
+        # 否则每次夹取都会被当成保护性堵转打断。
+        block = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2
+        g, fake = make_gripper(block_rad=block)
+        g.motion_config = MotionConfig(
+            sleep_fn=lambda _: None, monotonic_fn=tick_clock(0.1))
+        res = g.grasp(force_n=20.0, hold_s=0.4)
+
+        self.assertTrue(res.stalled, res)     # 撞上工件（位置式堵转）
+        self.assertTrue(res.ok, res)          # 保力正常，没被保护打断
+        self.assertTrue([f for f in fake.frames if f.tau_ff == 2.0])  # 有保力帧
 
 
 if __name__ == "__main__":
