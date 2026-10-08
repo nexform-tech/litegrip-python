@@ -989,6 +989,7 @@ class LiteGrip:
             "max_position_rad": self._config.pos_open_rad,
             "travel_range_rad": abs(self._config.pos_open_rad - self._config.pos_closed_rad),
             "rad_to_mm": self._config.rad_to_mm,
+            "work_stroke_mm": self._config.work_stroke_mm,
             "motor_type": self._motor_type.name,
             "kp": self._config.kp,
             "kd": self._config.kd,
@@ -1107,6 +1108,7 @@ class LiteGrip:
             ("kp", "kp"),
             ("kd", "kd"),
             ("grasp_torque_threshold", "grasp_torque_threshold"),
+            ("work_stroke_mm", "work_stroke_mm"),
         ]:
             if key in data:
                 setattr(self._config, attr, data[key])
@@ -1180,14 +1182,20 @@ class LiteGrip:
         *,
         progress: Optional[Callable[[MoveProgress], None]] = None,
     ) -> MoveResult:
-        """Open the gripper fully.
+        """Open the gripper.
 
-        A continuous ramp (velocity feed-forward, one frame per
+        By default a continuous ramp (velocity feed-forward, one frame per
         :attr:`MotionConfig.frame_interval`) that drives *past* the calibrated
         open limit and lets the mechanical stop end the move. The command lead
         is narrowed to :attr:`MotionConfig.stop_lead_mm` inside
         :attr:`MotionConfig.press_zone_mm` of the limit, so the pressing
         torque stays around ``kp × stop_lead_mm``.
+
+        When the config carries a **work stroke** (:attr:`GripperConfig.work_stroke_mm`
+        set and smaller than the mechanical travel) it stops there instead — a
+        plain move to that position that never presses the open stop, leaving a
+        margin at the open end.  ``MoveResult.ok`` is then ``reached and not
+        stalled``.
 
         Args:
             speed_mm_s: Opening speed; ``None`` = ``MotionConfig.speed_mm_s``.
@@ -1195,10 +1203,11 @@ class LiteGrip:
                 :class:`~litegrip.actions.MoveProgress` per sample.
 
         Returns:
-            :class:`~litegrip.actions.MoveResult` — truthy when it pressed
-            onto the stop (``stalled`` and parked within
-            :attr:`MotionConfig.stop_tol` of the limit).  Stalling far from
-            the limit means something blocked the travel, and is falsy.
+            :class:`~litegrip.actions.MoveResult` — with no work stroke, truthy
+            when it pressed onto the stop (``stalled`` and parked within
+            :attr:`MotionConfig.stop_tol` of the limit); stalling far from the
+            limit means something blocked the travel, and is falsy.  With a work
+            stroke, truthy when it reached the work position.
         """
         self._check_connected()
         return self._actions.open(speed_mm_s, progress=progress)
@@ -1833,11 +1842,11 @@ class LiteGrip:
         kp: Optional[float] = None,
         kd: Optional[float] = None,
         align: bool = True,
-        align_speed_mm_s: float = DEFAULT_ALIGN_SPEED_MM_S,
+        align_speed_mm_s: float = DEFAULT_ALIGN_SPEED_MM_S,   # [遥操对齐块]
         watchdog_s: float = 0.2,
         dq_max: float = DEFAULT_DQ_MAX,
         torque_limit_nm: float = DEFAULT_TORQUE_LIMIT_NM,
-        lead_cap_mm: float = DEFAULT_LEAD_CAP_MM,
+        lead_cap_mm: float = DEFAULT_LEAD_CAP_MM,             # [遥操对齐块]
         require_ready: bool = True,
         ready_timeout_s: float = DEFAULT_READY_TIMEOUT_S,
         ready_tolerance_mm: float = DEFAULT_READY_TOLERANCE_MM,
@@ -1965,9 +1974,9 @@ class LiteGrip:
             manager = GripperTeleop(
                 self, transport, mode, key,
                 rate_hz=rate_hz, kp=kp, kd=kd, align=align,
-                align_speed_mm_s=align_speed_mm_s,
+                align_speed_mm_s=align_speed_mm_s,                      # [遥操对齐块]
                 watchdog_s=watchdog_s, dq_max=dq_max,
-                torque_limit_nm=torque_limit_nm, lead_cap_mm=lead_cap_mm,
+                torque_limit_nm=torque_limit_nm, lead_cap_mm=lead_cap_mm,  # [遥操对齐块]
                 ready_topic=ready_key, require_ready=require_ready,
                 ready_timeout_s=ready_timeout_s,
                 ready_tolerance_mm=ready_tolerance_mm,

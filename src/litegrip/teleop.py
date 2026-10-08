@@ -115,6 +115,12 @@ DEFAULT_DQ_MAX = 10.0
 #: fall back to position-only control for that cycle.
 MAX_FRAME_GAP_S = 0.05
 
+# ── [遥操对齐块] 常量 ──────────────────────────────────────────────────────
+# 遥操从机启动对齐的「定速斜坡 + 每帧领先上限」。整块的作用、清单，以及
+# 临时停用 / 整块移除的做法，见 GripperTeleop._ramp_to() 上方那段说明。
+# 用 `grep -n '\[遥操对齐块\]' src/litegrip/teleop.py src/litegrip/gripper.py`
+# 可定位本块的全部位置。
+# ──────────────────────────────────────────────────────────────────────────
 #: Speed the follower travels at when it aligns to the leader's opening, in mm/s
 #: of jaw travel.  It used to travel at whatever stiffness would get it there:
 #: ``goto_rad(..., duration=1.0)`` sends ``q = q_target`` from the first frame,
@@ -626,11 +632,11 @@ class GripperTeleop:
         kp: Optional[float] = None,
         kd: Optional[float] = None,
         align: bool = True,
-        align_speed_mm_s: float = DEFAULT_ALIGN_SPEED_MM_S,
+        align_speed_mm_s: float = DEFAULT_ALIGN_SPEED_MM_S,   # [遥操对齐块]
         watchdog_s: float = 0.2,
         dq_max: float = DEFAULT_DQ_MAX,
         torque_limit_nm: float = DEFAULT_TORQUE_LIMIT_NM,
-        lead_cap_mm: float = DEFAULT_LEAD_CAP_MM,
+        lead_cap_mm: float = DEFAULT_LEAD_CAP_MM,             # [遥操对齐块]
         ready_topic: Optional[str] = None,
         require_ready: bool = True,
         ready_timeout_s: float = DEFAULT_READY_TIMEOUT_S,
@@ -968,6 +974,10 @@ class GripperTeleop:
                 self._last_openness = _clamp01(first[0])
                 self._last_position_mm = float(first[1])
                 self._last_force_n = float(first[2])
+                # [遥操对齐块] 定速斜坡 + 领先上限对齐（说明见 _ramp_to() 上方）。
+                # 退回旧行为就把下一行换成：
+                # self._g.goto_rad(q_cmd, kp=self._resolve_kp(),
+                #                  kd=self._resolve_kd(), duration=1.0)
                 self._ramp_to(q_cmd)
             else:
                 log.warning("[slave] no frame within align timeout; "
@@ -1177,6 +1187,31 @@ class GripperTeleop:
         self._ready_state = ready
         self._ready_pub_ts = now
         self._ready_pubs += 1
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # [遥操对齐块] 遥操从机启动对齐的安全措施 —— 可整块注释 / 删除
+    #
+    # 作用：把"对齐到 leader 第一帧"从「一帧 goto_rad 把整个误差一次发出去」
+    # 改成「定速斜坡（align_speed_mm_s）+ 每帧把指令领先夹到 lead_cap_mm」。
+    # 力矩 = kp × (q_cmd − q_measured)，夹住领先就从构造上夹住了力矩 —— 开盘
+    # 那一帧不再以满力矩顶过去（曾有从机被这样怼进硬限位、撞断打印限位）。
+    # 顺带把对齐纳入 _update_torque_guard：卡住会像正常一样失力释放。
+    #
+    # 本块清单（grep -n '\[遥操对齐块\]' src/litegrip/teleop.py src/litegrip/gripper.py）：
+    #   - 常量   DEFAULT_ALIGN_SPEED_MM_S / DEFAULT_LEAD_CAP_MM
+    #   - 形参   __init__ 的 align_speed_mm_s / lead_cap_mm（含校验与赋值）
+    #   - 方法   _lead_cap_rad / _cap_lead / _ramp_to（本段）
+    #   - 调用点 self._ramp_to(q_cmd)（slave 对齐段）
+    #   - 透传   gripper.py 的 teleop_start(align_speed_mm_s=, lead_cap_mm=)
+    #
+    # 临时停用（不动代码）：teleop_start(lead_cap_mm=0) 关掉领先上限；
+    #   align_speed_mm_s 只调对齐速度。
+    # 整块移除：删掉上面清单，并把 _ramp_to(q_cmd) 换回旧行为 ——
+    #   self._g.goto_rad(q_cmd, kp=self._resolve_kp(),
+    #                    kd=self._resolve_kd(), duration=1.0)
+    #   （注意：旧的 duration 只是 deadline、不是斜坡，第一帧即满误差；这正是
+    #    本块要修的隐患。）
+    # ═══════════════════════════════════════════════════════════════════════
 
     def _lead_cap_rad(self) -> float:
         """The lead cap in radians, or ``0.0`` when it is disabled.
