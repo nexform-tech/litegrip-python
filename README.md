@@ -400,7 +400,7 @@ with LiteGrip("can0") as gripper:
 | `stop_tol` | `0.02` | how close to the calibrated stop the jaw must park to count as pressed home, radians |
 | `force_n` | `20.0` | default `grasp` force |
 | `hold_interval` | `0.2` | force-hold slice length, seconds |
-| `hold_kp` / `hold_kd` | `150.0` / `2.0` | gains used while holding force |
+| `hold_kp` / `hold_kd` | `150.0` / `2.0` | deprecated — the force hold uses no gains; setting them changes nothing |
 | `enable_retries` / `enable_retry_interval` | `3` / `0.2` | enable retry count and gap |
 | `calib_kp` / `calib_kd` | `20.0` / `2.0` | probe stiffness used by `zero()` |
 | `calib_step_rad` | `0.05` | probe increment used by `zero()`, and the cap on how far the command may lead the measured position |
@@ -473,6 +473,14 @@ Worth reading if a gripper is behaving oddly.
   `stall_cycles` samples falls below `max(stall_delta, stall_ratio × expected distance)`. A
   single-sample test would misfire on the close-side stick-slip dead band. The settle phase after
   the ramp is not checked, because a stationary jaw is the expected outcome there.
+- **The force hold is a torque command, not a position one.** `grasp`'s hold phase and
+  `set_force` stream frames with `kp = kd = 0`, so the drive's output is the feed-forward
+  torque `force_n × 0.1 Nm` alone, wherever the jaws are. That is what makes the force
+  independent of the workpiece: as a soft object yields, the jaws follow it and the grip
+  stays at the setpoint. Do not add a gain to make the hold "stiffer" — `kp × (q - measured)`
+  turns into a force error the moment the jaws move, and at `kp = 150` the closed side's
+  ~`0.0103 rad` stick-slip step is worth about `15 N`. `hold_kp` / `hold_kd` used to do
+  exactly that; they are now ignored.
 - **`enable` is a verified one-way command.** Enabling sends a CAN frame with no
   acknowledgement, so a dropped frame goes unnoticed and the motor silently stays disabled.
   `enable()` therefore sends it, re-reads the status frame, and reports success only when
@@ -485,6 +493,10 @@ Worth reading if a gripper is behaving oddly.
   repeatable setting, not a calibrated measurement.
 - **DM4310 limits** are a 3 Nm rating, a 7 Nm peak, and a 10 Nm protocol/firmware ceiling. The
   default 20 N (`2.0 Nm` feed-forward) sits inside the rating.
+- **A held force leaves the jaws compliant.** The hold frames carry no stiffness or damping, so
+  an external push back-drives the jaws while the motor keeps pushing with `force_n` — and a
+  `grasp()` that finds nothing between the jaws closes onto the mechanical stop at that force.
+  That is the price of a force that does not drift when the workpiece moves.
 - **Direction is data, not a switch.** Both extreme positions live in the calibration file, and
   which of the two is numerically larger is what says which way closing runs
   (`GripperConfig.close_sign`). A reverse-mounted gripper is therefore a perfectly ordinary

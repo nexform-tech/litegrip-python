@@ -414,6 +414,68 @@ class TestGrasp(unittest.TestCase):
         self.assertEqual(res.state.error_code, 0x9)
 
 
+class TestForceHoldIsTorqueOnly(unittest.TestCase):
+    """保力只下发前馈力矩（kp=kd=0）：力不随工件屈服而衰减。
+
+    保力帧带上位置刚度时，MIT 律里的 ``kp × (q - 实测位置)`` 会随夹爪位移变
+    化 —— 工件在设定力下让位，夹爪跟着走，这一项就从设定力里扣掉一截，现象
+    是「先夹到设定力，过一会儿掉到某个更小的值」。闭合侧约 0.0103 rad 的粘滑
+    死区每走一格，``hold_kp=150`` 就换算成约 15 N 的力误差。
+    """
+
+    # 工件：夹在行程中段的挡块，受载后持续让位
+    OBJECT_RAD = POS_OPEN_RAD + 0.5 * (POS_CLOSED_RAD - POS_OPEN_RAD)
+    YIELD_RAD_S = 0.05                  # ≈ 3.7 mm/s（RAD_TO_MM = 74.19）
+    YIELD_TAU_NM = 0.5                  # 载荷一过 0.5 Nm 就开始让位
+
+    def _motion(self, **kw):
+        return MotionConfig(sleep_fn=lambda _: None,
+                            monotonic_fn=tick_clock(0.1), **kw)
+
+    def _yielding_gripper(self):
+        return make_gripper(block_rad=self.OBJECT_RAD,
+                            yield_rad_s=self.YIELD_RAD_S,
+                            yield_tau_nm=self.YIELD_TAU_NM)
+
+    def test_a_yielding_workpiece_does_not_erode_the_hold_force(self):
+        g, fake = self._yielding_gripper()
+        g.motion_config = self._motion()
+        res = g.grasp(force_n=20.0, hold_s=0.4)
+
+        self.assertTrue(res.ok, res)
+        hold = [f for f in fake.frames if f.tau_ff == 2.0]      # 20 N → 2.0 Nm
+        self.assertTrue(hold, "没有保力帧")
+        # 工件一直在让位（夹爪被它带着往里走）—— 不然这条用例是空的
+        self.assertGreater(hold[-1].pos_after - hold[0].pos_after, 0.005)
+        # 让位再深，读到的力矩也得还是设定值
+        for f in hold:
+            self.assertAlmostEqual(f.tau_nm, 2.0, places=6)
+
+    def test_the_hold_frame_carries_no_gains(self):
+        # hold_kp / hold_kd 已废弃：显式设上也不该出现在保力帧里
+        g, fake = self._yielding_gripper()
+        g.motion_config = self._motion(hold_kp=300.0, hold_kd=9.0)
+        g.grasp(force_n=20.0, hold_s=0.4)
+
+        hold = [f for f in fake.frames if f.tau_ff == 2.0]
+        self.assertTrue(hold, "没有保力帧")
+        for f in hold:
+            self.assertEqual(f.kp, 0.0)
+            self.assertEqual(f.kd, 0.0)
+
+    def test_set_force_carries_no_gains(self):
+        g, fake = self._yielding_gripper()
+        fake.motor.pos = self.OBJECT_RAD            # 已经夹在工件上
+        g.set_force(20.0, duration=0.2)
+
+        self.assertTrue(fake.frames)
+        for f in fake.frames:
+            self.assertEqual(f.kp, 0.0)
+            self.assertEqual(f.kd, 0.0)
+            self.assertAlmostEqual(f.tau_nm, 2.0, places=6)
+        self.assertGreater(fake.motor.pos, self.OBJECT_RAD)     # 工件确实让位了
+
+
 class TestEnable(unittest.TestCase):
     """14：使能重试 / 真故障先清。"""
 
