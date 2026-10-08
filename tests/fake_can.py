@@ -4,6 +4,11 @@
 和故障注入。不建动力学、不建阻尼，``tau`` 只按 ``kp*(q - pos) + tau_ff``
 （限 ±10 Nm）报出来 —— 够用来守住「指令领先上限 ⇒ 力矩有界」这条逻辑，
 守不住真实动力学（那部分的数值来源是真机实测）。
+
+工件有两种：硬挡块（``block_rad``，顶住就不动），和受载后缓慢让位的工件
+（``yield_rad_s`` + ``yield_tau_nm`` —— 载荷过门槛就按给定速度退让，载荷掉回
+门槛以下就自己停）。后者用来守住「保力段不给增益，所以力不随工件屈服而衰减」
+这条逻辑。
 """
 
 from __future__ import annotations
@@ -66,13 +71,18 @@ class FakeMotor:
     def __init__(self, pos: float = 0.0, block_rad: Optional[float] = None,
                  sticky_rad: float = 0.0, err: int = 1,
                  limit_lo: Optional[float] = None,
-                 limit_hi: Optional[float] = None):
+                 limit_hi: Optional[float] = None,
+                 yield_rad_s: float = 0.0, yield_tau_nm: float = 0.0):
         self.pos = pos
         self.vel = 0.0
         self.tau = 0.0
         self.err = err
         self.block_rad = block_rad
         self.sticky_rad = sticky_rad
+        # 工件受载让位：在 block_rad 处被顶住、净力矩还在往里压、且大小过了
+        # yield_tau_nm 时，block_rad 按 yield_rad_s 朝受力方向退让。0 = 硬挡块。
+        self.yield_rad_s = yield_rad_s
+        self.yield_tau_nm = yield_tau_nm
         # 两端机械限位（真实夹爪本来就有）。block_rad 是单向的「障碍物」，
         # 用来模拟行程中途被挡住。
         self.limit_lo = limit_lo
@@ -113,6 +123,18 @@ class FakeMotor:
                 new = min(new, self.block_rad)
             else:
                 new = max(new, self.block_rad)
+            # 接触是保持的：只要本帧的净力矩还在朝工件压，已经顶在工件上的
+            # 夹爪就退不出来（真机上是工件把它顶住）。净力矩过了门槛时工件
+            # 还会朝受力方向持续让位，夹爪跟着走 —— 这就是「设定力下工件屈服」
+            # 那个工况。让位速度是给定的，不建动力学；载荷一掉回门槛以下就让
+            # 位自己停下来，所以它不会跑飞。
+            net = kp * (q - self.pos) + tau_ff
+            if self.pos == self.block_rad and self._block_dir * net > 0.0:
+                new = self.block_rad
+                if (self.yield_rad_s > 0.0
+                        and abs(net) >= self.yield_tau_nm):
+                    self.block_rad += self._block_dir * self.yield_rad_s * dt
+                    new = self.block_rad
         if self.limit_lo is not None:
             new = max(new, self.limit_lo)
         if self.limit_hi is not None:
@@ -130,10 +152,13 @@ class FakeLiteGripCAN:
                  sticky_rad: float = 0.0, err: int = 1,
                  initialize_results: Optional[List[bool]] = None,
                  limit_lo: Optional[float] = None,
-                 limit_hi: Optional[float] = None):
+                 limit_hi: Optional[float] = None,
+                 yield_rad_s: float = 0.0, yield_tau_nm: float = 0.0):
         self.motor = FakeMotor(pos=pos, block_rad=block_rad,
                                sticky_rad=sticky_rad, err=err,
-                               limit_lo=limit_lo, limit_hi=limit_hi)
+                               limit_lo=limit_lo, limit_hi=limit_hi,
+                               yield_rad_s=yield_rad_s,
+                               yield_tau_nm=yield_tau_nm)
         self.frames: List[Frame] = []
         self.initialize_results = list(initialize_results or [])
         self.initialize_calls = 0
@@ -229,6 +254,8 @@ def make_gripper(
     initialize_results: Optional[List[bool]] = None,
     stops: bool = False,
     reverse: bool = False,
+    yield_rad_s: float = 0.0,
+    yield_tau_nm: float = 0.0,
 ):
     """造一个「已连接、已使能、已标定」的 LiteGrip，底层换成 :class:`FakeLiteGripCAN`。
 
@@ -240,6 +267,10 @@ def make_gripper(
 
     ``stops=True`` 在两端装机械限位 —— 真夹爪本来就有，而 ``open``/``close``
     现在靠撞它来结束运动，所以这类用例必须开。
+
+    ``yield_rad_s`` / ``yield_tau_nm`` 把 ``block_rad`` 处的工件改成**会屈服**
+    的：被顶住且载荷过门槛就按 ``yield_rad_s`` 退让，用来复现「夹到工件后工件
+    缓慢让位」的保力场景。
 
     ``start_rad`` 默认停在张开侧（两种装法各自的那一端）。
 
@@ -262,7 +293,9 @@ def make_gripper(
                            sticky_rad=sticky_rad, err=err,
                            initialize_results=initialize_results,
                            limit_lo=LIMIT_LO_RAD if stops else None,
-                           limit_hi=LIMIT_HI_RAD if stops else None)
+                           limit_hi=LIMIT_HI_RAD if stops else None,
+                           yield_rad_s=yield_rad_s,
+                           yield_tau_nm=yield_tau_nm)
     g._can = fake
     g._connected = True
     g._enabled = True
