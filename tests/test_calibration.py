@@ -88,6 +88,68 @@ class TestDirectionTemplates(unittest.TestCase):
             abs(b.config.pos_closed_rad - b.config.pos_open_rad))
 
 
+class TestShippedCalibrationFiles(unittest.TestCase):
+    """随包发布的三个标定文件必须真的是出厂几何 —— 它们曾经一起漂掉。
+
+    三份文件各自独立，曾同时停在 ``0.0 / -1.651026 / 52.69``（另一台夹爪的
+    读数），而出厂值（litegrip-cpp 的 ``calibration/factory_calibration.json``）
+    是 ``0.052071 / -1.357481 / 61.01229326764816``。这里把出厂几何钉住，并
+    检查三份文件**互相一致**：只改一半（换了 ``rad_to_mm`` 忘了
+    ``travel_range_rad``）会让 ``open()`` 的行程算错，而单看一份文件看不出来。
+    """
+
+    # litegrip-cpp/calibration/factory_calibration.json
+    FACTORY_CLOSED_RAD = 0.052071        # zero_position_rad
+    FACTORY_OPEN_RAD = -1.357481         # max_position_rad
+    FACTORY_RAD_TO_MM = 61.01229326764816
+    FACTORY_TRAVEL_MM = 86.0
+
+    def _load(self, path):
+        with open(path) as f:
+            return json.load(f)
+
+    def test_the_shipped_geometry_is_the_factory_geometry(self):
+        data = self._load(_FACTORY_CALIB)
+        self.assertAlmostEqual(data["zero_position_rad"], self.FACTORY_CLOSED_RAD)
+        self.assertAlmostEqual(data["max_position_rad"], self.FACTORY_OPEN_RAD)
+        self.assertAlmostEqual(data["rad_to_mm"], self.FACTORY_RAD_TO_MM)
+        self.assertAlmostEqual(data["travel_range_rad"],
+                               self.FACTORY_CLOSED_RAD - self.FACTORY_OPEN_RAD)
+
+    def test_the_travel_is_the_real_86_mm(self):
+        data = self._load(_FACTORY_CALIB)
+        self.assertAlmostEqual(data["travel_range_rad"] * data["rad_to_mm"],
+                               self.FACTORY_TRAVEL_MM, places=6)
+
+    def test_the_work_stroke_stays_inside_the_travel(self):
+        data = self._load(_FACTORY_CALIB)
+        travel_mm = data["travel_range_rad"] * data["rad_to_mm"]
+        self.assertGreater(data["work_stroke_mm"], 0.0)
+        self.assertLess(data["work_stroke_mm"], travel_mm)
+
+    def test_the_factory_file_loads_with_the_factory_travel(self):
+        g = LiteGrip("can0")
+        self.assertTrue(g.load_calibration(_FACTORY_CALIB))
+        cfg = g.config
+        self.assertAlmostEqual(cfg.pos_closed_rad, self.FACTORY_CLOSED_RAD)
+        self.assertAlmostEqual(cfg.pos_open_rad, self.FACTORY_OPEN_RAD)
+        # 和 actions.py 里算行程的方式一致
+        travel_mm = abs(cfg.pos_open_rad - cfg.pos_closed_rad) * cfg.rad_to_mm
+        self.assertAlmostEqual(travel_mm, self.FACTORY_TRAVEL_MM)
+
+    def test_both_templates_carry_the_same_factory_geometry(self):
+        for name in ("normal", "reverse"):
+            with self.subTest(template=name):
+                data = self._load(CALIB_TEMPLATES[name])
+                self.assertAlmostEqual(data["rad_to_mm"], self.FACTORY_RAD_TO_MM)
+                self.assertAlmostEqual(
+                    data["travel_range_rad"],
+                    self.FACTORY_CLOSED_RAD - self.FACTORY_OPEN_RAD)
+                self.assertEqual(
+                    sorted([data["zero_position_rad"], data["max_position_rad"]]),
+                    sorted([self.FACTORY_OPEN_RAD, self.FACTORY_CLOSED_RAD]))
+
+
 class TestPersistence(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
