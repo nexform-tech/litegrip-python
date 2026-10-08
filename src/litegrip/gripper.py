@@ -1842,11 +1842,11 @@ class LiteGrip:
         kp: Optional[float] = None,
         kd: Optional[float] = None,
         align: bool = True,
-        align_speed_mm_s: float = DEFAULT_ALIGN_SPEED_MM_S,
+        align_speed_mm_s: float = DEFAULT_ALIGN_SPEED_MM_S,   # [遥操对齐块]
         watchdog_s: float = 0.2,
         dq_max: float = DEFAULT_DQ_MAX,
         torque_limit_nm: float = DEFAULT_TORQUE_LIMIT_NM,
-        lead_cap_mm: float = DEFAULT_LEAD_CAP_MM,
+        lead_cap_mm: float = DEFAULT_LEAD_CAP_MM,             # [遥操对齐块]
         require_ready: bool = True,
         ready_timeout_s: float = DEFAULT_READY_TIMEOUT_S,
         ready_tolerance_mm: float = DEFAULT_READY_TOLERANCE_MM,
@@ -1974,9 +1974,9 @@ class LiteGrip:
             manager = GripperTeleop(
                 self, transport, mode, key,
                 rate_hz=rate_hz, kp=kp, kd=kd, align=align,
-                align_speed_mm_s=align_speed_mm_s,
+                align_speed_mm_s=align_speed_mm_s,                      # [遥操对齐块]
                 watchdog_s=watchdog_s, dq_max=dq_max,
-                torque_limit_nm=torque_limit_nm, lead_cap_mm=lead_cap_mm,
+                torque_limit_nm=torque_limit_nm, lead_cap_mm=lead_cap_mm,  # [遥操对齐块]
                 ready_topic=ready_key, require_ready=require_ready,
                 ready_timeout_s=ready_timeout_s,
                 ready_tolerance_mm=ready_tolerance_mm,
