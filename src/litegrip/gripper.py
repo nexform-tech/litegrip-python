@@ -41,6 +41,7 @@ from .actions import (
     MotionConfig,
     MoveProgress,
     MoveResult,
+    _toward,
 )
 from .teleop import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX, DEFAULT_GRIP_ID,
                      DEFAULT_GRIP_PORT, DEFAULT_LEAD_CAP_MM,
@@ -1358,6 +1359,16 @@ class LiteGrip:
         ``rad_to_mm``, a jaw creeping at 3 mm/s lost about 15 N of a 20 N
         setting.
 
+        The torque is ramped to the setpoint at a fixed rate
+        (:attr:`MotionConfig.force_ramp_n_s`, newtons per second), starting
+        from the torque already in flight.  Stepping to the setpoint in one
+        frame is an impulse through the mechanism, and the fingers bounce off
+        what they just touched; the ramp makes the force climb evenly where a
+        gain-based or duration-based ramp would lead with a step.  The climb
+        takes ``force_n / force_ramp_n_s`` seconds, so give ``duration`` at
+        least that long for the force to land on the setpoint — a shorter call
+        stops partway and a follow-up call continues from where it got to.
+
         Args:
             force_n: Target force in newtons.
             duration: Hold time in seconds.
@@ -1369,16 +1380,26 @@ class LiteGrip:
 
         # Squeezing may mean increasing or decreasing rad depending on the
         # mount; close_sign carries that.
-        tau_nm = self._config.close_sign * force_n * UnitConversion.N_TO_NM
+        target_nm = self._config.close_sign * force_n * UnitConversion.N_TO_NM
         current_pos = self._can.get_position()
 
+        motion = self.motion_config
+        step_nm = (motion.force_ramp_n_s * motion.frame_interval
+                   * UnitConversion.N_TO_NM)
+        in_flight = self._can.get_torque()
+        # Entering force mode: continue from the torque in flight so the
+        # transition is continuous.  Torque already past the setpoint starts at
+        # the setpoint — that step goes down, so it is not an impulse.
+        tau_cmd = in_flight if abs(in_flight) < abs(target_nm) else target_nm
+        frames = max(1, int(round(duration / motion.frame_interval)))
+
         try:
-            return self._can.control_mit_stream(
-                q_target=current_pos,
-                kp=0.0, kd=0.0,
-                duration_s=duration,
-                tau_feedforward=tau_nm,
-            )
+            for _ in range(frames):
+                tau_cmd = _toward(tau_cmd, target_nm, step_nm)
+                if not self.send_mit_frame(current_pos, 0.0, 0.0, tau=tau_cmd):
+                    return False
+                motion.sleep_fn(motion.frame_interval)
+            return True
         except Exception as e:
             raise CommError(f"力控失败: {e}")
 

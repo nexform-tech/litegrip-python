@@ -116,6 +116,13 @@ class MotionConfig:
     # 的粘滑死区一动），``kp × 位移`` 就从设定力里扣掉一截，现象是「先夹到
     # 设定力，过一会儿掉下来」。推导与代价见 GripperActions._hold_force。
     force_n: float = 20.0               # 默认夹持力 N（= 2.0 Nm）
+    # 保力力矩的**爬升速率** N/s：保力从进入时飞行中的力矩按这个速率爬到设定值，
+    # 而不是一步跳过去、也不是按指数逼近（指数只是把阶跃抹开，第一拍最陡）。一步
+    # 踏进接触里就是隔着机构的一次冲击，指爪会被刚碰到的东西弹开；按速率爬升才是
+    # 「力均匀地涨、到了设定值就停」。20 N/s 下，从压紧的约 10 N 交接到 20 N 设定值
+    # 要半秒，设定值最大到额定 40 N 要两秒。和 console（litegrip-studio）同一个数、
+    # 同一个单位，两边保持同步。
+    force_ramp_n_s: float = 20.0        # 保力爬升速率 N/s
     hold_interval: float = 0.2          # 保力分片时长 s
     # [Deprecated] 保力不再用增益（见上）。留着只为兼容老配置，设了也不生效。
     hold_kp: float = 150.0              # 已废弃：保力刚度
@@ -354,6 +361,17 @@ def work_limit_target(
 # ═══════════════════════════════════════════════════════════════════════════
 # 动作层
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _toward(value: float, target: float, step: float) -> float:
+    """把 ``value`` 朝 ``target`` 挪最多 ``step``，并且**正好落在** ``target`` 上。
+
+    落在靶点上、而不是逼近它，是关键：只按剩余距离的某个比例前进的斜坡永远到不了
+    终点，而保力的结果，操作者就是按它最终停在的数值来读的。
+    """
+    if value < target:
+        return min(value + step, target)
+    return max(value - step, target)
+
 
 class GripperActions:
     """夹爪的六个动作：``open`` / ``close`` / ``grasp`` / ``zero`` /
@@ -742,15 +760,25 @@ class GripperActions:
     ) -> Tuple[bool, int, Optional[GripperState]]:
         """持续输出夹持力：整段只下发前馈力矩。
 
-        每片 :attr:`MotionConfig.hold_interval` 下发同一个 ``tau = force_n × 0.1``
-        Nm，回读一次状态查故障。帧里 ``kp=kd=0`` —— 保力要的是**力**，而 MIT
-        律里 ``kp × (q - 实测位置)`` 与 ``kd × (0 - 实测速度)`` 都随夹爪的位置
-        和速度变化：工件在设定力下让位（或闭合侧约 0.010 rad 的粘滑死区走一
-        格），实测位置就往前挪，``kp × 位移`` 立刻从前馈里扣掉一截，读数表现
-        为「先夹到设定力，过一会儿掉到某个更小的值」。上一版锚在 200 ms 前的
-        位置读数上、``kp=150``，工件以 3 mm/s 让位就能把 20 N 读成 5 N。所以
-        **不要**为了「顶得更硬」把增益加回来；:attr:`MotionConfig.hold_kp` /
-        :attr:`MotionConfig.hold_kd` 已废弃，设了也不生效。
+        帧里 ``kp=kd=0`` —— 保力要的是**力**，而 MIT 律里 ``kp × (q - 实测位置)``
+        与 ``kd × (0 - 实测速度)`` 都随夹爪的位置和速度变化：工件在设定力下让位
+        （或闭合侧约 0.010 rad 的粘滑死区走一格），实测位置就往前挪，``kp × 位移``
+        立刻从前馈里扣掉一截，读数表现为「先夹到设定力，过一会儿掉到某个更小的
+        值」。上一版锚在 200 ms 前的位置读数上、``kp=150``，工件以 3 mm/s 让位就能
+        把 20 N 读成 5 N。所以**不要**为了「顶得更硬」把增益加回来；
+        :attr:`MotionConfig.hold_kp` / :attr:`MotionConfig.hold_kd` 已废弃，设了也不
+        生效。
+
+        力矩不是一步跳到设定值，而是按 :attr:`MotionConfig.force_ramp_n_s`
+        （N/s）从**进入保力时飞行中的力矩**爬上去，且每下发一帧走一步、正好落在
+        设定值上。这一步不是可有可无的：交接时电机的力矩本就带着闭合压紧量
+        （真机上约 10 N），一步跳到设定值就是隔着机构的一次冲击，指爪会被刚碰到
+        的东西弹开 —— 现场看到的是「夹爪停在 10 N，然后跳到 20 N，边跳边往里
+        收」。从飞行值开始爬，交接是连续的；爬升率是常量，力就是均匀地涨。定的是
+        **速率**不是时长：按时长定的斜坡第一拍最陡，等于带慢尾的阶跃。
+
+        每片 :attr:`MotionConfig.hold_interval` 回读一次状态查故障（一帧一步的爬升
+        都在片内完成，见上面的速率）。
 
         代价：零增益下夹爪可以被外力推动，夹到空载时也会一路顶到机械限位
         （和 ``close()`` 的压紧段一样，只是力矩小得多）。
@@ -764,20 +792,27 @@ class GripperActions:
         g = self._g
         # 夹紧方向的力矩符号随安装方向翻转：正装时 rad 增大是闭合，
         # 反装时反过来。力矩大小不变，只是要让前馈往「夹」而不是「撑」。
-        tau_nm = g.config.close_sign * force_n * UnitConversion.N_TO_NM
+        target_nm = g.config.close_sign * force_n * UnitConversion.N_TO_NM
 
         deadline = None if hold_s <= 0 else cfg.monotonic_fn() + hold_s
         frames_per_slice = max(1, int(round(cfg.hold_interval
                                             / cfg.frame_interval)))
+        # 一帧一步。一片是 frames_per_slice 帧，只在片首走一步的话，20 N/s 在 0.2 s
+        # 的片里就成了 4 N 一级的台阶，不是爬升。
+        step_nm = cfg.force_ramp_n_s * cfg.frame_interval * UnitConversion.N_TO_NM
         cycles = 0
         st = g.get_state()
         pos = st.position_rad
+        # 进入保力：从飞行中的力矩接着爬，交接才连续。飞行力矩已经越过设定值时
+        # 直接从设定值起步（那一步是往下走到设定值，不是往上，不构成冲击）。
+        tau_cmd = st.torque_nm if abs(st.torque_nm) < abs(target_nm) else target_nm
 
         while deadline is None or cfg.monotonic_fn() < deadline:
             # 用上一次读到的位置当 q 下发（kp=0 时 q 不产生任何力，只是给下游
-            # 一个不越位的指令），再回读状态查故障
+            # 一个不越位的指令），每帧把力矩朝设定值推一步，再回读状态查故障
             for _ in range(frames_per_slice):
-                self._emit(pos, 0.0, tau_nm, kp=0.0, kd=0.0)
+                tau_cmd = _toward(tau_cmd, target_nm, step_nm)
+                self._emit(pos, 0.0, tau_cmd, kp=0.0, kd=0.0)
             cycles += 1
 
             st = g.get_state()

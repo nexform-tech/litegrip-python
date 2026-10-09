@@ -466,14 +466,141 @@ class TestForceHoldIsTorqueOnly(unittest.TestCase):
     def test_set_force_carries_no_gains(self):
         g, fake = self._yielding_gripper()
         fake.motor.pos = self.OBJECT_RAD            # 已经夹在工件上
-        g.set_force(20.0, duration=0.2)
+        # 时长给够，让爬升能落到设定值（力矩从 0 起步要 20 N ÷ 20 N/s = 1.0 s）
+        g.set_force(20.0, duration=1.0)
 
         self.assertTrue(fake.frames)
         for f in fake.frames:
             self.assertEqual(f.kp, 0.0)
             self.assertEqual(f.kd, 0.0)
-            self.assertAlmostEqual(f.tau_nm, 2.0, places=6)
+        # 从飞行力矩（这里恒为 0）按固定速率爬，末帧正好落在 2.0 Nm
+        self.assertAlmostEqual(fake.frames[0].tau_nm, 0.01, places=9)
+        self.assertAlmostEqual(fake.frames[-1].tau_nm, 2.0, places=6)
         self.assertGreater(fake.motor.pos, self.OBJECT_RAD)     # 工件确实让位了
+
+
+class TestHeldForceRampsToSetpoint(unittest.TestCase):
+    """保力力矩按固定速率（force_ramp_n_s，N/s）从飞行力矩爬到设定值。
+
+    旧行为是一步跳到设定值：交接时电机力矩里还带着闭合压紧量（真机上约 10 N），
+    一帧跳到 20 N 就是隔着机构的一次冲击，指爪会被刚碰到的东西弹开 —— 现场看到
+    「停在 10 N，然后跳到 20 N，边跳边往里收」。斜坡要的是「力均匀地涨、到了设定
+    值就停」，而且必须**每帧**走一步、正好落在设定值上。
+
+    为了让交接处飞行力矩（约 10 N）低于设定值（20 N），把行进段领先上限收到
+    ``max_lead_mm=0.74``：``kp × 上限 ≈ 0.997 Nm ≈ 10 N``，真机上的量级。
+    """
+
+    #: 工件：行程中段的硬挡块（不移位，专注看力矩的形状）
+    OBJECT_RAD = POS_OPEN_RAD + 0.5 * (POS_CLOSED_RAD - POS_OPEN_RAD)
+    #: kp=100 × 0.74/74.19 ≈ 1.0 Nm ≈ 10 N 的压紧力
+    PRESS_LEAD_MM = 0.74
+    #: force_ramp_n_s × frame_interval × 0.1 Nm/N = 20 × 0.005 × 0.1
+    STEP_NM = 20.0 * DT * 0.1
+    FRAMES_PER_SLICE = 40                       # hold_interval 0.2 ÷ frame_interval 0.005
+
+    def _motion(self, **kw):
+        return MotionConfig(max_lead_mm=self.PRESS_LEAD_MM,
+                            sleep_fn=lambda _: None,
+                            monotonic_fn=tick_clock(0.1), **kw)
+
+    def _grasp(self, hold_s=0.6, force_n=20.0, **motion_kw):
+        g, fake = make_gripper(block_rad=self.OBJECT_RAD)
+        g.motion_config = self._motion(**motion_kw)
+        res = g.grasp(force_n=force_n, hold_s=hold_s)
+        move = [f for f in fake.frames if f.kp != 0.0]     # 闭合段：带位置刚度
+        hold = [f for f in fake.frames if f.kp == 0.0]     # 保力段：纯前馈
+        return g, fake, res, move, hold
+
+    def test_the_climb_starts_from_the_torque_in_flight(self):
+        _g, _fake, _res, move, hold = self._grasp()
+
+        in_flight = move[-1].tau_nm
+        # 交接处的飞行力矩就是压紧力，低于设定值 —— 否则这条用例证明不了爬升
+        self.assertAlmostEqual(in_flight, 1.0, places=1)
+        # 第一帧 = 飞行力矩 + 一步，而不是直接就是设定值
+        self.assertAlmostEqual(hold[0].tau_ff, in_flight + self.STEP_NM, places=9)
+        self.assertLess(hold[0].tau_ff, 2.0)
+
+    def test_every_climbing_frame_adds_the_same_amount(self):
+        _g, _fake, _res, _move, hold = self._grasp()
+
+        climb = [f.tau_ff for f in hold if f.tau_ff < 2.0]
+        self.assertGreater(len(climb), 1)
+        for a, b in zip(climb, climb[1:]):
+            self.assertAlmostEqual(b - a, self.STEP_NM, places=9)
+
+    def test_it_lands_exactly_on_the_setpoint_and_stays(self):
+        _g, _fake, _res, _move, hold = self._grasp()
+
+        # 设定值 20 N = 2.0 Nm；爬到位之后每一帧都停在上面
+        landed = [i for i, f in enumerate(hold) if f.tau_ff >= 2.0]
+        self.assertTrue(landed, "没有一帧到达设定值")
+        for f in hold[landed[0]:]:
+            self.assertAlmostEqual(f.tau_ff, 2.0, places=9)
+
+    def test_the_climb_is_linear_in_time(self):
+        _g, _fake, _res, _move, hold = self._grasp()
+
+        climb = [f.tau_ff for f in hold if f.tau_ff < 2.0]
+        self.assertGreater(len(climb), 10)
+        start = climb[0] - self.STEP_NM
+        total = 2.0 - start
+        # 逐帧等步长就是线性：第 k 帧 = 起点 + (k+1) 步
+        for k in range(0, len(climb), 7):
+            self.assertAlmostEqual(climb[k], start + (k + 1) * self.STEP_NM,
+                                   places=9)
+        # 爬到一半：一半的帧数对应一半的升幅。被替换掉的指数（时间常数 0.05 s）
+        # 在这已经到顶了，这里必须还在半路。
+        mid = len(climb) // 2
+        self.assertLessEqual(
+            abs(climb[mid] - (start + total / 2)), self.STEP_NM + 1e-9)
+        self.assertLess(climb[mid], start + 0.7 * total)
+
+    def test_advancing_once_per_frame_not_once_per_slice(self):
+        _g, _fake, _res, _move, hold = self._grasp()
+
+        # 一片 40 帧只在片首走一步的话，0.2 s 的片会一次涨 4 N（0.4 Nm）—— 台阶。
+        # 逐帧走，片内相邻两帧只差一步。
+        within_slice = hold[1].tau_ff - hold[0].tau_ff
+        self.assertAlmostEqual(within_slice, self.STEP_NM, places=9)
+        self.assertNotAlmostEqual(within_slice,
+                                  self.STEP_NM * self.FRAMES_PER_SLICE, places=9)
+
+    def test_a_torque_already_past_the_setpoint_starts_at_the_setpoint(self):
+        # 默认行进上限（4 mm）下压紧力矩 ≈ 5.4 Nm，远超 20 N 的设定值：没有可爬
+        # 的，直接从设定值起步 —— 往下走到设定值不是冲击。
+        g, fake = make_gripper(block_rad=self.OBJECT_RAD)
+        g.motion_config = MotionConfig(sleep_fn=lambda _: None,
+                                       monotonic_fn=tick_clock(0.1))
+        g.grasp(force_n=20.0, hold_s=0.4)
+
+        move = [f for f in fake.frames if f.kp != 0.0]
+        hold = [f for f in fake.frames if f.kp == 0.0]
+        self.assertGreater(move[-1].tau_nm, 2.0)
+        self.assertAlmostEqual(hold[0].tau_ff, 2.0, places=9)
+
+
+class TestSetForceRampsToo(unittest.TestCase):
+    """``set_force`` 是另一条下发恒定前馈力矩的保力路径，同样按时率爬。"""
+
+    def test_the_climb_starts_from_the_torque_in_flight_and_lands(self):
+        g, fake = make_gripper()
+        g.motion_config = MotionConfig(sleep_fn=lambda _: None,
+                                       monotonic_fn=tick_clock(0.1))
+        fake.motor.tau = 1.0                         # 交接时飞行力矩 1.0 Nm
+        g.set_force(20.0, duration=1.0)
+
+        step = 20.0 * DT * 0.1                       # 0.01 Nm/帧
+        taus = [f.tau_ff for f in fake.frames]
+        self.assertAlmostEqual(taus[0], 1.0 + step, places=9)
+        # 从 1.0 爬到 2.0 要 100 帧；之后一直停在 2.0
+        self.assertAlmostEqual(taus[99], 2.0, places=9)
+        for tau in taus[99:]:
+            self.assertAlmostEqual(tau, 2.0, places=9)
+        for f in fake.frames:
+            self.assertEqual(f.kp, 0.0)
+            self.assertEqual(f.kd, 0.0)
 
 
 class TestEnable(unittest.TestCase):

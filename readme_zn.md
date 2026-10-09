@@ -291,7 +291,7 @@ python3 examples/trajectory.py --play pick --repeat 3
 | --- | --- | --- |
 | `open(speed_mm_s=None)` | 按斜坡**越过**标定的张开侧限位，由机械限位结束这趟运动。 | `MoveResult` |
 | `close(speed_mm_s=None)` | 同上，朝闭合侧。 | `MoveResult` |
-| `grasp(force_n=None, hold_s=0.0)` | 闭合到堵转（即夹住），然后持续输出 `force_n`。`hold_s=0` 表示不限时长。 | `GraspResult` |
+| `grasp(force_n=None, hold_s=0.0)` | 闭合到堵转（即夹住），然后爬到并持续输出 `force_n`。`hold_s=0` 表示不限时长。 | `GraspResult` |
 | `zero()` | 完整标定：探测两端机械限位，算出行程与 `rad_to_mm`，并存盘。它沿用已加载标定声明的方向 —— 堵转分不出撞到的是哪一端。 | `CalibrationData` |
 | `enable(retries=None)` | 下发使能并回读状态帧，反复重试直到回读到 `err == 1`。 | `EnableResult` |
 | `disable()` | 失能电机（零力矩，可用手推动）。 | `bool` |
@@ -349,6 +349,7 @@ with LiteGrip("can0") as gripper:
 | `stop_lead_mm` | `0.7` | 压紧段的领先上限，压紧力矩约 `kp × stop_lead_mm` |
 | `stop_tol` | `0.02` | 停稳位置距标定限位多近才算顶到位 rad |
 | `force_n` | `20.0` | `grasp` 默认夹持力 |
+| `force_ramp_n_s` | `20.0` | 保力力矩爬到设定值的速率 N/s |
 | `hold_interval` | `0.2` | 保力的分片时长 s |
 | `hold_kp` / `hold_kd` | `150.0` / `2.0` | 已废弃 —— 保力不用增益，设了也不生效 |
 | `enable_retries` / `enable_retry_interval` | `3` / `0.2` | 使能重试次数与间隔 |
@@ -420,6 +421,14 @@ with LiteGrip("can0") as gripper:
   为了「顶得更硬」加增益 —— 夹爪一动，`kp × (q - 实测位置)` 就变成力误差，`kp = 150`
   时闭合侧约 `0.0103 rad` 的粘滑一格就是约 `15 N`。`hold_kp` / `hold_kd` 以前正是干
   这个的，现在已经不生效。
+- **保力力矩是爬上去的，不是一步跳上去的。** 进入保力时，力矩按 `force_ramp_n_s`
+  （20 N/s）从**飞行中的力矩** —— 也就是闭合压紧量，真机上约 `10 N` —— 每帧走一步爬
+  到设定值，正好落在设定值上，而不是逼近它。一步踏进接触里就是隔着机构的一次冲击，
+  指爪会被刚碰到的东西弹开；按速率爬，力才是均匀地涨。20 N/s 下，从约 `10 N` 的压紧
+  力交接到 `20 N` 设定值要半秒，设定值最大到额定 `40 N` 要两秒。**不要**把爬升改写成
+  「时长」：按时长定的斜坡第一拍最陡，等于带慢尾的阶跃。`set_force` 的时长是有界的，
+  所以 `duration` 至少要给到 `force_n / force_ramp_n_s` 秒才能落到设定值；给短了会停在
+  半路，再调一次会从到达的地方接着爬。
 - **`enable` 是单向命令，所以要校验。** 使能只是一帧 CAN，没有确认，丢帧了也不会报错，
   电机就静默地没使能。所以 `enable()` 下发后会回读状态帧，只有 `err == 1` 才算成功，
   最多重试 `enable_retries` 次，遇到真实故障会先清故障再重试。
