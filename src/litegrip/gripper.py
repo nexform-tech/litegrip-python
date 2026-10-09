@@ -1365,13 +1365,21 @@ class LiteGrip:
         frame is an impulse through the mechanism, and the fingers bounce off
         what they just touched; the ramp makes the force climb evenly where a
         gain-based or duration-based ramp would lead with a step.  The climb
-        takes ``force_n / force_ramp_n_s`` seconds, so give ``duration`` at
-        least that long for the force to land on the setpoint — a shorter call
-        stops partway and a follow-up call continues from where it got to.
+        takes ``force_n / force_ramp_n_s`` seconds.
+
+        ``duration`` is the hold time **after** the climb, not a budget that
+        includes it: the call ramps to the setpoint, holds there for
+        ``duration`` seconds, then returns.  Its wall clock is therefore
+        ``climb + duration`` — a ``set_force(20.0)`` from a released grip at
+        the default ``duration=0.3`` blocks for about ``1.0 s + 0.3 s = 1.3 s``
+        where it used to be just ``0.3 s``.  The force always lands on the
+        setpoint, so a short ``duration`` still gets the full force; it only
+        shortens the hold.  ``duration=0`` means "ramp to the setpoint and
+        return" — the climb still completes.
 
         Args:
             force_n: Target force in newtons.
-            duration: Hold time in seconds.
+            duration: Hold time in seconds after the ramp, ``0`` to just ramp.
         """
         self._check_connected()
         self._check_enabled()
@@ -1391,11 +1399,24 @@ class LiteGrip:
         # transition is continuous.  Torque already past the setpoint starts at
         # the setpoint — that step goes down, so it is not an impulse.
         tau_cmd = in_flight if abs(in_flight) < abs(target_nm) else target_nm
-        frames = max(1, int(round(duration / motion.frame_interval)))
+
+        # 爬升要几帧：从飞行力矩逐帧朝设定值走，走到就是几帧。已经在设定值
+        # （或已越过）时是 0 帧 —— 不加多余的一帧。
+        climb_frames = 0
+        probe = tau_cmd
+        if step_nm > 0.0:
+            while probe != target_nm:
+                probe = _toward(probe, target_nm, step_nm)
+                climb_frames += 1
+        # duration 是爬到设定值以后**继续保力**的时间，不含爬升本身。
+        hold_frames = max(0, int(round(duration / motion.frame_interval)))
 
         try:
-            for _ in range(frames):
-                tau_cmd = _toward(tau_cmd, target_nm, step_nm)
+            for i in range(climb_frames + hold_frames):
+                if i < climb_frames:
+                    tau_cmd = _toward(tau_cmd, target_nm, step_nm)
+                else:
+                    tau_cmd = target_nm
                 if not self.send_mit_frame(current_pos, 0.0, 0.0, tau=tau_cmd):
                     return False
                 # Drain incoming frames between sends, the way

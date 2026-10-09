@@ -582,7 +582,11 @@ class TestHeldForceRampsToSetpoint(unittest.TestCase):
 
 
 class TestSetForceRampsToo(unittest.TestCase):
-    """``set_force`` 是另一条下发恒定前馈力矩的保力路径，同样按时率爬。"""
+    """``set_force`` 是另一条下发恒定前馈力矩的保力路径，同样按时率爬。
+
+    ``duration`` 是**爬到设定值之后**继续保力的时间，不含爬升本身，所以调用的
+    墙钟是 ``climb + duration``；已经在设定值上时爬升为 0 帧，调用就是 ``duration``。
+    """
 
     def test_the_climb_starts_from_the_torque_in_flight_and_lands(self):
         g, fake = make_gripper()
@@ -602,15 +606,64 @@ class TestSetForceRampsToo(unittest.TestCase):
             self.assertEqual(f.kp, 0.0)
             self.assertEqual(f.kd, 0.0)
 
+    def test_the_call_ramps_then_holds_for_duration(self):
+        # duration 保的是**爬升之后**的时间：先把 1.0 Nm 爬 100 帧到设定值，
+        # 再到 20 N 上保 0.3 s（60 帧）。墙钟因此是 climb + duration。
+        g, fake = make_gripper()
+        g.motion_config = MotionConfig(sleep_fn=lambda _: None,
+                                       monotonic_fn=tick_clock(0.1))
+        fake.motor.tau = 1.0                         # 交接时飞行力矩 1.0 Nm
+        g.set_force(20.0, duration=0.3)
+
+        taus = [f.tau_ff for f in fake.frames]
+        climb = 100                                  # 1.0 Nm ÷ 0.01 Nm/帧
+        hold = int(round(0.3 / DT))                  # 60 帧
+        self.assertEqual(len(taus), climb + hold)
+        # 爬升最后一帧正好落到设定值（2.0 Nm），其后每一帧都停在上面 ——
+        # 设定值上的帧数 = 1 帧落点 + duration 的保力帧
+        first_at = taus.index(2.0)
+        self.assertEqual(first_at, climb - 1)
+        self.assertTrue(all(t == 2.0 for t in taus[first_at:]))
+        self.assertEqual(len(taus[first_at:]), hold + 1)
+
+    def test_a_call_already_at_the_setpoint_is_just_the_hold(self):
+        # 飞行力矩已在设定值上（或已越过）：没有可爬的，爬升 0 帧，调用就是
+        # duration —— 不能为爬升多补一帧。
+        for in_flight in (2.0, 3.0):
+            with self.subTest(in_flight=in_flight):
+                g, fake = make_gripper()
+                g.motion_config = MotionConfig(
+                    sleep_fn=lambda _: None, monotonic_fn=tick_clock(0.1))
+                fake.motor.tau = in_flight
+                g.set_force(20.0, duration=0.3)
+
+                taus = [f.tau_ff for f in fake.frames]
+                self.assertEqual(len(taus), int(round(0.3 / DT)))    # 60 帧
+                for tau in taus:
+                    self.assertAlmostEqual(tau, 2.0, places=9)
+
+    def test_duration_zero_still_completes_the_climb(self):
+        # duration=0 表示「爬到设定值就返回」：爬升照样要爬完，只是不保力。
+        g, fake = make_gripper()
+        g.motion_config = MotionConfig(sleep_fn=lambda _: None,
+                                       monotonic_fn=tick_clock(0.1))
+        fake.motor.tau = 1.0
+        g.set_force(20.0, duration=0.0)
+
+        taus = [f.tau_ff for f in fake.frames]
+        self.assertEqual(len(taus), 100)             # 全是爬升帧，没有保力帧
+        self.assertAlmostEqual(taus[0], 1.01, places=9)
+        self.assertAlmostEqual(taus[-1], 2.0, places=9)
+
     def test_it_polls_once_per_emitted_frame(self):
         # 换掉 control_mit_stream 时不能把每帧的 poll 也丢了 —— 那是整段调用里唯一
         # 收状态帧的地方（control_mit → poll → sleep）。假总线只数 poll 次数。
         g, fake = make_gripper()
         g.motion_config = MotionConfig(sleep_fn=lambda _: None,
                                        monotonic_fn=tick_clock(0.1))
-        g.set_force(20.0, duration=0.2)              # 40 帧
+        g.set_force(20.0, duration=0.2)              # 200 帧爬升 + 40 帧保力
 
-        self.assertEqual(len(fake.frames), 40)
+        self.assertEqual(len(fake.frames), 240)
         self.assertEqual(fake.poll_calls, len(fake.frames))
 
 

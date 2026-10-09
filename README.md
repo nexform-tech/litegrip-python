@@ -490,9 +490,14 @@ Worth reading if a gripper is behaving oddly.
   force climb evenly. At 20 N/s a hand-over from a ~`10 N` press reaches a `20 N` setpoint
   in half a second, and a setpoint moved to at most the rated `40 N` takes two. Do not
   specify the climb as a *duration* instead: a duration-shaped ramp is at its steepest in
-  its first tick, which is a step with a slow tail. `set_force` is bounded by its
-  `duration`, so give it at least `force_n / force_ramp_n_s` seconds to land — a shorter
-  call stops partway and a follow-up call continues from where it got to.
+  its first tick, which is a step with a slow tail.
+- **`set_force`'s `duration` is the hold time after the climb, not a budget that includes
+  it.** The call ramps to the setpoint, holds there for `duration` seconds, then returns,
+  so its wall clock is `climb + duration`. From a released grip at the default
+  `duration=0.3`, `set_force(20.0)` climbs for about `1.0 s` and then holds `0.3 s`, so it
+  blocks for about `1.3 s` where it used to be just `0.3 s`. The force always lands on the
+  setpoint, so a short `duration` still gets the full force — it only shortens the hold.
+  `duration=0` ramps to the setpoint and returns without holding.
 - **`enable` is a verified one-way command.** Enabling sends a CAN frame with no
   acknowledgement, so a dropped frame goes unnoticed and the motor silently stays disabled.
   `enable()` therefore sends it, re-reads the status frame, and reports success only when
