@@ -602,6 +602,17 @@ class TestSetForceRampsToo(unittest.TestCase):
             self.assertEqual(f.kp, 0.0)
             self.assertEqual(f.kd, 0.0)
 
+    def test_it_polls_once_per_emitted_frame(self):
+        # 换掉 control_mit_stream 时不能把每帧的 poll 也丢了 —— 那是整段调用里唯一
+        # 收状态帧的地方（control_mit → poll → sleep）。假总线只数 poll 次数。
+        g, fake = make_gripper()
+        g.motion_config = MotionConfig(sleep_fn=lambda _: None,
+                                       monotonic_fn=tick_clock(0.1))
+        g.set_force(20.0, duration=0.2)              # 40 帧
+
+        self.assertEqual(len(fake.frames), 40)
+        self.assertEqual(fake.poll_calls, len(fake.frames))
+
 
 class TestEnable(unittest.TestCase):
     """14：使能重试 / 真故障先清。"""

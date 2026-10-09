@@ -1398,6 +1398,11 @@ class LiteGrip:
                 tau_cmd = _toward(tau_cmd, target_nm, step_nm)
                 if not self.send_mit_frame(current_pos, 0.0, 0.0, tau=tau_cmd):
                     return False
+                # Drain incoming frames between sends, the way
+                # ``control_mit_stream`` did (control_mit, poll, sleep): without
+                # the poll nothing reads the drive's status frames for the
+                # whole call.
+                self.poll(timeout_s=0.0)
                 motion.sleep_fn(motion.frame_interval)
             return True
         except Exception as e:
