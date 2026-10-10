@@ -1219,17 +1219,19 @@ class LiteGrip:
         """Open the gripper.
 
         By default a continuous ramp (velocity feed-forward, one frame per
-        :attr:`MotionConfig.frame_interval`) that drives *past* the calibrated
-        open limit and lets the mechanical stop end the move. The command lead
-        is narrowed to :attr:`MotionConfig.stop_lead_mm` inside
-        :attr:`MotionConfig.press_zone_mm` of the limit, so the pressing
-        torque stays around ``kp × stop_lead_mm``.
+        :attr:`MotionConfig.frame_interval`) toward the open end. The command
+        lead is narrowed to :attr:`MotionConfig.stop_lead_mm` inside
+        :attr:`MotionConfig.press_zone_mm` of the limit, and every emitted
+        command position is capped at the calibrated travel, so the jaw stops
+        on the calibrated open limit and is never driven past it. That cap is
+        what makes a stale calibration, or a mechanical stop that is not where
+        the calibration says, bound the travel instead of letting the jaw run
+        on. The move ends on stall detection.
 
         When the config carries a **work stroke** (:attr:`GripperConfig.work_stroke_mm`
         set and smaller than the mechanical travel) it stops there instead — a
-        plain move to that position that never presses the open stop, leaving a
-        margin at the open end.  ``MoveResult.ok`` is then ``reached and not
-        stalled``.
+        plain move to that position, leaving a margin at the open end.
+        ``MoveResult.ok`` is then ``reached and not stalled``.
 
         Args:
             speed_mm_s: Opening speed; ``None`` = ``MotionConfig.speed_mm_s``.
@@ -1238,10 +1240,10 @@ class LiteGrip:
 
         Returns:
             :class:`~litegrip.actions.MoveResult` — with no work stroke, truthy
-            when it pressed onto the stop (``stalled`` and parked within
-            :attr:`MotionConfig.stop_tol` of the limit); stalling far from the
-            limit means something blocked the travel, and is falsy.  With a work
-            stroke, truthy when it reached the work position.
+            when it stalled and parked within :attr:`MotionConfig.stop_tol` of
+            the calibrated limit; stalling far from the limit means something
+            blocked the travel, and is falsy.  With a work stroke, truthy when
+            it reached the work position.
         """
         self._check_connected()
         return self._actions.open(speed_mm_s, progress=progress)
@@ -1254,9 +1256,11 @@ class LiteGrip:
     ) -> MoveResult:
         """Close the gripper.
 
-        Same ramp as :meth:`open`, pressing onto the closed-side mechanical
-        stop.  Use :meth:`grasp` for a power grasp (closing onto an object and
-        squeezing) — that one stops on the object, not on the empty stop.
+        Same ramp as :meth:`open`, toward the closed side; the emitted command
+        is capped at the calibrated travel, so the jaw stops on the calibrated
+        closed limit and is never driven past it.  Use :meth:`grasp` for a power
+        grasp (closing onto an object and squeezing) — that one stops on the
+        object, not on the empty travel end.
 
         Args:
             speed_mm_s: Closing speed; ``None`` = ``MotionConfig.speed_mm_s``.
