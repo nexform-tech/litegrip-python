@@ -366,8 +366,8 @@ outcome before reporting success, so callers do not re-implement ramps or stall 
 
 | Method | Behaviour | Returns |
 | --- | --- | --- |
-| `open(speed_mm_s=None)` | Ramps *past* the calibrated open-side stop and lets the mechanical stop end the move. With `GripperConfig.work_stroke_mm` set it stops at that opening instead and never presses the stop — the shipped calibration sets it to `80.0`, so a plain `open()` ends 6 mm inside the recorded open extreme, 5 mm short of the jaws' full travel. | `MoveResult` |
-| `close(speed_mm_s=None)` | Same, toward the closed side. `work_stroke_mm` is an open-side number and does not change where a close ends. | `MoveResult` |
+| `open(speed_mm_s=None)` | Ramps toward the calibrated open-side stop; the emitted command is capped at the calibrated travel, so the jaw stops on the calibrated limit and is never driven past it. The move ends on stall detection. With `GripperConfig.work_stroke_mm` set it stops at that opening instead — the shipped calibration sets it to `80.0`, so a plain `open()` ends 6 mm inside the recorded open extreme, 5 mm short of the jaws' full travel. | `MoveResult` |
+| `close(speed_mm_s=None)` | Same, toward the closed side, with the same command cap. `work_stroke_mm` is an open-side number and does not change where a close ends. | `MoveResult` |
 | `grasp(force_n=None, hold_s=0.0)` | Closes until it stalls (i.e. grips), then ramps to and holds `force_n`. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. `hold_s=0` holds forever. | `GraspResult` |
 | `zero()` | Full calibration: probes both mechanical stops, derives travel and `rad_to_mm`, saves to disk. It preserves the direction already declared by the loaded calibration; a stall cannot tell one stop from the other. | `CalibrationData` |
 | `enable(retries=None)` | Sends enable and re-reads the status frame, retrying until it reports `err == 1`. | `EnableResult` |
@@ -423,9 +423,9 @@ with LiteGrip("can0") as gripper:
 | `stall_delta` | `0.0015` | floor for the stall threshold, radians |
 | `max_lead_mm` | `4.0` | travel-phase cap on how far the command may lead the measured position, on moves that carry no force setpoint |
 | `press_safety` | `0.9` | fraction of the setpoint a force-carrying approach may spend, so the measured force lands below it |
-| `press_overshoot` | `0.05` | fraction of travel the `open` / `close` command aims *past* the stop |
+| `press_overshoot` | `0.05` | fraction of travel the `open` / `close` **target** sits past the stop; the emitted command is capped at the calibrated travel, so this only sets the internal schedule |
 | `press_zone_mm` | `2.0` | within this distance of the stop, the lead cap drops to `stop_lead_mm` |
-| `stop_lead_mm` | `0.7` | lead cap while pressing, so pressing torque is about `kp × stop_lead_mm` |
+| `stop_lead_mm` | `0.7` | lead cap on the approach to the stop, so the approach torque stays below about `kp × stop_lead_mm` |
 | `stop_tol` | `0.02` | how close to the calibrated stop the jaw must park to count as pressed home, radians |
 | `force_n` | `20.0` | default `grasp` force |
 | `force_ramp_n_s` | `20.0` | rate the held force climbs to its setpoint, N/s |
@@ -455,10 +455,11 @@ idiom still compiles. What it *means* changed for `open` and `close` — see bel
 
 `MoveResult.ok` means different things depending on who produced it:
 
-- From `open()` / `close()`: success is *pressing onto the mechanical stop*, so a successful move
-  reports `ok=True`, `stalled=True`, and `reached=False` — the target is deliberately past the
-  stop, so the jaw never gets there. `reached` is essentially always `False` here; read `ok`.
-  Stalling far from the stop means something blocked the travel, and gives `ok=False`.
+- From `open()` / `close()`: success is *stalling with the command capped at the calibrated limit
+  and the jaw parked within `stop_tol` of it*, so a successful move reports `ok=True`,
+  `stalled=True`, and `reached=False` — the target is deliberately past the limit, so the jaw
+  never gets there. `reached` is essentially always `False` here; read `ok`.
+  Stalling far from the limit means something blocked the travel, and gives `ok=False`.
 - From `grasp()`'s closing phase: success is `reached and not stalled`, unchanged from before —
   gripping an object stops short of the empty-jaw target by design.
 
@@ -467,7 +468,7 @@ Two combinations look alarming but are correct:
 - **`grasp` on a real object** returns `stalled=True, reached=False` while `ok=True`. Stopping
   short of the empty-jaw target is the point of gripping, so read `ok`, not `reached`.
 - **`close` on an empty gripper** reports `ok=True, stalled=True, reached=False` — the jaw has
-  parked on the mechanical stop. Before, the same call reported `reached=True, stalled=False`.
+  parked on the calibrated limit. Before, the same call reported `reached=True, stalled=False`.
 - **`grasp`'s closing phase on an empty gripper** can report `reached=True` while the jaw sits
   about `0.010 rad` short of `target_rad`. That is the close-side stick-slip dead band, which is
   why `reach_tol` defaults to `0.02` — a tighter tolerance would report a false failure.
@@ -480,14 +481,16 @@ Worth reading if a gripper is behaving oddly.
   duration, so the servo snaps onto it in tens of milliseconds and then idles — at low speed
   that reads as step-and-stop. These actions push a linear ramp at `frame_interval` with joint
   velocity feed-forward, the same technique the SDK's own `move_at_speed` uses.
-- **Command lead is capped, in two tiers.** The command is an absolute ramp, but the part that
-  leads the measured position is clamped. While travelling it is `max_lead_mm`, enough to break
-  static friction; within `press_zone_mm` of the stop it narrows to `stop_lead_mm`, so pressing
-  torque stays around `kp × stop_lead_mm` rather than climbing to `kp × press_overshoot`. The
-  tier switch applies to the settle phase too — there the command sits past the stop, and an
-  uncapped lead would push to about 8 Nm. Uncapped anywhere, a blocked jaw accumulates error until
-  torque reaches a dangerous value; capped, the torque stays bounded at roughly `kp × lead`.
-  Narrowing the cap globally is not an option either: too small a lead cannot break static
+- **Command lead is capped in two tiers, and the command itself never leaves the calibrated
+  travel.** The command is an absolute ramp, but the part that leads the measured position is
+  clamped: `max_lead_mm` while travelling, enough to break static friction; within
+  `press_zone_mm` of the stop it narrows to `stop_lead_mm`. Whatever those tiers compute, the
+  command actually put on the wire is then capped at `[pos_closed_rad, pos_open_rad]` — the
+  calibrated travel. The tiers now only decide how fast the command closes on the limit, never
+  whether it can go past it. Uncapped anywhere, a blocked jaw accumulates error until torque
+  reaches a dangerous value; capped, the torque stays bounded at roughly `kp × lead`, and once
+  the command rests on the limit the residual error is zero, so the steady pressing torque is
+  zero. Narrowing the cap globally is not an option either: too small a lead cannot break static
   friction, so the jaw would report a false stall mid-travel. Making the command relative to the
   measured position is not an option: the command then freezes with the jaw, the error never
   grows, and the stall test misfires.
@@ -507,11 +510,13 @@ Worth reading if a gripper is behaving oddly.
   grasp closes at 13.4 mm/s, a 0.1 N one at 1.3 mm/s. That is deliberate: there is no way to
   approach at 0.1 N quickly, so do not ask for a force the mechanism's own friction can absorb;
   use `grasp_speed_mm_s` to cap the travel time instead.
-- **`open` and `close` aim past the stop.** Their target is the calibrated stop plus
-  `press_overshoot` of travel, and the move ends when stall detection fires on the mechanical
-  stop. The calibrated extreme therefore only decides *which way* to travel and what the mm display
-  reads — a slightly off calibration no longer moves the endpoint. That also removes the reliance
-  on `margin` guessing correctly and on fighting the close-side stick-slip dead band.
+- **`open` and `close` aim past the stop, but command only as far as the calibrated limit.** Their
+  *target* is the calibrated stop plus `press_overshoot` of travel, so the move still ends when
+  stall detection fires; their *commands* are capped at the calibrated extreme, so the jaw stops
+  on the calibrated limit and is never driven beyond it. The calibrated extreme therefore decides
+  *which way* to travel, what the mm display reads, **and how far the jaw may go** — a calibration
+  that is off only limits the travel, it cannot let the jaw run past. That also removes the
+  reliance on `margin` guessing correctly and on fighting the close-side stick-slip dead band.
   `grasp` is different: it must stop on the *object*, so its closing phase still targets
   `margin` inside the stop.
 - **Stall detection is windowed software logic.** The DM4310 has no stall protection, so the
@@ -558,7 +563,10 @@ Worth reading if a gripper is behaving oddly.
 - **A held force leaves the jaws compliant.** The hold frames carry no stiffness or damping, so
   an external push back-drives the jaws while the motor keeps pushing with `force_n` — and a
   `grasp()` that finds nothing between the jaws closes onto the mechanical stop at that force.
-  That is the price of a force that does not drift when the workpiece moves.
+  That is the price of a force that does not drift when the workpiece moves. The position cap
+  does not bound this phase: the frames carry `kp = kd = 0`, so there is no position error to
+  clamp — only the torque the setpoint asks for. Nothing stops the jaw at the calibrated limit
+  here, and it is the one motion path that deliberately has no position guardrail.
 - **Direction is data, not a switch.** Both extreme positions live in the calibration file, and
   which of the two is numerically larger is what says which way closing runs
   (`GripperConfig.close_sign`). A reverse-mounted gripper is therefore a perfectly ordinary
@@ -579,26 +587,33 @@ Worth reading if a gripper is behaving oddly.
   ever returning. A feed-forward torque beyond the motor's own frame range (`±10 Nm` on a DM4310,
   `±28 Nm` on a DM4340) is refused for the same reason: the clamp would have shipped a different
   force. A finite out-of-range value still clamps, exactly as before.
-- **Pressing torque is bounded by design.** On `open` and `close` — the two moves that press onto
-  a stop with no force setpoint — the travel-phase cap of `max_lead_mm` is about
-  `kp × max_lead_mm / rad_to_mm`, and the pressing cap of `stop_lead_mm` about
-  `kp × stop_lead_mm / rad_to_mm`. **`kp` is whichever is in effect, and a calibration file that
-  carries one overrides the `GripperConfig` default.** At the config defaults (`kp=100`,
+- **Pressing torque is bounded by design, and goes to zero at the limit.** On `open` and `close` —
+  the two moves that press onto a stop with no force setpoint — the travel-phase cap of
+  `max_lead_mm` is about `kp × max_lead_mm / rad_to_mm`, and the approach cap of `stop_lead_mm`
+  about `kp × stop_lead_mm / rad_to_mm`. **`kp` is whichever is in effect, and a calibration file
+  that carries one overrides the `GripperConfig` default.** At the config defaults (`kp=100`,
   `max_lead_mm=4.0`, `stop_lead_mm=0.7`, `rad_to_mm=75.44`) that is `5.30 Nm` and `0.93 Nm`; with
   the shipped calibration loaded it is `0.33 Nm` and `0.06 Nm`, because that file sets `kp=5.0`.
-  `grasp`'s closing leg is bounded by its setpoint instead, as described under *How the motion
-  works*. The caps cannot usefully go below one frame of travel
-  (`speed_mm_s × frame_interval`, `0.25 mm` at the defaults), otherwise the ramp's own step gets
-  clipped. If `open`/`close` does not press home reliably — the jaw coasts in and settles further
-  than `stop_tol`, so it reports `ok=False` — raise `stop_lead_mm` until it does without audible
-  impact. Every number here is arithmetic from the two formulas above, not a hardware measurement:
-  whether a given unit presses home at them has to be confirmed on that unit, and the shipped
-  calibration's `kp=5.0` makes its `0.06 Nm` the first thing to check.
-- **Sustained pressing heats the coil.** `open` and `close` now hold against the stop for the
-  settle phase every time, so check the coil temperature if they run back to back.
-- **`open`, `close`, `grasp` and `zero` drive the jaws into mechanical stops or apply sustained
-  force.** Keep hands and objects out of the travel range unless you intend to grip them, and
-  support the jaws before running `zero()`.
+  Those are approach figures, and they are also an upper bound: the emitted command is capped at
+  the calibrated limit, so once the jaw is there the residual error is zero and the steady
+  pressing torque is zero whatever these numbers are. `grasp`'s closing leg is bounded by its
+  setpoint instead, as described under *How the motion works*. The caps cannot usefully go below
+  one frame of travel (`speed_mm_s × frame_interval`, `0.25 mm` at the defaults), otherwise the
+  ramp's own step gets clipped. If `open`/`close` does not press home reliably — the jaw coasts in
+  and settles further than `stop_tol`, so it reports `ok=False` — raise `stop_lead_mm` until it
+  does without audible impact; that increases the torque on the way in, but it cannot press harder
+  once the command has reached the limit. Every number here is arithmetic from the two formulas
+  above, not a hardware measurement: whether a given unit presses home at them has to be confirmed
+  on that unit, and the shipped calibration's `kp=5.0` makes its `0.06 Nm` the first thing to
+  check.
+- **Sustained pressing heats the coil.** `open` and `close` now hold against the limit for the
+  settle phase every time, so check the coil temperature if they run back to back. The coil
+  carries the torque of `kp × (limit − position)` there rather than of a command held past the
+  limit, so the earlier pressing cap still applies to it.
+- **`open`, `close`, `grasp` and `zero` drive the jaws to the calibrated limit or apply sustained
+  force.** `open` and `close` stop on the calibrated limit; `zero` still probes the real mechanical
+  stops, unclamped, because finding them is the point. Keep hands and objects out of the travel
+  range unless you intend to grip them, and support the jaws before running `zero()`.
 - **Disabling on disconnect is the default**, so a crashed process does not leave the motor
   holding torque. Set `disable_on_disconnect=False` only when something else keeps the gripper
   under control.
@@ -645,8 +660,15 @@ These behaviour changes matter beyond the signatures:
   `CommandError` and has to `load_calibration()` first. Those defaults also swapped round, so
   they read as a normal mount rather than a reverse one.
 - The pressing lead cap `stop_lead_mm` dropped from `1.0` to `0.7` mm, so `open` and `close` press
-  onto the stop with roughly a third of the rated torque instead of half. Raise it back if a unit
-  fails to press home.
+  onto the limit with roughly a third of the rated torque instead of half. Raise it back if a unit
+  fails to press home on the way in.
+- `open` and `close` no longer command past the calibrated limit. The target still sits past it, so
+  the move still ends on stall detection, but the positions actually sent to the motor are capped
+  at `[pos_closed_rad, pos_open_rad]`. `MoveResult.final_cmd_rad` and `MoveProgress.cmd_rad` report
+  that capped value. The result fields (`ok`, `stalled`, `reached`, `target_rad`, `limit_rad`) are
+  unchanged; the peak torque during a press drops, and a calibration that is short of the real stop
+  now limits the travel instead of being overrun. This is a consumer-visible behaviour change even
+  though no signature moved.
 - Default `save_calibration()` / `load_calibration()` paths are now per channel —
   `~/.litegrip/<channel>_calibration.json`, not the single `litegrip_calibration.json`. That old
   file is still read as a fallback and `LITEGRIP_CALIB` still overrides everything, but a `can0`

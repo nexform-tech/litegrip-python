@@ -77,6 +77,7 @@ from .actions import (
     limit_target,
     press_target,
     work_limit_target,
+    clamp_to_travel,
     force_approach_terms,
 )
 
@@ -208,6 +209,7 @@ __all__ = [
     "limit_target",
     "press_target",
     "work_limit_target",
+    "clamp_to_travel",
     "force_approach_terms",
     # Models
     "GripperState",
