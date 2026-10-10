@@ -5,13 +5,13 @@ from __future__ import annotations
 import unittest
 
 import _sdkpath  # noqa: F401
-from litegrip import (CommandError, GraspResult, MotionConfig, UnitConversion,
-                      force_approach_terms, limit_target, press_target,
-                      work_limit_target)
+from litegrip import (CommandError, GraspResult, LiteGrip, MotionConfig,
+                      UnitConversion, force_approach_terms, limit_target,
+                      press_target, work_limit_target)
 from litegrip.actions import GripperActions
 
 from fake_can import (DT, POS_CLOSED_RAD, POS_OPEN_RAD, RAD_TO_MM,
-                      make_gripper, planned_steps, tick_clock)
+                      FakeLiteGripCAN, make_gripper, planned_steps, tick_clock)
 
 SPEED_MM_S = 50.0
 SPEED_RAD_S = SPEED_MM_S / RAD_TO_MM          # ≈ 0.674 rad/s
@@ -1139,6 +1139,97 @@ class TestNonFiniteInputIsRefused(unittest.TestCase):
         self.assertTrue(taus, "一帧都没发")
         self.assertEqual(taus[-1], 2.0)
         self.assertAlmostEqual(taus[0], 0.01, places=9)   # 一帧一步
+
+
+class TestUncalibratedConfigRefusesMotion(unittest.TestCase):
+    """没标定的配置上不许有任何运动 —— 包括不经过 ``GripperActions`` 的那几条。
+
+    ``open`` / ``close`` / ``grasp`` 走 ``limit_target`` / ``press_target``，早就被
+    ``_check_calibrated`` 拦住了；``goto`` / ``goto_rad`` / ``move_to`` / ``home`` /
+    ``move_at_speed*`` 却各自把目标 clamp 进 ``pos_closed_rad`` / ``pos_open_rad``
+    —— 没标定时那是**占位默认值**（``1.14`` / ``0.0`` / ``rad_to_mm=75.44``），
+    描述的不是这台机器的行程。实测（2026-10-10 审计）：全新对象上
+    ``goto(40.0)`` 返回 True，线上最后一帧 ``q=0.6098 kp=100``，而真机闭合止点在
+    ``+0.0521 rad`` —— 夹爪被推过止点压在那里，指令力矩 ``kp*(q-pos)`` 约 56 Nm。
+    （审计当时记的是 ``q=0.7600`` / 约 70 Nm：那时的占位 ``rad_to_mm`` 还是凭空写的
+    ``120/1.14``，换成实测的 ``86/1.14`` 后同一个越界更近，但仍然越界。）
+
+    闸门只加在 clamp 之前：拒绝必须发生在机构动之前。已经标定好的配置一条都不受影响
+    （见本类最后两条）。
+    """
+
+    @staticmethod
+    def fresh():
+        """全新对象，限位还是占位默认值 —— 就是操作员第一次上电时那个状态。"""
+        g = LiteGrip("vcan0", can_id=0x08)
+        fake = FakeLiteGripCAN(pos=0.0)
+        g._can = fake
+        g._connected = True
+        g._enabled = True
+        assert not g.config.calibrated
+        return g, fake
+
+    def test_goto_refuses_and_sends_nothing(self):
+        g, fake = self.fresh()
+        with self.assertRaises(CommandError) as ctx:
+            g.goto(40.0)
+        self.assertEqual(fake.frames, [])
+        self.assertIn("标定", str(ctx.exception))
+
+    def test_goto_rad_refuses_and_sends_nothing(self):
+        g, fake = self.fresh()
+        with self.assertRaises(CommandError):
+            g.goto_rad(0.0)
+        self.assertEqual(fake.frames, [])
+
+    def test_move_to_and_home_refuse_and_send_nothing(self):
+        """``home`` 读的正是那个占位闭合限位，``move_to`` 直通 ``goto_rad``。"""
+        for call in (lambda g: g.move_to(0.0), lambda g: g.home()):
+            g, fake = self.fresh()
+            with self.assertRaises(CommandError):
+                call(g)
+            self.assertEqual(fake.frames, [])
+
+    def test_move_at_speed_refuses_and_sends_nothing(self):
+        for call in (lambda g: g.move_at_speed(40.0),
+                     lambda g: g.move_at_speed_rad(0.0)):
+            g, fake = self.fresh()
+            with self.assertRaises(CommandError):
+                call(g)
+            self.assertEqual(fake.frames, [])
+
+    def test_the_placeholder_target_lands_outside_the_real_travel(self):
+        """把这道闸门要挡的东西摆出来：占位值算出的目标不在真机行程里。"""
+        g, _ = self.fresh()
+        cfg = g.config
+        target_rad = (cfg.pos_closed_rad
+                      - cfg.close_sign * 40.0 / cfg.rad_to_mm)
+        lo = min(POS_CLOSED_RAD, POS_OPEN_RAD)
+        hi = max(POS_CLOSED_RAD, POS_OPEN_RAD)
+        self.assertAlmostEqual(target_rad, 0.61, places=2)   # 占位值算出的 q
+        self.assertTrue(target_rad > hi or target_rad < lo,
+                        f"占位值算出的 {target_rad:.4f} rad 落在真机行程 "
+                        f"[{lo:.4f}, {hi:.4f}] 之内了 —— 这条审计结论已过期")
+
+    def test_a_calibrated_config_is_untouched(self):
+        """不许误伤：标定好的配置上这些动作照旧发帧。"""
+        for call in (lambda g: g.goto(40.0),
+                     lambda g: g.goto_rad(0.0),
+                     lambda g: g.move_to(0.0),
+                     lambda g: g.home(),
+                     lambda g: g.move_at_speed(40.0),
+                     lambda g: g.move_at_speed_rad(0.0)):
+            g, fake = make_gripper(stops=True)
+            self.assertTrue(call(g))
+            self.assertTrue(fake.frames, "标定好的配置上竟然一帧都没发")
+
+    def test_a_calibrated_but_zero_travel_config_is_refused_too(self):
+        """标定过但两端相同：clamp 只会把目标收成一个点，运动没有意义。"""
+        g, fake = make_gripper(stops=True)
+        g.config.pos_open_rad = g.config.pos_closed_rad
+        with self.assertRaises(CommandError):
+            g.goto(40.0)
+        self.assertEqual(fake.frames, [])
 
 
 if __name__ == "__main__":
