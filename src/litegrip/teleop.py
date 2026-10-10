@@ -130,11 +130,12 @@ DEFAULT_ALIGN_SPEED_MM_S = 50.0
 
 #: Ceiling on how far the *align* command may lead the measured position, in mm
 #: of jaw travel.  Torque is ``kp * (q_cmd - q_measured)``, so bounding the lead
-#: bounds the commanded torque by construction.  4 mm is 0.054 rad at the shipped
-#: ``rad_to_mm`` of ~83, i.e. ~5.4 Nm at ``kp`` 100 — the bracket ``open``/
-#: ``close`` already travel with (``MotionConfig.max_lead_mm``).  ``0`` disables
-#: the cap.  The follow loop does not use this: it commands the leader's opening
-#: outright so it stays responsive.
+#: bounds the commanded torque by construction.  4 mm is 0.053 rad at the config
+#: default ``rad_to_mm`` (``UnitConversion.RAD_TO_MM``, 75.44 mm/rad), i.e.
+#: ~5.30 Nm at ``kp`` 100 — the bracket ``open``/``close`` already travel with
+#: (``MotionConfig.max_lead_mm``).  ``0`` disables the cap.  The follow loop does
+#: not use this: it commands the leader's opening outright so it stays
+#: responsive.
 DEFAULT_LEAD_CAP_MM = 4.0
 
 #: Default ceiling on the follower's own torque, in Nm.  ``0`` disables the guard,

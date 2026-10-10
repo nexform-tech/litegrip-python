@@ -234,7 +234,8 @@ the jaws without opening a second CAN reader.
   speed fed forward as `dq`, and each of its frames stays within a lead cap: the commanded position
   may lead the measured one by at most `lead_cap_mm` (default `4` mm). Torque is
   `kp * (q_cmd - q_measured)`, so that bounds the align's commanded torque by construction — about
-  5.4 Nm out of the box. Capping does not make the move slower for free: the jaws still travel, they
+  5.30 Nm at the config defaults (`kp = 100`, `rad_to_mm = 75.44`). Capping does not make the move
+  slower for free: the jaws still travel, they
   just press with a bounded torque while they catch up. The **follow loop is deliberately not
   capped** — it commands the leader's opening outright so the follower stays responsive, and
   `torque_limit_nm` is what protects it under load. `lead_cap_mm=0` disables the align's cap;
@@ -493,8 +494,9 @@ Worth reading if a gripper is behaving oddly.
 - **An approach that carries a force setpoint spends that setpoint as its budget.** `grasp`'s
   closing leg is still a position frame, so on meeting the object the drive computes the torque
   itself: `kp × lead + kd × commanded speed` — decided by how fast the leg travels and how far the
-  engine lets the command lead, not by the force that was asked for. At the defaults that is
-  5.4 Nm from the lead cap alone, about 54 N, and it was the same 54 N whether the grasp asked for
+  engine lets the command lead, not by the force that was asked for. At the config defaults that is
+  `kp × max_lead_mm / rad_to_mm` = 5.30 Nm from the lead cap alone, about 53 N, and it was the same
+  53 N whether the grasp asked for
   5 N or 40 N. So this leg hands its budget (`force_n × 0.1 × press_safety`) to the three terms a
   frame can spend it on, in this order: the tick's own step (`kp × v × dt`, which only the speed
   can cover), then the damping (`kd`), then the lead. Meeting the object then presses at about
