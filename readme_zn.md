@@ -291,7 +291,7 @@ python3 examples/trajectory.py --play pick --repeat 3
 | --- | --- | --- |
 | `open(speed_mm_s=None)` | 按斜坡**越过**标定的张开侧限位，由机械限位结束这趟运动。 | `MoveResult` |
 | `close(speed_mm_s=None)` | 同上，朝闭合侧。 | `MoveResult` |
-| `grasp(force_n=None, hold_s=0.0)` | 闭合到堵转（即夹住），然后爬到并持续输出 `force_n`。`hold_s=0` 表示不限时长。 | `GraspResult` |
+| `grasp(force_n=None, hold_s=0.0)` | 闭合到堵转（即夹住），然后爬到并持续输出 `force_n`。闭合段带着 `force_n` 当力矩预算走，所以撞上工件时压出的力不超过设定值。`hold_s=0` 表示不限时长。 | `GraspResult` |
 | `zero()` | 完整标定：探测两端机械限位，算出行程与 `rad_to_mm`，并存盘。它沿用已加载标定声明的方向 —— 堵转分不出撞到的是哪一端。 | `CalibrationData` |
 | `enable(retries=None)` | 下发使能并回读状态帧，反复重试直到回读到 `err == 1`。 | `EnableResult` |
 | `disable()` | 失能电机（零力矩，可用手推动）。 | `bool` |
@@ -343,7 +343,8 @@ with LiteGrip("can0") as gripper:
 | `stall_cycles` | `5` | 堵转窗口的采样点数 |
 | `stall_ratio` | `0.2` | 窗口位移低于「本该走的距离」的这个比例即为堵转 |
 | `stall_delta` | `0.0015` | 堵转阈值下限 rad |
-| `max_lead_mm` | `4.0` | 行进段指令最多领先实测位置多少 |
+| `max_lead_mm` | `4.0` | 不带设定力的行进段，指令最多领先实测位置多少 |
+| `press_safety` | `0.9` | 带设定力的接近段允许花掉设定值的几分之几，让实测力落在设定值之下 |
 | `press_overshoot` | `0.05` | `open` / `close` 的目标**越过**限位的行程比例 |
 | `press_zone_mm` | `2.0` | 距限位这么近，领先上限就降到 `stop_lead_mm` |
 | `stop_lead_mm` | `0.7` | 压紧段的领先上限，压紧力矩约 `kp × stop_lead_mm` |
@@ -407,6 +408,18 @@ with LiteGrip("can0") as gripper:
   力矩顶到危险值；封顶后力矩始终有界，约为 `kp × 领先上限`。反过来也不能全局调小：领先量
   太小破不了静摩擦，夹爪会在半路报假堵转。更不能改成「相对实测位置加一块」：那样一旦夹住，
   指令就跟着实测冻结，误差永远涨不上去，堵转判据会误判。
+- **带设定力的接近段，花的就是那个设定值。** `grasp` 的闭合段仍然是指令位置帧，所以撞上
+  工件时力矩由驱动器自己算出来：`kp × 领先 + kd × 指令速度` —— 定这个数的是这趟走多快、
+  引擎允许指令领先多少，而不是你要的那个力。默认值下光领先上限就是 5.4 Nm（约 54 N），
+  而且不管要 5 N 还是 40 N，撞上去都是这 54 N。于是这一段把自己的预算
+  （`force_n × 0.1 × press_safety`）按顺序交给一帧能花掉它的三个项：本帧自己的位移
+  （`kp × v × dt`，只有速度能覆盖它）、阻尼（`kd`）、最后才是领先。撞上工件时压出的力
+  因此约为 `0.9 × force_n` —— 5 N 的夹取是 4.5 N，40 N 的是 36 N。有两个后果值得知道。
+  领先跟着设定力变窄：40 N、50 mm/s 时是 1.7 mm，20 N 时是 0.34 mm。而在默认
+  `grasp_speed_mm_s` 下低于约 `3.7 N` 时，**速度**由设定值决定 —— 那点速度走一帧就已经
+  压满整个预算：1 N 的夹取以 13.4 mm/s 闭合，0.1 N 的以 1.3 mm/s。这是有意的：0.1 N
+  本来就没法快速接近，所以别去要一个机构自身摩擦就能吃掉的力；想限时改用
+  `grasp_speed_mm_s`。
 - **`open` 和 `close` 的目标在限位外侧。** 目标是标定限位再加 `press_overshoot` 比例的行程，
   由堵转判据在机械限位上结束这趟运动。于是标定出来的极限值只决定**往哪个方向走**和 mm 显示
   读多少 —— 标定偏一点不再影响终点位置。顺带也不再依赖 `margin` 猜得准，不用再跟闭合侧
@@ -450,9 +463,11 @@ with LiteGrip("can0") as gripper:
   方向走（`GripperConfig.close_sign`）。所以反装是一份完全正常的配置，不是错误。真正会被
   `CommandError` 拒绝的是「从没标定过」（`GripperConfig.calibrated` 仍为 `False`）和「两个
   限位相等」，因为那时方向全是猜的。
-- **压紧力矩是有界的。** 行进段的 `max_lead_mm` 上限约 5 Nm；压紧段的 `stop_lead_mm` 上限
-  约 `kp × stop_lead_mm / rad_to_mm` —— 默认（`kp=100`、`stop_lead_mm=0.7`、`rad_to_mm≈74`）
-  约 `0.94 Nm`，约为额定 3 Nm 的三分之一。上限再往下调没有意义：低于一帧的位移
+- **压紧力矩是有界的。** 对 `open` 和 `close` —— 那两个不带设定力、直接顶限位的动作 ——
+  行进段的 `max_lead_mm` 上限约 5 Nm，压紧段的 `stop_lead_mm` 上限约
+  `kp × stop_lead_mm / rad_to_mm`，默认（`kp=100`、`stop_lead_mm=0.7`、`rad_to_mm≈74`）
+  约 `0.94 Nm`，约为额定 3 Nm 的三分之一。`grasp` 的闭合段则由它自己的设定值封顶，
+  见「运动逻辑」那一节。上限再往下调没有意义：低于一帧的位移
   （`speed_mm_s × frame_interval`，默认 0.25 mm）就会把斜坡自己那一格切掉。压不实就往上调
   `stop_lead_mm`（表现为夹爪冲进来后压不住、停稳位置超出 `stop_tol`，于是 `open`/`close`
   报 `ok=False`），调到能稳定压住、又听不到撞击声为止；默认值只是算术结果，不是真机实测值，

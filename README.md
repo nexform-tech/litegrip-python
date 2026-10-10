@@ -340,7 +340,7 @@ outcome before reporting success, so callers do not re-implement ramps or stall 
 | --- | --- | --- |
 | `open(speed_mm_s=None)` | Ramps *past* the calibrated open-side stop and lets the mechanical stop end the move. | `MoveResult` |
 | `close(speed_mm_s=None)` | Same, toward the closed side. | `MoveResult` |
-| `grasp(force_n=None, hold_s=0.0)` | Closes until it stalls (i.e. grips), then ramps to and holds `force_n`. `hold_s=0` holds forever. | `GraspResult` |
+| `grasp(force_n=None, hold_s=0.0)` | Closes until it stalls (i.e. grips), then ramps to and holds `force_n`. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. `hold_s=0` holds forever. | `GraspResult` |
 | `zero()` | Full calibration: probes both mechanical stops, derives travel and `rad_to_mm`, saves to disk. It preserves the direction already declared by the loaded calibration; a stall cannot tell one stop from the other. | `CalibrationData` |
 | `enable(retries=None)` | Sends enable and re-reads the status frame, retrying until it reports `err == 1`. | `EnableResult` |
 | `disable()` | Disables the motor (zero torque, back-drivable by hand). | `bool` |
@@ -393,7 +393,8 @@ with LiteGrip("can0") as gripper:
 | `stall_cycles` | `5` | samples per stall window |
 | `stall_ratio` | `0.2` | window movement below this fraction of the expected distance counts as stalled |
 | `stall_delta` | `0.0015` | floor for the stall threshold, radians |
-| `max_lead_mm` | `4.0` | travel-phase cap on how far the command may lead the measured position |
+| `max_lead_mm` | `4.0` | travel-phase cap on how far the command may lead the measured position, on moves that carry no force setpoint |
+| `press_safety` | `0.9` | fraction of the setpoint a force-carrying approach may spend, so the measured force lands below it |
 | `press_overshoot` | `0.05` | fraction of travel the `open` / `close` command aims *past* the stop |
 | `press_zone_mm` | `2.0` | within this distance of the stop, the lead cap drops to `stop_lead_mm` |
 | `stop_lead_mm` | `0.7` | lead cap while pressing, so pressing torque is about `kp × stop_lead_mm` |
@@ -462,6 +463,21 @@ Worth reading if a gripper is behaving oddly.
   friction, so the jaw would report a false stall mid-travel. Making the command relative to the
   measured position is not an option: the command then freezes with the jaw, the error never
   grows, and the stall test misfires.
+- **An approach that carries a force setpoint spends that setpoint as its budget.** `grasp`'s
+  closing leg is still a position frame, so on meeting the object the drive computes the torque
+  itself: `kp × lead + kd × commanded speed` — decided by how fast the leg travels and how far the
+  engine lets the command lead, not by the force that was asked for. At the defaults that is
+  5.4 Nm from the lead cap alone, about 54 N, and it was the same 54 N whether the grasp asked for
+  5 N or 40 N. So this leg hands its budget (`force_n × 0.1 × press_safety`) to the three terms a
+  frame can spend it on, in this order: the tick's own step (`kp × v × dt`, which only the speed
+  can cover), then the damping (`kd`), then the lead. Meeting the object then presses at about
+  `0.9 × force_n` — 4.5 N for a 5 N grasp, 36 N for a 40 N one. Two consequences are worth
+  knowing. The lead shrinks with the setpoint: 1.7 mm at a 40 N grasp and 50 mm/s, 0.34 mm at
+  20 N. And below `~3.7 N` at the default `grasp_speed_mm_s` the *speed* is the setpoint's to
+  decide, because one frame of travel at that speed already presses the whole budget — a 1 N
+  grasp closes at 13.4 mm/s, a 0.1 N one at 1.3 mm/s. That is deliberate: there is no way to
+  approach at 0.1 N quickly, so do not ask for a force the mechanism's own friction can absorb;
+  use `grasp_speed_mm_s` to cap the travel time instead.
 - **`open` and `close` aim past the stop.** Their target is the calibrated stop plus
   `press_overshoot` of travel, and the move ends when stall detection fires on the mechanical
   stop. The calibrated extreme therefore only decides *which way* to travel and what the mm display
@@ -520,15 +536,17 @@ Worth reading if a gripper is behaving oddly.
   configuration, not an error. What is rejected — with `CommandError` — is a configuration that
   has never been calibrated (`GripperConfig.calibrated` still `False`) or whose two limits are
   equal, because then every direction would be a guess.
-- **Pressing torque is bounded by design.** The travel-phase cap of `max_lead_mm` is about 5 Nm,
-  and the pressing cap of `stop_lead_mm` is about `kp × stop_lead_mm / rad_to_mm` — roughly
-  `0.94 Nm` at the defaults (`kp=100`, `stop_lead_mm=0.7`, `rad_to_mm≈74`), about a third of the
-  3 Nm rating. The cap cannot usefully go below one frame of travel
+- **Pressing torque is bounded by design.** On `open` and `close` — the two moves that press onto
+  a stop with no force setpoint — the travel-phase cap of `max_lead_mm` is about 5 Nm, and the
+  pressing cap of `stop_lead_mm` is about `kp × stop_lead_mm / rad_to_mm` — roughly `0.94 Nm` at
+  the defaults (`kp=100`, `stop_lead_mm=0.7`, `rad_to_mm≈74`), about a third of the 3 Nm rating.
+  `grasp`'s closing leg is bounded by its setpoint instead, as described under *How the motion
+  works*. The caps cannot usefully go below one frame of travel
   (`speed_mm_s × frame_interval`, `0.25 mm` at the defaults), otherwise the ramp's own step gets
-  clipped. If it does not press home reliably — the jaw coasts in and settles further than
-  `stop_tol`, so `open`/`close` report `ok=False` — raise `stop_lead_mm` until it does without
-  audible impact; the default is arithmetic, not a hardware measurement, and needs confirming on
-  the real unit.
+  clipped. If `open`/`close` does not press home reliably — the jaw coasts in and settles further
+  than `stop_tol`, so it reports `ok=False` — raise `stop_lead_mm` until it does without audible
+  impact; the default is arithmetic, not a hardware measurement, and needs confirming on the
+  real unit.
 - **Sustained pressing heats the coil.** `open` and `close` now hold against the stop for the
   settle phase every time, so check the coil temperature if they run back to back.
 - **`open`, `close`, `grasp` and `zero` drive the jaws into mechanical stops or apply sustained

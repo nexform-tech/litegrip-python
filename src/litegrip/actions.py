@@ -25,6 +25,14 @@ ROS 2 桥接、RPC 服务、产品代码都能直接调 :attr:`LiteGrip.actions`
 精度。``grasp()`` 的闭合段仍停在限位内侧（:attr:`MotionConfig.margin`）——
 夹取要停在工件上，不能压向空载限位。
 
+**带设定力的接近段另有一条预算**（``grasp`` 的闭合段，见
+:func:`force_approach_terms`）：上面那条 ``kp × 领先上限`` 对默认的 4 mm 上限
+是 5.4 Nm ≈ 54 N，与这一次夹取设定的力无关，于是「夹住工件」和「先拿 54 N 撞
+一下」是同一件事。所以只要这一段带着设定力，它的力矩预算（设定值 ×
+:attr:`MotionConfig.press_safety`）就分给这一帧的速度、阻尼和领先，撞上工件
+时压出的力矩不超过设定值。代价是领先跟着设定力变窄，而设定力低到一帧的位移
+自己能占满预算时，接近**速度**也由设定力定。
+
 堵转判据是软件侧的位置增量判据（电机本身没有堵转保护）：每
 :attr:`MotionConfig.sample_interval` 采一次位置，连续
 :attr:`MotionConfig.stall_cycles` 次采样的**窗口净位移**小于阈值即判堵转。
@@ -96,6 +104,20 @@ class MotionConfig:
 
     # ── 力矩 / 指令上限 ────────────────────────────────────────────────
     max_lead_mm: float = 4.0            # 行进段领先上限 mm（≈ kp × 上限）
+
+    # ── 带设定力的接近段（grasp 的闭合段）的力矩预算 ───────────────────
+    # grasp 的闭合段是**带设定力**的，可它这一段仍然是位置帧：撞上工件时力矩由
+    # 驱动器自己算 —— ``kp × 领先 + kd × 指令速度``，和设定的力没关系。默认那
+    # 条 4 mm 行进段上限按 ``kp=100`` 折算是 5.4 Nm ≈ 54 N，所以 5 N 的夹取也
+    # 是拿 54 N 撞上去的（假件台上的实测）。这一段改成把设定力的力矩预算分给一
+    # 帧里的三项，撞上工件时压出的力矩就不超过预算 —— 分配见
+    # :func:`force_approach_terms`，与 console（litegrip-studio）的接近段同一
+    # 条律、同一个数。
+    #
+    # 边界：预算直接由 ``force_n × UnitConversion.N_TO_NM`` 折算，再乘这个余量。
+    # 夹爪的额定力不在这一层拦 —— 那是调用方给的设定值自己的事，而保力段本来也
+    # 照设定的力往下发。
+    press_safety: float = 0.9           # 预算余量：撞上时实测力落在设定值之下
 
     # ── 行进段堵转保护（≈7 N） ────────────────────────────────────────
     # 普通移动（``press=True`` 的 open/close）行进段的领先上限是 max_lead_mm，
@@ -358,6 +380,72 @@ def work_limit_target(
     return config.pos_closed_rad - s * work_rad, config.pos_open_rad, work_rad
 
 
+def force_approach_terms(
+    kp: float,
+    kd: float,
+    speed_rad_s: float,
+    frame_interval: float,
+    budget_nm: float,
+    lead_ceiling_rad: float,
+) -> Tuple[float, float, float]:
+    """把**带设定力**的接近段的力矩预算分给一帧里的三项。
+
+    返回 ``(速度 rad/s, 阻尼, 领先上限 rad)``。
+
+    ``grasp`` 的闭合段带着设定力走，可它这一段还是位置帧：撞上工件时力矩由驱
+    动器自己算，是 ``kp × 领先 + kd × 指令速度`` —— 只由这一段的速度和引擎自己
+    给的领先决定，与设定的力无关。默认那条 ``max_lead_mm`` 按 ``kp=100`` 折算
+    是 5.4 Nm ≈ 54 N，所以 5 N 的夹取也是拿 54 N 撞上去的。
+
+    这里把设定力的力矩预算 ``force_n × UnitConversion.N_TO_NM ×
+    MotionConfig.press_safety`` 分给这一帧能出力的每一项，接近段撞上工件时压出
+    的力矩就不超过预算：
+
+    * **一帧自己那一格**（``kp × v × dt``）只能用速度封：指令再怎么跟，本帧的
+      位移也让指令领先实测一格，撞上就是这么多。所以预算先划出这一格，只够这
+      一格时把速度降下来 —— 这是唯一一处设定力仍然决定接近**速度**的地方，而
+      且是这一帧的算术，不是策略；
+    * **阻尼**（``kd × v``）接着分，按预算收窄，但不高于调用方给的上限；
+    * **领先**拿剩下的。它的下限是一帧的位移（``min_cap_rad``，引擎本来就靠这
+      条保住斜坡自己那一格），而这个下限的力矩恰好就是上面那一格，所以不会把
+      预算撑破。
+
+    顺序是有意的：阻尼先分、位置项（领先）后分，预算不够时先砍领先。反过来先给
+    领先、剩下的才给阻尼，在低速端（``kd × v`` 只有一两牛）会把阻尼砍到零，那样
+    一帧里只剩位置项，工件让位时力就跟着掉。
+
+    ``budget_nm <= 0``（没带设定力）时原样返回，两个上限都不动。
+
+    Args:
+        kp: 位置刚度（驱动器那一档，默认 100）。
+        kd: 调用方给的阻尼上限。
+        speed_rad_s: 这一段原本的指令速度 rad/s。
+        frame_interval: 一帧的时长 s。
+        budget_nm: 这一段允许压出的力矩 N·m。
+        lead_ceiling_rad: 不进预算时用的领先上限 rad（如 ``max_lead_mm``）。
+
+    Returns:
+        ``(速度, 阻尼, 领先上限)``，满足
+        ``kp × 领先上限 + 阻尼 × 速度 ≤ 预算``。
+    """
+    if budget_nm <= 0.0 or kp <= 0.0 or speed_rad_s <= 0.0:
+        return speed_rad_s, kd, lead_ceiling_rad
+
+    # 一帧的位移本身就是指令领先实测的下限，速度不能快到它自己就吃掉预算。
+    speed_rad_s = min(speed_rad_s, budget_nm / (kp * frame_interval))
+    tick_nm = kp * speed_rad_s * frame_interval
+    tick_rad = speed_rad_s * frame_interval
+    used_kd = max(0.0, min(kd, (budget_nm - tick_nm) / speed_rad_s))
+    lead_budget_rad = (budget_nm - used_kd * speed_rad_s) / kp
+    return (speed_rad_s, used_kd,
+            min(lead_ceiling_rad, max(tick_rad, lead_budget_rad)))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 动作层
+# ═══════════════════════════════════════════════════════════════════════════
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 动作层
 # ═══════════════════════════════════════════════════════════════════════════
@@ -445,6 +533,10 @@ class GripperActions:
     ) -> GraspResult:
         """夹取：先闭合到堵转（= 夹住工件），再持续输出 ``force_n`` 大小的力。
 
+        闭合段**带着设定力走**：它的力矩预算就是这一次夹取的力（见
+        :func:`force_approach_terms`），撞上工件时压出的力矩不超过它 —— 空载时
+        它才一路走到底。
+
         Args:
             force_n: 夹持力 N，``None`` = 用 :attr:`MotionConfig.force_n`。
                 按 SDK 近似换算 1 N = 0.1 Nm。
@@ -459,7 +551,7 @@ class GripperActions:
         force = cfg.force_n if force_n is None else force_n
 
         move = self._move_to_limit(
-            "close", cfg.grasp_speed_mm_s, progress=progress)
+            "close", cfg.grasp_speed_mm_s, force_n=force, progress=progress)
         ok, cycles, st = self._hold_force(force, hold_s, progress=progress)
         return GraspResult(
             ok=ok,
@@ -570,6 +662,7 @@ class GripperActions:
         *,
         press: bool = False,
         target_rad: Optional[float] = None,
+        force_n: Optional[float] = None,
         progress: Optional[Callable[[MoveProgress], None]] = None,
     ) -> MoveResult:
         """走到一端的限位：整段是一条 frame_interval 一格的连续斜坡（MIT 帧 +
@@ -584,6 +677,11 @@ class GripperActions:
         ``target_rad``：显式目标（如 :func:`work_limit_target` 算出的工作行程
         点）。给了它就走**普通定位**语义（``press`` 视为 False），``limit`` 取该
         方向的标定限位用于上报。
+
+        ``force_n``：这一段**带着多大的力走**。``None`` = 不带（普通移动，压出
+        多少由领先上限和速度决定）。给了它，它的力矩预算就分给这一帧的三项（速
+        度、阻尼、领先，见 :func:`force_approach_terms`），所以撞上工件时压出的
+        力矩不超过这个设定值 —— ``grasp`` 的闭合段给的就是它这次的夹持力。
 
         返回 :class:`MoveResult`。
         """
@@ -611,6 +709,23 @@ class GripperActions:
         speed_rad_s = speed_mm_s / gcfg.rad_to_mm
 
         interval = cfg.frame_interval
+        # 不带力的移动用配置里那条行进段上限；带了力，上限和这一帧的阻尼、速
+        # 度一起由设定值的预算定（见 force_approach_terms）。
+        kd_frame = gcfg.kd
+        lead_ceiling_rad = cfg.max_lead_mm / gcfg.rad_to_mm
+        if force_n is not None:
+            speed_rad_s, kd_frame, lead_ceiling_rad = force_approach_terms(
+                kp=gcfg.kp,
+                kd=gcfg.kd,
+                speed_rad_s=speed_rad_s,
+                frame_interval=interval,
+                budget_nm=force_n * UnitConversion.N_TO_NM * cfg.press_safety,
+                lead_ceiling_rad=lead_ceiling_rad,
+            )
+            # 预算只降不升，但降下来以后斜坡的帧数、速度前馈和堵转阈值都得跟着
+            # 走那一条速度，否则斜坡跑完了夹爪还在半路。
+            speed_mm_s = speed_rad_s * gcfg.rad_to_mm
+
         ramp_s = dist_mm / speed_mm_s if speed_mm_s > 0 else 0.0
         ramp_steps = max(1, int(round(ramp_s / interval)))
         settle_steps = max(1, int(round(cfg.settle_s / interval)))
@@ -626,17 +741,21 @@ class GripperActions:
         # stop_lead_mm，压紧力矩 ≈ kp × stop_lead_mm。下限都是一帧的位移，
         # 免得斜坡自己那一格被切掉。
         min_cap_rad = speed_rad_s * interval
-        travel_cap_rad = max(cfg.max_lead_mm / gcfg.rad_to_mm, min_cap_rad)
+        travel_cap_rad = max(lead_ceiling_rad, min_cap_rad)
         stop_cap_rad = max(cfg.stop_lead_mm / gcfg.rad_to_mm, min_cap_rad)
         press_zone_rad = cfg.press_zone_mm / gcfg.rad_to_mm
 
         log.info("%s %.4f → %.4f rad（%.1f mm/s，%.1f mm，%d+%d 帧，"
-                 "堵转阈值 %.5f rad，领先上限 %.5f/%.5f rad%s）",
+                 "堵转阈值 %.5f rad，领先上限 %.5f/%.5f rad%s%s）",
                  "闭合" if toward == "close" else "张开",
                  before.position_rad, target, speed_mm_s, dist_mm,
                  ramp_steps, settle_steps, win_thresh_rad,
                  travel_cap_rad, stop_cap_rad,
-                 "，顶限位" if press else "")
+                 "，顶限位" if press else "",
+                 "" if force_n is None else
+                 "，力预算 %.3f Nm（kd %.2f）" % (
+                     force_n * UnitConversion.N_TO_NM * cfg.press_safety,
+                     kd_frame))
 
         hist = [before.position_rad]
         stalled = False
@@ -665,7 +784,7 @@ class GripperActions:
             lead = (q_sched - pos) * sign
             cmd = pos + sign * lead_cap_rad if lead > lead_cap_rad else q_sched
             last_cmd = cmd
-            self._emit(cmd, dq, 0.0)
+            self._emit(cmd, dq, 0.0, kd=kd_frame)
             last_i = i
 
             if i % sample_every and i != total_steps:
