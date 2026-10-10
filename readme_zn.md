@@ -489,6 +489,12 @@ with LiteGrip("can0") as gripper:
   方向走（`GripperConfig.close_sign`）。所以反装是一份完全正常的配置，不是错误。真正会被
   `CommandError` 拒绝的是「从没标定过」（`GripperConfig.calibrated` 仍为 `False`）和「两个
   限位相等」，因为那时方向全是猜的。
+- **非有限值一律拒绝，绝不夹位。** `goto`、`goto_rad`、`move_at_speed*`、`grasp`、`set_force`
+  的参数只要是 NaN 或 ±inf 就抛 `CommandError`；CAN 那一层同样拒收 MIT 帧里任何非有限的
+  字段，不让它有机会变成字节。钳位给的答案其实是量程的一端 —— `q → +12.5 rad`、`kp → 500`、
+  `tau → +10 Nm` —— 那是一个没人要过的真实指令；`set_force(nan)` 更曾卡在爬升循环里，一帧不
+  发也永不返回。前馈力矩超出本型号的帧量程（DM4310 是 `±10 Nm`，DM4340 是 `±28 Nm`）同样
+  拒绝：钳到端值等于换成了另一个力。有限的超量程值照旧钳位，与原来一致。
 - **压紧力矩是有界的。** 对 `open` 和 `close` —— 那两个不带设定力、直接顶限位的动作 ——
   行进段的 `max_lead_mm` 上限约 `kp × max_lead_mm / rad_to_mm`，压紧段的 `stop_lead_mm` 上限约
   `kp × stop_lead_mm / rad_to_mm`。**`kp` 取的是当下生效的那个，而标定文件里带的 `kp` 会盖过

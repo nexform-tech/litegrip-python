@@ -7,6 +7,7 @@ into a simplified interface tailored for a single gripper motor.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Optional
 
@@ -19,7 +20,8 @@ from ..can.protocol import (
     DM_REG,
 )
 from ..constants import GripperParams, DefaultParams
-from ..exceptions import ConnectError, CommError, HardwareError, NotInitializedError
+from ..exceptions import (CommandError, CommError, ConnectError, HardwareError,
+                          NotInitializedError)
 
 log = logging.getLogger("litegrip.can_bus")
 
@@ -321,10 +323,58 @@ class LiteGripCAN:
     # Motion control
     # ═══════════════════════════════════════════════════════════════════
 
+    def _check_motion_command(self, q_target: float, kp: float, kd: float,
+                              dq_target: float,
+                              tau_feedforward: float) -> None:
+        """拒收一帧 MIT 不该承载的指令（见 :meth:`control_mit`）。
+
+        这一层是**所有**下发的必经之路 —— 引擎的每一帧、``goto_rad`` 的整段
+        流、``set_force`` 的爬升，最后都落在这里 —— 所以数值边界放在这里一次
+        就够。上层的判据（领先上限、保力预算）管的是「走多快、压多硬」，这里
+        管的是「这一帧本身是不是一个指令」。
+        """
+        for name, value in (("q_target", q_target), ("kp", kp), ("kd", kd),
+                            ("dq_target", dq_target),
+                            ("tau_feedforward", tau_feedforward)):
+            if not math.isfinite(value):
+                raise CommandError(
+                    f"MIT 指令的 {name} 不是有限数：{value!r}。非有限值在编码"
+                    "器里会被映射到量程的一端（如 q → +12.5 rad、tau → "
+                    "+10 Nm），那是一个调用方没要过的真实指令，所以拒绝下发。")
+
+        # 帧量程按型号来（DM4310 是 10 Nm，DM4340 是 28 Nm）。鸭子类型的替身
+        # 没带 limits，退回 DM4310 —— 本 SDK 的夹爪就是它。
+        limits = getattr(self._motor, "limits", None)
+        tau_max = limits.tau_max if limits is not None else 10.0
+        if abs(tau_feedforward) > tau_max:
+            raise CommandError(
+                f"前馈力矩 {tau_feedforward} Nm 超出本型号的帧量程 "
+                f"±{tau_max} Nm。超量程会被静默钳到端值 —— 那是另一个力，"
+                "不是要的那个，所以拒绝下发。")
+
     def control_mit(self, q_target: float, kp: float, kd: float,
                     dq_target: float = 0.0,
                     tau_feedforward: float = 0.0) -> bool:
-        """Send a single MIT control frame."""
+        """Send a single MIT control frame.
+
+        Args:
+            q_target: Target position (rad).
+            kp: Position stiffness.
+            kd: Velocity damping.
+            dq_target: Target velocity (rad/s).
+            tau_feedforward: Feed-forward torque (Nm).
+
+        Returns:
+            True if the frame was sent, False when there is no connection.
+
+        Raises:
+            CommandError: a field is NaN/infinite, or the torque exceeds the
+                frame's range.  Those are caller bugs rather than transport
+                conditions, so they keep a diagnosable reason instead of being
+                folded into the ``False`` return.
+        """
+        self._check_motion_command(q_target, kp, kd, dq_target,
+                                   tau_feedforward)
         if self._controller is None or self._motor is None:
             return False
         try:
@@ -361,7 +411,24 @@ class LiteGripCAN:
         """Stream MIT frames for a duration (blocking).
 
         DM motors require continuous MIT frames to sustain motion.
+
+        Raises:
+            CommandError: a field is NaN/infinite, the torque exceeds the
+                frame's range, or the timing is not usable — the same rule as
+                :meth:`control_mit`, checked once before the first frame rather
+                than per frame.
         """
+        self._check_motion_command(q_target, kp, kd, dq_target,
+                                   tau_feedforward)
+        for name, value in (("duration_s", duration_s),
+                            ("interval_s", interval_s)):
+            if not math.isfinite(value):
+                raise CommandError(
+                    f"{name} 不是有限数：{value!r}。拒绝下发：duration_s 为 "
+                    "NaN 时 ``while now < deadline`` 恒为假 —— 整段一帧都不发"
+                    "却返回 True，调用方以为夹爪动了。")
+        if interval_s < 0.0:
+            raise CommandError(f"interval_s 不能为负：{interval_s!r}。")
         if self._controller is None or self._motor is None:
             return False
 

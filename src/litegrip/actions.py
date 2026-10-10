@@ -51,6 +51,7 @@ ROS 2 桥接、RPC 服务、产品代码都能直接调 :attr:`LiteGrip.actions`
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional, Tuple
@@ -564,9 +565,20 @@ class GripperActions:
         Returns:
             :class:`GraspResult`。夹住工件时 ``stalled=True`` 且
             ``reached=False``（压不到空载目标位置是正常的）。
+
+        Raises:
+            CommandError: ``force_n`` / ``hold_s`` 不是有限数。两条都不是
+                「夹得轻/夹得久」的边界，而是没有意义的输入：NaN 的力会让闭合段
+                的力矩预算（:func:`force_approach_terms`）整段变成 NaN，NaN 的
+                ``hold_s`` 会让保力段一帧不保就返回 —— 偏偏报「成功」。
+                一直保力请用 ``hold_s=0``，不是 ``inf``。
         """
         cfg = self.config
         force = cfg.force_n if force_n is None else force_n
+        for name, value in (("force_n", force), ("hold_s", hold_s)):
+            if not math.isfinite(value):
+                raise CommandError(
+                    f"grasp 的 {name} 不是有限数：{value!r}。拒绝下发。")
 
         move = self._move_to_limit(
             "close", cfg.grasp_speed_mm_s, force_n=force, progress=progress)
@@ -707,6 +719,11 @@ class GripperActions:
         g = self._g
         g._check_enabled()
         gcfg = g.config
+
+        if not math.isfinite(speed_mm_s):
+            raise CommandError(
+                f"移动速度不是有限数：speed_mm_s={speed_mm_s!r}。拒绝下发："
+                "斜坡的帧数与速度前馈都由它算出来。")
 
         if target_rad is not None:
             press = False

@@ -24,6 +24,7 @@ Example::
 from __future__ import annotations
 
 import logging
+import math
 import os as _os
 import select as _select_mod
 import sys
@@ -1362,9 +1363,21 @@ class LiteGrip:
         kd: Optional[float] = None,
         duration: float = 0.5,
     ) -> bool:
-        """Move to an absolute position in millimetres."""
+        """Move to an absolute position in millimetres.
+
+        Raises:
+            CommandError: ``position_mm`` is not a finite number.  A NaN has no
+                position on the travel; letting it through would press the jaws
+                onto one of the stops (the clamp below turns it into an end of
+                the calibrated range), which is a move nobody asked for.
+        """
         self._check_connected()
         self._check_enabled()
+        if not math.isfinite(position_mm):
+            raise CommandError(
+                f"目标位置不是有限数：position_mm={position_mm!r}。"
+                "拒绝下发：NaN 落在下面的限位 clamp 里会变成量程的一端，"
+                "也就是一个调用方没要过的真实位置。")
         # Opening may increase or decrease the motor rad count depending on the
         # mount; close_sign carries that, so this works for both.
         position_rad = (self._config.pos_closed_rad
@@ -1381,9 +1394,27 @@ class LiteGrip:
         tau_feedforward: float = 0.0,
         duration: float = 0.5,
     ) -> bool:
-        """Move to an absolute position in radians (streams MIT frames)."""
+        """Move to an absolute position in radians (streams MIT frames).
+
+        The target is clamped into the calibrated range; the other fields
+        (``kp`` / ``kd`` / ``dq_target`` / ``tau_feedforward`` / ``duration``)
+        are checked by the bus layer, which refuses a value the frame cannot
+        honestly carry.
+
+        Raises:
+            CommandError: ``position_rad`` is not a finite number, or the bus
+                layer refused a field.  The check is deliberately *above* the
+                clamp: ``min`` / ``max`` compare false against a NaN, so the
+                clamp would answer it with one of the calibrated limits — a
+                real position that was never asked for.
+        """
         self._check_connected()
         self._check_enabled()
+        if not math.isfinite(position_rad):
+            raise CommandError(
+                f"目标位置不是有限数：position_rad={position_rad!r}。"
+                "拒绝下发：NaN 落在下面的限位 clamp 里会变成量程的一端，"
+                "也就是一个调用方没要过的真实位置。")
         if self._can is None:
             return False
 
@@ -1404,6 +1435,10 @@ class LiteGrip:
                 dq_target=dq_target,
                 tau_feedforward=tau_feedforward,
             )
+        except CommandError:
+            # 已经是一个带原因的拒绝，别再包成「位置控制失败」把它变成
+            # 看起来像通信问题。
+            raise
         except Exception as e:
             raise CommError(f"位置控制失败: {e}")
 
@@ -1452,9 +1487,21 @@ class LiteGrip:
         Args:
             force_n: Target force in newtons.
             duration: Hold time in seconds after the ramp, ``0`` to just ramp.
+
+        Raises:
+            CommandError: ``force_n`` or ``duration`` is not a finite number,
+                or the torque the force works out to exceeds what the frame can
+                carry (the bus layer refuses it on the first frame).  It is not
+                clamped: a request for 200 N is not a request for 100 N.
         """
         self._check_connected()
         self._check_enabled()
+        for name, value in (("force_n", force_n), ("duration", duration)):
+            if not math.isfinite(value):
+                raise CommandError(
+                    f"{name} 不是有限数：{value!r}。拒绝下发：目标力矩随之非"
+                    "有限，而下面的爬升循环写成 ``while probe != target_nm``"
+                    " —— NaN 与任何值都不相等，它会一帧都发不出去地永远转下去。")
         if self._can is None:
             return False
 
@@ -1474,12 +1521,25 @@ class LiteGrip:
 
         # 爬升要几帧：从飞行力矩逐帧朝设定值走，走到就是几帧。已经在设定值
         # （或已越过）时是 0 帧 —— 不加多余的一帧。
+        #
+        # 循环写成 ``!=`` 是有意的（每帧一步正好落在设定值上），但它只在「每步都
+        # 真的朝设定值靠近」时才会结束。两种输入会让它空转：目标力矩非有限
+        # （NaN 与任何值都不相等，比较全为假 —— 2026-10-10 审计里那条一帧都发不
+        # 出去、永不返回的路径，现在由上面 force_n / duration 的检查堵死），以及
+        # 步长小到被浮点吃掉（``value ± step == value``，一步都不挪）。所以每步
+        # 都验一次「到设定值的距离真的变小了」，不成立就抛错，不空转。
         climb_frames = 0
         probe = tau_cmd
         if step_nm > 0.0:
             while probe != target_nm:
+                dist_nm = abs(target_nm - probe)
                 probe = _toward(probe, target_nm, step_nm)
                 climb_frames += 1
+                # 非有限值时 ``<`` 为假，这里同样命中 —— 写法不能改成 ``>=``。
+                if not (abs(target_nm - probe) < dist_nm):
+                    raise CommandError(
+                        f"力矩爬升没有朝设定值前进：停在 {probe!r}（设定值 "
+                        f"{target_nm!r}，每帧 {step_nm!r}），不再空转。")
         # duration 是爬到设定值以后**继续保力**的时间，不含爬升本身。
         hold_frames = max(0, int(round(duration / motion.frame_interval)))
 
@@ -1498,6 +1558,9 @@ class LiteGrip:
                 self.poll(timeout_s=0.0)
                 motion.sleep_fn(motion.frame_interval)
             return True
+        except CommandError:
+            # 带原因的拒绝原样上传；包成「力控失败」会让它看起来像通信问题。
+            raise
         except Exception as e:
             raise CommError(f"力控失败: {e}")
 
@@ -1527,9 +1590,19 @@ class LiteGrip:
 
         Returns:
             True on success.
+
+        Raises:
+            CommandError: ``target_mm`` or ``speed_mm_s`` is not a finite
+                number.  Both of the shortcuts below compare false against a
+                NaN, so it would slip past them and reach the ramp arithmetic.
         """
         self._check_connected()
         self._check_enabled()
+        for name, value in (("target_mm", target_mm),
+                            ("speed_mm_s", speed_mm_s)):
+            if not math.isfinite(value):
+                raise CommandError(
+                    f"{name} 不是有限数：{value!r}。拒绝下发。")
 
         current_mm = self.get_state().position_mm
         distance_mm = abs(target_mm - current_mm)
@@ -1565,9 +1638,19 @@ class LiteGrip:
 
         Returns:
             True on success.
+
+        Raises:
+            CommandError: ``target_rad`` or ``speed_rad_s`` is not a finite
+                number — see :meth:`move_at_speed`; the clamp further down
+                would otherwise answer a NaN target with a calibrated limit.
         """
         self._check_connected()
         self._check_enabled()
+        for name, value in (("target_rad", target_rad),
+                            ("speed_rad_s", speed_rad_s)):
+            if not math.isfinite(value):
+                raise CommandError(
+                    f"{name} 不是有限数：{value!r}。拒绝下发。")
 
         current_rad = self.get_position_rad()
         distance_rad = abs(target_rad - current_rad)
@@ -1587,9 +1670,23 @@ class LiteGrip:
         kp: Optional[float],
         kd: Optional[float],
     ) -> bool:
-        """Core: linear ramp from start to target at constant speed."""
+        """Core: linear ramp from start to target at constant speed.
+
+        Raises:
+            CommandError: ``target_rad`` or ``duration_s`` is not a finite
+                number.  Both callers derive the duration from finite inputs
+                and the bus layer refuses a non-finite frame anyway; this is
+                the backstop that keeps ``int(duration_s / interval)`` from
+                becoming a bare ValueError / OverflowError.
+        """
         if self._can is None:
             return False
+
+        for name, value in (("target_rad", target_rad),
+                            ("duration_s", duration_s)):
+            if not math.isfinite(value):
+                raise CommandError(
+                    f"{name} 不是有限数：{value!r}。拒绝下发。")
 
         kp = kp if kp is not None else self._config.kp
         kd = kd if kd is not None else self._config.kd
