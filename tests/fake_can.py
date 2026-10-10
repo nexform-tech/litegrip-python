@@ -168,6 +168,14 @@ class FakeLiteGripCAN:
         self.holding = False
         #: 收帧次数 —— 守住「每下发一帧就 poll 一次」的时序（set_force 曾经丢掉）。
         self.poll_calls = 0
+        #: 命令序列 —— 按发生顺序记下 disable / set_zero / initialize，
+        #: 用来守「先失能、再发 0xFE、后重使能」这一步序。
+        self.calls: List[str] = []
+        #: 0xFE 是否被接受（False = 帧没发出/没注册，set_zero() 返回 False）。
+        self.set_zero_ok = True
+        #: 0xFE 是否真的改写偏置（False = 电机忽略了它，比如仍在使能态：
+        #: set_zero() 照报 True，但读数不变）。
+        self.set_zero_applies = True
 
     # ── 运动 ───────────────────────────────────────────────────────────
     def control_mit(self, q_target, kp, kd, dq_target=0.0,
@@ -216,12 +224,21 @@ class FakeLiteGripCAN:
 
     # ── 使能 ───────────────────────────────────────────────────────────
     def disable(self) -> bool:
+        self.calls.append("disable")
         self.motor.err = 0
         return True
 
     def set_zero(self) -> bool:
-        """0xFE：把当前读数记成 0（只改偏置，不改物理位置）。"""
-        self.motor.set_zero()
+        """0xFE：把当前读数记成 0（只改偏置，不改物理位置）。
+
+        ``set_zero_ok=False`` 模拟帧没发出去（返回 False）；
+        ``set_zero_applies=False`` 模拟电机忽略了 0xFE（返回 True 但偏置不动）。
+        """
+        self.calls.append("set_zero")
+        if not self.set_zero_ok:
+            return False
+        if self.set_zero_applies:
+            self.motor.set_zero()
         return True
 
     def clear_fault(self) -> bool:
@@ -234,6 +251,7 @@ class FakeLiteGripCAN:
 
         没给脚本就当成一台好电机（返回 True）。
         """
+        self.calls.append("initialize")
         self.initialize_calls += 1
         ok = (self.initialize_results.pop(0)
               if self.initialize_results else True)
