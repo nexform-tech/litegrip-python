@@ -41,6 +41,7 @@ from .actions import (
     MotionConfig,
     MoveProgress,
     MoveResult,
+    WriteZeroResult,
     _toward,
 )
 from .teleop import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX, DEFAULT_GRIP_ID,
@@ -1278,6 +1279,52 @@ class LiteGrip:
         self._check_connected()
         self._check_enabled()
         return self._actions.zero()
+
+    def write_zero(self) -> WriteZeroResult:
+        """Make the current encoder angle the motor's zero, in place (CMD 0xFE).
+
+        The jaws are left limp at whatever angle they are at, that angle is
+        declared zero, and the angle is read back to confirm (~0).  Unlike
+        :meth:`zero`, this does **not** probe the end stops or touch the
+        calibration file: it only rewrites the encoder offset, so the span
+        already measured stays valid.  ⚠ Irreversible — it writes the offset
+        into the motor's flash.
+
+        A Damiao motor ignores 0xFE while it is enabled, so the motor is
+        disabled first and re-enabled after (the order ``examples/zero_closed.py``
+        uses).
+
+        Returns:
+            :class:`~litegrip.actions.WriteZeroResult` — truthy when the
+            read-back came back ~0.
+        """
+        self._check_connected()
+        self._check_enabled()
+        if self._can is None:
+            raise HardwareError("未连接")
+
+        # 1. Limp at the current angle, so the jaws stay exactly where the
+        #    operator put them, then read the pose we are about to zero.
+        before = self._can.get_position()
+        self._can.control_mit_stream(q_target=before, kp=0.0, kd=0.0,
+                                     duration_s=0.3)
+        self._can.update_state(timeout_s=0.3)
+        before = self._can.get_position()
+
+        # 2. A DM motor ignores 0xFE while enabled — disable first.
+        self.disable()
+        time.sleep(0.02)
+        if not self._can.set_zero():
+            raise HardwareError("0xFE 未能发送（未连接或未注册）")
+        time.sleep(0.05)
+
+        # 3. Re-enable, force fresh frames, read the new zero back.
+        self.enable()
+        self._can.control_mit_stream(q_target=0.0, kp=0.0, kd=0.0,
+                                     duration_s=0.2)
+        self._can.update_state(timeout_s=0.3)
+        after = self._can.get_position()
+        return WriteZeroResult(before_rad=before, after_rad=after)
 
     # ═══════════════════════════════════════════════════════════════════
     # Motion — mid-level
