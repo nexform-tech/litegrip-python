@@ -488,7 +488,12 @@ with LiteGrip("can0") as gripper:
 - **方向约定是数据，不是开关。** 两端极限都存在标定文件里，**哪个数值更大**就说明闭合往哪个
   方向走（`GripperConfig.close_sign`）。所以反装是一份完全正常的配置，不是错误。真正会被
   `CommandError` 拒绝的是「从没标定过」（`GripperConfig.calibrated` 仍为 `False`）和「两个
-  限位相等」，因为那时方向全是猜的。
+  限位相等」，因为那时方向全是猜的。**每一个**运动方法都会拒绝这种配置 —— 不止上面六个
+  动作，`goto`、`goto_rad`、`move_to`、`home`、`move_at_speed*` 同样拒绝。它们把目标
+  clamp 进 `pos_closed_rad` / `pos_open_rad`，而在占位默认值上那个 clamp 不是安全网，是
+  在描述不了这台机器行程的数字上做算术：全新未标定的对象上 `goto(40.0)` 会映射到
+  `+0.61 rad`，越过真机闭合止点 `+0.05 rad`，夹爪被推过去压在那里（指令力矩约 56 Nm）。
+  先加载标定 —— 这道闸门就只有这一条。
 - **非有限值一律拒绝，绝不夹位。** `goto`、`goto_rad`、`move_at_speed*`、`grasp`、`set_force`
   的参数只要是 NaN 或 ±inf 就抛 `CommandError`；CAN 那一层同样拒收 MIT 帧里任何非有限的
   字段，不让它有机会变成字节。钳位给的答案其实是量程的一端 —— `q → +12.5 rad`、`kp → 500`、

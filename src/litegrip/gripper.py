@@ -43,6 +43,7 @@ from .actions import (
     MoveProgress,
     MoveResult,
     WriteZeroResult,
+    _check_calibrated,
     _toward,
 )
 from .teleop import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX, DEFAULT_GRIP_ID,
@@ -1199,6 +1200,11 @@ class LiteGrip:
 
         Uses this instance's calibrated closed limit, so a reverse-mounted
         gripper homes to the correct end.
+
+        Raises:
+            CommandError: the configuration is uncalibrated — the "calibrated
+                closed limit" is a placeholder default in that state.  See
+                :meth:`goto_rad`.
         """
         self._check_connected()
         self._check_enabled()
@@ -1366,10 +1372,11 @@ class LiteGrip:
         """Move to an absolute position in millimetres.
 
         Raises:
-            CommandError: ``position_mm`` is not a finite number.  A NaN has no
-                position on the travel; letting it through would press the jaws
-                onto one of the stops (the clamp below turns it into an end of
-                the calibrated range), which is a move nobody asked for.
+            CommandError: ``position_mm`` is not a finite number, or the
+                configuration is uncalibrated — see :meth:`goto_rad`.  A NaN has
+                no position on the travel; letting it through would press the
+                jaws onto one of the stops (the clamp below turns it into an end
+                of the calibrated range), which is a move nobody asked for.
         """
         self._check_connected()
         self._check_enabled()
@@ -1402,14 +1409,25 @@ class LiteGrip:
         honestly carry.
 
         Raises:
-            CommandError: ``position_rad`` is not a finite number, or the bus
-                layer refused a field.  The check is deliberately *above* the
-                clamp: ``min`` / ``max`` compare false against a NaN, so the
-                clamp would answer it with one of the calibrated limits — a
-                real position that was never asked for.
+            CommandError: ``position_rad`` is not a finite number, the
+                configuration is uncalibrated, or the bus layer refused a field.
+                The finiteness check is deliberately *above* the clamp: ``min`` /
+                ``max`` compare false against a NaN, so the clamp would answer it
+                with one of the calibrated limits — a real position that was
+                never asked for.
+
+                The calibration check is there because the clamp below is not a
+                safety net while ``pos_closed_rad`` / ``pos_open_rad`` are still
+                the placeholder defaults — it is arithmetic on numbers that
+                describe no real travel, and it produces a real target.  On the
+                defaults ``goto(40.0)`` lands at ``+0.61 rad``, past this unit's
+                closed stop at ``+0.05 rad``, so the jaws are driven into it and
+                press there.  Every other motion already refuses through
+                ``_check_calibrated``; this was the way around it.
         """
         self._check_connected()
         self._check_enabled()
+        _check_calibrated(self._config)
         if not math.isfinite(position_rad):
             raise CommandError(
                 f"目标位置不是有限数：position_rad={position_rad!r}。"
@@ -1450,7 +1468,12 @@ class LiteGrip:
         tau_feedforward: float = 0.0,
         duration: float = 1.0,
     ) -> bool:
-        """Sustained move to a target position (longer default duration)."""
+        """Sustained move to a target position (longer default duration).
+
+        Raises:
+            CommandError: the configuration is uncalibrated — see
+                :meth:`goto_rad`.
+        """
         return self.goto_rad(target_rad, kp=kp, kd=kd,
                              tau_feedforward=tau_feedforward,
                              duration=duration)
@@ -1593,11 +1616,16 @@ class LiteGrip:
 
         Raises:
             CommandError: ``target_mm`` or ``speed_mm_s`` is not a finite
-                number.  Both of the shortcuts below compare false against a
-                NaN, so it would slip past them and reach the ramp arithmetic.
+                number, or the configuration is uncalibrated — see
+                :meth:`goto_rad`.  Both of the shortcuts below compare false
+                against a NaN, so it would slip past them and reach the ramp
+                arithmetic.
         """
         self._check_connected()
         self._check_enabled()
+        # Before the shortcuts below: on a placeholder config even a "nothing to
+        # do" comparison is arithmetic on numbers that describe no real travel.
+        _check_calibrated(self._config)
         for name, value in (("target_mm", target_mm),
                             ("speed_mm_s", speed_mm_s)):
             if not math.isfinite(value):
@@ -1641,11 +1669,14 @@ class LiteGrip:
 
         Raises:
             CommandError: ``target_rad`` or ``speed_rad_s`` is not a finite
-                number — see :meth:`move_at_speed`; the clamp further down
-                would otherwise answer a NaN target with a calibrated limit.
+                number, or the configuration is uncalibrated — see
+                :meth:`goto_rad`.  The clamp further down would otherwise answer
+                a NaN target with a calibrated limit.
         """
         self._check_connected()
         self._check_enabled()
+        # Same as ``move_at_speed``: refuse before the "nothing to do" shortcut.
+        _check_calibrated(self._config)
         for name, value in (("target_rad", target_rad),
                             ("speed_rad_s", speed_rad_s)):
             if not math.isfinite(value):
@@ -2151,8 +2182,8 @@ class LiteGrip:
         self._check_enabled()
         if mode not in ("master", "slave"):
             raise ValueError(f"mode must be 'master' or 'slave', got {mode!r}")
-        # Before anything is enabled or driven: ``send_mit_frame`` and
-        # ``goto_rad`` do not check ``calibrated`` themselves.
+        # Before anything is enabled or driven: ``send_mit_frame`` does not
+        # check ``calibrated`` itself (``goto_rad`` now does).
         check_ready(self.config)
         if self._teleop is not None and self._teleop.is_running:
             raise TeleopBusyError("teleop is already running")

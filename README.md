@@ -564,7 +564,13 @@ Worth reading if a gripper is behaving oddly.
   (`GripperConfig.close_sign`). A reverse-mounted gripper is therefore a perfectly ordinary
   configuration, not an error. What is rejected — with `CommandError` — is a configuration that
   has never been calibrated (`GripperConfig.calibrated` still `False`) or whose two limits are
-  equal, because then every direction would be a guess.
+  equal, because then every direction would be a guess. Every motion method refuses such a
+  configuration — `goto`, `goto_rad`, `move_to`, `home` and `move_at_speed*` included, not only
+  the six actions. Those clamp their target into `pos_closed_rad` / `pos_open_rad`, and on the
+  placeholder defaults that clamp is not a safety net but arithmetic on numbers that describe no
+  real travel: `goto(40.0)` on a fresh, never-calibrated object maps to `+0.61 rad`, past the
+  real closed stop at `+0.05 rad`, so the jaws are driven into it and press there (~56 Nm of
+  commanded torque). Load a calibration first; that is the whole gate.
 - **A non-finite value is refused, never clamped.** `goto`, `goto_rad`, `move_at_speed*`, `grasp`
   and `set_force` raise `CommandError` when an argument is NaN or ±inf, and the CAN boundary
   refuses any such field of an MIT frame before it can become bytes. Clamping a NaN answers it
