@@ -253,6 +253,23 @@ class EnableResult:
         return self.ok
 
 
+@dataclass
+class WriteZeroResult:
+    """write_zero 的结果。"""
+
+    before_rad: float                   # 写入前的角度
+    after_rad: float                    # 重新使能后回读的角度
+    tolerance_rad: float = 1e-3         # 回读视为 ~0 的容差
+
+    @property
+    def ok(self) -> bool:
+        """回读是否 ~0（0xFE 是否被电机接受）。"""
+        return abs(self.after_rad) <= self.tolerance_rad
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 目标位置
 # ═══════════════════════════════════════════════════════════════════════════
