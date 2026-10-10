@@ -536,6 +536,14 @@ Worth reading if a gripper is behaving oddly.
   configuration, not an error. What is rejected — with `CommandError` — is a configuration that
   has never been calibrated (`GripperConfig.calibrated` still `False`) or whose two limits are
   equal, because then every direction would be a guess.
+- **A non-finite value is refused, never clamped.** `goto`, `goto_rad`, `move_at_speed*`, `grasp`
+  and `set_force` raise `CommandError` when an argument is NaN or ±inf, and the CAN boundary
+  refuses any such field of an MIT frame before it can become bytes. Clamping a NaN answers it
+  with an end of the range — `q → +12.5 rad`, `kp → 500`, `tau → +10 Nm` — a real command nobody
+  asked for, and `set_force(nan)` used to spin in its climb loop without sending a single frame or
+  ever returning. A feed-forward torque beyond the motor's own frame range (`±10 Nm` on a DM4310,
+  `±28 Nm` on a DM4340) is refused for the same reason: the clamp would have shipped a different
+  force. A finite out-of-range value still clamps, exactly as before.
 - **Pressing torque is bounded by design.** On `open` and `close` — the two moves that press onto
   a stop with no force setpoint — the travel-phase cap of `max_lead_mm` is about 5 Nm, and the
   pressing cap of `stop_lead_mm` is about `kp × stop_lead_mm / rad_to_mm` — roughly `0.94 Nm` at

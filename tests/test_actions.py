@@ -1031,5 +1031,114 @@ class TestForceApproachPressBudget(unittest.TestCase):
             self.assertAlmostEqual(f.tau_ff, 2.0, places=9)
 
 
+class TestNonFiniteInputIsRefused(unittest.TestCase):
+    """非有限值不许变成运动：拒绝带原因，而且**一帧都不发**。
+
+    这里钉住的是 2026-10-10 审计里实测到的旧行为，三条都在假台上复现过：
+
+    - ``goto(nan)``：限位 clamp 的 ``min`` / ``max`` 与 NaN 的比较全为假，NaN 静默
+      变成一个**真实位置**（闭合侧端点），于是夹爪朝那个止点压过去；
+    - ``grasp(nan)``：NaN 一路传到帧上，编码器把它抬到量程上端，线上是 +10 Nm；
+    - ``set_force(nan)``：爬升循环 ``while probe != target_nm`` 一帧都发不出去地
+      永不返回（25 s 里 0 帧）。
+
+    一帧都不发这一条是重点：NaN 不是「大」或「小」的边界，它没有意义，所以拒绝
+    必须发生在机构动之前 —— 夹爪先动一下再报错是不行的。
+    """
+
+    NON_FINITE = (float("nan"), float("inf"), float("-inf"))
+
+    def test_goto_rejects_a_non_finite_position(self):
+        for bad in self.NON_FINITE:
+            g, fake = make_gripper(stops=True)
+            with self.assertRaises(CommandError):
+                g.goto(bad)
+            self.assertEqual(fake.frames, [], f"goto({bad!r}) 竟然发帧了")
+
+    def test_goto_rad_rejects_a_non_finite_position(self):
+        for bad in self.NON_FINITE:
+            g, fake = make_gripper(stops=True)
+            with self.assertRaises(CommandError):
+                g.goto_rad(bad)
+            self.assertEqual(fake.frames, [], f"goto_rad({bad!r}) 竟然发帧了")
+
+    def test_move_at_speed_rejects_a_non_finite_argument(self):
+        for field, bad in (("target_mm", float("nan")),
+                           ("speed_mm_s", float("inf"))):
+            g, fake = make_gripper(stops=True)
+            kwargs = dict(target_mm=40.0, speed_mm_s=30.0)
+            kwargs[field] = bad
+            with self.assertRaises(CommandError):
+                g.move_at_speed(**kwargs)
+            self.assertEqual(fake.frames, [])
+
+    def test_move_at_speed_rad_rejects_a_non_finite_argument(self):
+        for field, bad in (("target_rad", float("nan")),
+                           ("speed_rad_s", float("-inf"))):
+            g, fake = make_gripper(stops=True)
+            kwargs = dict(target_rad=0.0, speed_rad_s=0.5)
+            kwargs[field] = bad
+            with self.assertRaises(CommandError):
+                g.move_at_speed_rad(**kwargs)
+            self.assertEqual(fake.frames, [])
+
+    def test_grasp_rejects_a_non_finite_force_before_it_moves(self):
+        for bad in self.NON_FINITE:
+            g, fake = make_gripper(stops=True)
+            with self.assertRaises(CommandError):
+                g.grasp(bad, hold_s=0.0)
+            self.assertEqual(fake.frames, [], f"grasp({bad!r}) 竟然先动了")
+
+    def test_grasp_rejects_a_non_finite_hold_before_it_moves(self):
+        for bad in self.NON_FINITE:
+            g, fake = make_gripper(stops=True)
+            with self.assertRaises(CommandError):
+                g.grasp(20.0, hold_s=bad)
+            self.assertEqual(fake.frames, [], f"hold_s={bad!r} 竟然先动了")
+
+    def test_the_motion_config_setpoint_is_checked_too(self):
+        """``force_n=None`` 时用的是 ``MotionConfig.force_n`` —— 同一条规则。"""
+        g, fake = make_gripper(
+            stops=True,
+            motion=MotionConfig(force_n=float("nan"), sleep_fn=lambda _: None))
+        with self.assertRaises(CommandError):
+            g.grasp(hold_s=0.0)
+        self.assertEqual(fake.frames, [])
+
+    def test_set_force_rejects_non_finite_force_and_duration(self):
+        for field, bad in (("force_n", float("nan")), ("force_n", float("inf")),
+                           ("duration", float("nan")),
+                           ("duration", float("-inf"))):
+            g, fake = make_gripper(stops=True)
+            kwargs = dict(force_n=20.0, duration=0.0)
+            kwargs[field] = bad
+            with self.assertRaises(CommandError):
+                g.set_force(**kwargs)
+            self.assertEqual(fake.frames, [], f"{field}={bad!r} 竟然发帧了")
+
+    def test_the_force_climb_never_spins_when_a_step_is_absorbed(self):
+        """步长小到被浮点吃掉（``value ± step == value``）时也不许空转。
+
+        旧写法 ``while probe != target_nm`` 这时一步都不挪、永不返回。现在每次爬升
+        都验「到设定值的距离真的变小了」，不成立就抛错。
+        """
+        g, fake = make_gripper(
+            stops=True,
+            motion=MotionConfig(force_ramp_n_s=1e-15, sleep_fn=lambda _: None))
+        with self.assertRaises(CommandError) as ctx:
+            g.set_force(20.0, duration=0.0)
+        self.assertIn("没有朝设定值前进", str(ctx.exception))
+        self.assertEqual(fake.frames, [])
+
+    def test_a_normal_climb_still_lands_on_the_setpoint(self):
+        """上面那道闸门不许改到正常爬升：照旧一帧一步，正好落在设定值上。"""
+        g, fake = make_gripper(stops=True)
+        self.assertTrue(g.set_force(20.0, duration=0.0))
+        taus = [f.tau_ff for f in fake.frames]
+        self.assertTrue(taus, "一帧都没发")
+        self.assertEqual(taus[-1], 2.0)
+        self.assertAlmostEqual(taus[0], 0.01, places=9)   # 一帧一步
+
+
 if __name__ == "__main__":
     unittest.main()
