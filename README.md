@@ -87,12 +87,39 @@ with LiteGrip("can1", mount="reverse") as gripper:
 The same selection is reachable four ways: `LiteGrip(..., mount="reverse")`,
 `gripper.load_template("reverse")`, `gripper.load_calibration(template="reverse")`,
 and — if you already hold the path — `load_calibration(CALIB_TEMPLATES["reverse"])`.
-All four load the identical file. Both templates are nominal: they label the
-direction and give a plausible stroke, which `zero()` then replaces with the
-measurement. A name outside `list_templates()` raises `CommandError` listing the
-valid ones, and a template that cannot be read raises rather than falling back —
-the fallback would be the factory file, and that is a *normal* mount, so answering
+All four load the identical file. Both templates carry the shipped unit's geometry and differ
+only in which limit they call closed: they declare the direction, and `zero()` then replaces the
+limits and the scale with your own measurement. A name outside `list_templates()` raises
+`CommandError` listing the valid ones, and a template that cannot be read raises rather than
+falling back — the fallback would be the factory file, and that is a *normal* mount, so answering
 a request for reverse with normal is the one failure the name exists to prevent.
+
+`zero()` is the only place the SDK asks for a number it cannot measure itself: the jaws' travel,
+in millimetres, as read off calipers. Put it in `GripperConfig.max_stroke_mm` — 85 mm by default,
+which is the shipped hardware:
+
+```python
+gripper.config.max_stroke_mm = 85.0     # your caliper measurement
+gripper.zero()                          # probes both stops, derives rad_to_mm, saves to disk
+```
+
+The scale it derives is that travel **plus the probe's inset**, over the span the probe recorded:
+
+```text
+rad_to_mm = (max_stroke_mm + STOP_INSET_MM) / recorded_travel_rad
+```
+
+The inset is not a fudge factor. The probe finds the open stop by pressing about a millimetre
+*into* it, so the two recorded extremes span that much more than the jaws actually travel
+(`GripperGeometry.SPAN_MM`, 86 mm, against `JAW_TRAVEL_MM`, 85 mm). Two errors follow from getting
+it wrong, and they are equal and opposite: dividing the recorded span by the caliper measurement
+alone leaves every mm-based move 1.2% short — 1 mm lost per full stroke — while putting the
+recorded span into `max_stroke_mm` adds the same millimetre a second time. On the shipped unit the
+defaults reproduce the factory file's own scale exactly: `86 / 1.409552 = 61.0123 mm/rad`.
+
+Set `max_stroke_mm` only when the jaws you measured are not 85 mm. It is the one per-unit geometry
+the SDK asks for, and no calibration file carries it — a file's own `rad_to_mm` is read as-is, so
+the number matters only when you re-probe.
 
 Deciding which is which takes one look: with the jaws visible, run a small move
 and see which way they travel. Choosing the wrong mount is not silent — the
@@ -207,7 +234,8 @@ the jaws without opening a second CAN reader.
   speed fed forward as `dq`, and each of its frames stays within a lead cap: the commanded position
   may lead the measured one by at most `lead_cap_mm` (default `4` mm). Torque is
   `kp * (q_cmd - q_measured)`, so that bounds the align's commanded torque by construction — about
-  5.4 Nm out of the box. Capping does not make the move slower for free: the jaws still travel, they
+  5.30 Nm at the config defaults (`kp = 100`, `rad_to_mm = 75.44`). Capping does not make the move
+  slower for free: the jaws still travel, they
   just press with a bounded torque while they catch up. The **follow loop is deliberately not
   capped** — it commands the leader's opening outright so the follower stays responsive, and
   `torque_limit_nm` is what protects it under load. `lead_cap_mm=0` disables the align's cap;
@@ -338,8 +366,8 @@ outcome before reporting success, so callers do not re-implement ramps or stall 
 
 | Method | Behaviour | Returns |
 | --- | --- | --- |
-| `open(speed_mm_s=None)` | Ramps *past* the calibrated open-side stop and lets the mechanical stop end the move. | `MoveResult` |
-| `close(speed_mm_s=None)` | Same, toward the closed side. | `MoveResult` |
+| `open(speed_mm_s=None)` | Ramps *past* the calibrated open-side stop and lets the mechanical stop end the move. With `GripperConfig.work_stroke_mm` set it stops at that opening instead and never presses the stop — the shipped calibration sets it to `80.0`, so a plain `open()` ends 6 mm inside the recorded open extreme, 5 mm short of the jaws' full travel. | `MoveResult` |
+| `close(speed_mm_s=None)` | Same, toward the closed side. `work_stroke_mm` is an open-side number and does not change where a close ends. | `MoveResult` |
 | `grasp(force_n=None, hold_s=0.0)` | Closes until it stalls (i.e. grips), then ramps to and holds `force_n`. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. `hold_s=0` holds forever. | `GraspResult` |
 | `zero()` | Full calibration: probes both mechanical stops, derives travel and `rad_to_mm`, saves to disk. It preserves the direction already declared by the loaded calibration; a stall cannot tell one stop from the other. | `CalibrationData` |
 | `enable(retries=None)` | Sends enable and re-reads the status frame, retrying until it reports `err == 1`. | `EnableResult` |
@@ -466,8 +494,9 @@ Worth reading if a gripper is behaving oddly.
 - **An approach that carries a force setpoint spends that setpoint as its budget.** `grasp`'s
   closing leg is still a position frame, so on meeting the object the drive computes the torque
   itself: `kp × lead + kd × commanded speed` — decided by how fast the leg travels and how far the
-  engine lets the command lead, not by the force that was asked for. At the defaults that is
-  5.4 Nm from the lead cap alone, about 54 N, and it was the same 54 N whether the grasp asked for
+  engine lets the command lead, not by the force that was asked for. At the config defaults that is
+  `kp × max_lead_mm / rad_to_mm` = 5.30 Nm from the lead cap alone, about 53 N, and it was the same
+  53 N whether the grasp asked for
   5 N or 40 N. So this leg hands its budget (`force_n × 0.1 × press_safety`) to the three terms a
   frame can spend it on, in this order: the tick's own step (`kp × v × dt`, which only the speed
   can cover), then the damping (`kd`), then the lead. Meeting the object then presses at about
@@ -537,16 +566,20 @@ Worth reading if a gripper is behaving oddly.
   has never been calibrated (`GripperConfig.calibrated` still `False`) or whose two limits are
   equal, because then every direction would be a guess.
 - **Pressing torque is bounded by design.** On `open` and `close` — the two moves that press onto
-  a stop with no force setpoint — the travel-phase cap of `max_lead_mm` is about 5 Nm, and the
-  pressing cap of `stop_lead_mm` is about `kp × stop_lead_mm / rad_to_mm` — roughly `0.94 Nm` at
-  the defaults (`kp=100`, `stop_lead_mm=0.7`, `rad_to_mm≈74`), about a third of the 3 Nm rating.
+  a stop with no force setpoint — the travel-phase cap of `max_lead_mm` is about
+  `kp × max_lead_mm / rad_to_mm`, and the pressing cap of `stop_lead_mm` about
+  `kp × stop_lead_mm / rad_to_mm`. **`kp` is whichever is in effect, and a calibration file that
+  carries one overrides the `GripperConfig` default.** At the config defaults (`kp=100`,
+  `max_lead_mm=4.0`, `stop_lead_mm=0.7`, `rad_to_mm=75.44`) that is `5.30 Nm` and `0.93 Nm`; with
+  the shipped calibration loaded it is `0.33 Nm` and `0.06 Nm`, because that file sets `kp=5.0`.
   `grasp`'s closing leg is bounded by its setpoint instead, as described under *How the motion
   works*. The caps cannot usefully go below one frame of travel
   (`speed_mm_s × frame_interval`, `0.25 mm` at the defaults), otherwise the ramp's own step gets
   clipped. If `open`/`close` does not press home reliably — the jaw coasts in and settles further
   than `stop_tol`, so it reports `ok=False` — raise `stop_lead_mm` until it does without audible
-  impact; the default is arithmetic, not a hardware measurement, and needs confirming on the
-  real unit.
+  impact. Every number here is arithmetic from the two formulas above, not a hardware measurement:
+  whether a given unit presses home at them has to be confirmed on that unit, and the shipped
+  calibration's `kp=5.0` makes its `0.06 Nm` the first thing to check.
 - **Sustained pressing heats the coil.** `open` and `close` now hold against the stop for the
   settle phase every time, so check the coil temperature if they run back to back.
 - **`open`, `close`, `grasp` and `zero` drive the jaws into mechanical stops or apply sustained

@@ -92,6 +92,7 @@ from .models import (
 
 # ── Constants & enums ───────────────────────────────────────────────────
 from .constants import (
+    GripperGeometry,
     GripperParams,
     UnitConversion,
     ErrorCode,
@@ -216,6 +217,7 @@ __all__ = [
     "GripperMode",
     "CalibrationData",
     # Constants
+    "GripperGeometry",
     "GripperParams",
     "UnitConversion",
     "ErrorCode",

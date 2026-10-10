@@ -15,7 +15,7 @@ from unittest import mock
 import _sdkpath  # noqa: F401
 import litegrip.gripper as gripper_mod
 from litegrip import (CALIB_TEMPLATES, LiteGrip, CommandError, GripperConfig,
-                      default_calib_path, list_templates)
+                      GripperGeometry, default_calib_path, list_templates)
 from litegrip.gripper import _FACTORY_CALIB
 
 from fake_can import (DT, POS_CLOSED_RAD, POS_OPEN_RAD, Frame, make_gripper)
@@ -241,9 +241,63 @@ class TestCalibratePreservesDirection(unittest.TestCase):
     def test_travel_matches_the_template_after_calibration(self):
         g, data = self._calibrate(reverse=True)
         self.assertGreater(data.travel_range, 0)
-        self.assertAlmostEqual(g.config.rad_to_mm,
-                               g.config.max_stroke_mm / data.travel_range,
-                               places=2)
+        self.assertAlmostEqual(
+            g.config.rad_to_mm,
+            (g.config.max_stroke_mm + GripperGeometry.STOP_INSET_MM)
+            / data.travel_range,
+            places=2)
+
+
+class TestDerivedScale(unittest.TestCase):
+    """``rad_to_mm`` 由 ``max_stroke_mm + 压入量`` 除以实测行程得来。
+
+    分子带上压入量不是笔误：标定探针压着张开限位找它，记录的跨度比两爪真正
+    能走的行程宽出约 1 mm。少算这一截，每个 mm 目标都短 1.2%（满行程丢 1 mm）。
+    """
+
+    def test_the_reference_scale_is_the_hand_recorded_one(self):
+        """(85 + 1) / 1.409552 必须等于出厂文件里手记的那一个。"""
+        self.assertAlmostEqual(
+            (GripperGeometry.JAW_TRAVEL_MM + GripperGeometry.STOP_INSET_MM)
+            / 1.409552,
+            61.01229326764816,
+            places=9)
+
+    def test_re_running_the_probe_on_a_shipped_unit_reproduces_its_scale(self):
+        """照出厂几何重跑一次标定，推出来的比例要和出厂文件自带的一样。
+
+        这是「新手照文档走一遍不会得到另一套数字」的那条不变量：默认
+        ``max_stroke_mm`` 与出厂文件的行程，必须把这台机器手记的比例重新推出来。
+        """
+        with open(_FACTORY_CALIB) as f:
+            data = json.load(f)
+        self.assertAlmostEqual(
+            gripper_mod._scale_from_travel(GripperConfig(),
+                                           data["travel_range_rad"]),
+            data["rad_to_mm"],
+            places=9)
+
+    def test_deriving_from_the_jaw_travel_alone_would_be_short(self):
+        """反例：只除 85 mm 得到的比例矮了一截 —— 钉住分子里有压入量。"""
+        travel_rad = 1.409552
+        short = GripperGeometry.JAW_TRAVEL_MM / travel_rad
+        self.assertLess(short, 61.01229326764816)
+        self.assertLess(61.01229326764816 - short, 0.8)   # 粗差，不是笔误量级
+
+    def test_a_coincident_travel_refuses_instead_of_inventing_a_scale(self):
+        """两端止点重合时抛错，绝不再写一个凭空的 105.26 比例。"""
+        for travel in (0.0, -1.0):
+            with self.assertRaises(RuntimeError) as ctx:
+                gripper_mod._scale_from_travel(GripperConfig(), travel)
+            self.assertIn("推不出", str(ctx.exception))
+
+    def test_the_helper_uses_the_configured_stroke(self):
+        """比例的分子跟着 ``max_stroke_mm`` 走，不是硬编码的 85。"""
+        cfg = GripperConfig()
+        cfg.max_stroke_mm = 40.0
+        self.assertAlmostEqual(
+            gripper_mod._scale_from_travel(cfg, 0.5),
+            (40.0 + GripperGeometry.STOP_INSET_MM) / 0.5)
 
 
 class TestHomeDirection(unittest.TestCase):
