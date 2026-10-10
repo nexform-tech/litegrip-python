@@ -166,6 +166,8 @@ class FakeLiteGripCAN:
         self.disconnected = False
         self.error_when_holding: Optional[int] = None
         self.holding = False
+        #: 收帧次数 —— 守住「每下发一帧就 poll 一次」的时序（set_force 曾经丢掉）。
+        self.poll_calls = 0
 
     # ── 运动 ───────────────────────────────────────────────────────────
     def control_mit(self, q_target, kp, kd, dq_target=0.0,
@@ -189,6 +191,7 @@ class FakeLiteGripCAN:
 
     # ── 状态 ───────────────────────────────────────────────────────────
     def poll(self, timeout_s: float = 0.0) -> bool:
+        self.poll_calls += 1
         return True
 
     def update_state(self, timeout_s: float = 0.05) -> bool:

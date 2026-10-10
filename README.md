@@ -340,7 +340,7 @@ outcome before reporting success, so callers do not re-implement ramps or stall 
 | --- | --- | --- |
 | `open(speed_mm_s=None)` | Ramps *past* the calibrated open-side stop and lets the mechanical stop end the move. | `MoveResult` |
 | `close(speed_mm_s=None)` | Same, toward the closed side. | `MoveResult` |
-| `grasp(force_n=None, hold_s=0.0)` | Closes until it stalls (i.e. grips), then holds `force_n`. `hold_s=0` holds forever. | `GraspResult` |
+| `grasp(force_n=None, hold_s=0.0)` | Closes until it stalls (i.e. grips), then ramps to and holds `force_n`. `hold_s=0` holds forever. | `GraspResult` |
 | `zero()` | Full calibration: probes both mechanical stops, derives travel and `rad_to_mm`, saves to disk. It preserves the direction already declared by the loaded calibration; a stall cannot tell one stop from the other. | `CalibrationData` |
 | `enable(retries=None)` | Sends enable and re-reads the status frame, retrying until it reports `err == 1`. | `EnableResult` |
 | `disable()` | Disables the motor (zero torque, back-drivable by hand). | `bool` |
@@ -399,6 +399,7 @@ with LiteGrip("can0") as gripper:
 | `stop_lead_mm` | `0.7` | lead cap while pressing, so pressing torque is about `kp × stop_lead_mm` |
 | `stop_tol` | `0.02` | how close to the calibrated stop the jaw must park to count as pressed home, radians |
 | `force_n` | `20.0` | default `grasp` force |
+| `force_ramp_n_s` | `20.0` | rate the held force climbs to its setpoint, N/s |
 | `hold_interval` | `0.2` | force-hold slice length, seconds |
 | `hold_kp` / `hold_kd` | `150.0` / `2.0` | deprecated — the force hold uses no gains; setting them changes nothing |
 | `enable_retries` / `enable_retry_interval` | `3` / `0.2` | enable retry count and gap |
@@ -481,6 +482,22 @@ Worth reading if a gripper is behaving oddly.
   turns into a force error the moment the jaws move, and at `kp = 150` the closed side's
   ~`0.0103 rad` stick-slip step is worth about `15 N`. `hold_kp` / `hold_kd` used to do
   exactly that; they are now ignored.
+- **The held force is ramped to its setpoint, not stepped to it.** Entering the hold, the
+  torque climbs at `force_ramp_n_s` (20 N/s) from the torque already in flight — the
+  closing press, about `10 N` on the bench — one step per frame, and lands exactly on the
+  setpoint rather than approaching it. A step into a contact is an impulse through the
+  mechanism and the fingers bounce off what they just touched; a rate is what makes the
+  force climb evenly. At 20 N/s a hand-over from a ~`10 N` press reaches a `20 N` setpoint
+  in half a second, and a setpoint moved to at most the rated `40 N` takes two. Do not
+  specify the climb as a *duration* instead: a duration-shaped ramp is at its steepest in
+  its first tick, which is a step with a slow tail.
+- **`set_force`'s `duration` is the hold time after the climb, not a budget that includes
+  it.** The call ramps to the setpoint, holds there for `duration` seconds, then returns,
+  so its wall clock is `climb + duration`. From a released grip at the default
+  `duration=0.3`, `set_force(20.0)` climbs for about `1.0 s` and then holds `0.3 s`, so it
+  blocks for about `1.3 s` where it used to be just `0.3 s`. The force always lands on the
+  setpoint, so a short `duration` still gets the full force — it only shortens the hold.
+  `duration=0` ramps to the setpoint and returns without holding.
 - **`enable` is a verified one-way command.** Enabling sends a CAN frame with no
   acknowledgement, so a dropped frame goes unnoticed and the motor silently stays disabled.
   `enable()` therefore sends it, re-reads the status frame, and reports success only when
