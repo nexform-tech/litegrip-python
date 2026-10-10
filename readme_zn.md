@@ -83,10 +83,34 @@ with LiteGrip("can1", mount="reverse") as gripper:
 
 同一个选择有四个入口：`LiteGrip(..., mount="reverse")`、`gripper.load_template("reverse")`、
 `gripper.load_calibration(template="reverse")`，以及已有路径时的
-`load_calibration(CALIB_TEMPLATES["reverse"])`；四者加载的是同一个文件。两份模板都只是
-**标称**值：用处是声明方向、给一个像样的行程，随后 `zero()` 会把行程换成实测值。名字不在
-`list_templates()` 里会抛 `CommandError` 并列出合法名字；模板读不出来时**直接抛**、不回退 ——
-出厂文件是正装，拿它回答「反装」的请求，正是这个按名字选的入口要防的失败。
+`load_calibration(CALIB_TEMPLATES["reverse"])`；四者加载的是同一个文件。两份模板带的都是出厂
+这台机器的几何，只有「哪个限位算闭合」互换：它们负责声明方向，随后 `zero()` 会把限位和比例
+换成你自己测的。名字不在 `list_templates()` 里会抛 `CommandError` 并列出合法名字；模板读不出来
+时**直接抛**、不回退 —— 出厂文件是正装，拿它回答「反装」的请求，正是这个按名字选的入口要防的
+失败。
+
+`zero()` 唯一需要你给的、SDK 自己量不出来的数，是两爪的行程（mm，卡尺读数）。放进
+`GripperConfig.max_stroke_mm` —— 默认 85 mm，就是出厂这台：
+
+```python
+gripper.config.max_stroke_mm = 85.0     # 你的卡尺读数
+gripper.zero()                          # 探两端限位，推出 rad_to_mm，写盘
+```
+
+它推出的比例是**行程加上探针的压入量**，除以探到的跨度：
+
+```text
+rad_to_mm = (max_stroke_mm + STOP_INSET_MM) / 探到的跨度_rad
+```
+
+压入量不是凑出来的数。探针是**压进**张开限位约 1 mm 才找到它的，所以记录下来的两端比两爪真正
+能走的行程宽出这么多（`GripperGeometry.SPAN_MM` 86 mm，对 `JAW_TRAVEL_MM` 85 mm）。搞错它会
+得到两个等大反向的误差：只拿卡尺读数除以探到的跨度，每个按 mm 走的目标都短 1.2%（满行程丢
+1 mm）；而把探到的跨度填进 `max_stroke_mm`，等于把那 1 mm 又加了一遍。出厂这台用默认值重推，
+结果和出厂文件自带的比例分毫不差：`86 / 1.409552 = 61.0123 mm/rad`。
+
+只有当你量到的行程不是 85 mm 时，才需要设 `max_stroke_mm`。这是 SDK 唯一要求的单机几何量，而且任何
+标定文件都不带它 —— 文件自带的 `rad_to_mm` 是照读的，所以这个数只在重新标定时起作用。
 
 判断是哪一种只需要看一眼：让夹爪走一小段，看指爪往哪边动。选错装法不是无声的 —— 加载时会
 把推导出的方向打进日志，第一次 `close()` 也会朝错的方向走。随时可以用 `gripper.mount` 读回来
@@ -289,8 +313,8 @@ python3 examples/trajectory.py --play pick --repeat 3
 
 | 方法 | 行为 | 返回 |
 | --- | --- | --- |
-| `open(speed_mm_s=None)` | 按斜坡**越过**标定的张开侧限位，由机械限位结束这趟运动。 | `MoveResult` |
-| `close(speed_mm_s=None)` | 同上，朝闭合侧。 | `MoveResult` |
+| `open(speed_mm_s=None)` | 按斜坡**越过**标定的张开侧限位，由机械限位结束这趟运动。设了 `GripperConfig.work_stroke_mm` 就改为停在那段开口处，不顶限位 —— 出厂标定把它设成 `80.0`，所以普通一次 `open()` 停在记录张开端内侧 6 mm 处，即两爪满行程前 5 mm。 | `MoveResult` |
+| `close(speed_mm_s=None)` | 同上，朝闭合侧。`work_stroke_mm` 是张开侧的数，不改变闭合停在哪儿。 | `MoveResult` |
 | `grasp(force_n=None, hold_s=0.0)` | 闭合到堵转（即夹住），然后爬到并持续输出 `force_n`。闭合段带着 `force_n` 当力矩预算走，所以撞上工件时压出的力不超过设定值。`hold_s=0` 表示不限时长。 | `GraspResult` |
 | `zero()` | 完整标定：探测两端机械限位，算出行程与 `rad_to_mm`，并存盘。它沿用已加载标定声明的方向 —— 堵转分不出撞到的是哪一端。 | `CalibrationData` |
 | `enable(retries=None)` | 下发使能并回读状态帧，反复重试直到回读到 `err == 1`。 | `EnableResult` |
@@ -464,14 +488,16 @@ with LiteGrip("can0") as gripper:
   `CommandError` 拒绝的是「从没标定过」（`GripperConfig.calibrated` 仍为 `False`）和「两个
   限位相等」，因为那时方向全是猜的。
 - **压紧力矩是有界的。** 对 `open` 和 `close` —— 那两个不带设定力、直接顶限位的动作 ——
-  行进段的 `max_lead_mm` 上限约 5 Nm，压紧段的 `stop_lead_mm` 上限约
-  `kp × stop_lead_mm / rad_to_mm`，默认（`kp=100`、`stop_lead_mm=0.7`、`rad_to_mm≈74`）
-  约 `0.94 Nm`，约为额定 3 Nm 的三分之一。`grasp` 的闭合段则由它自己的设定值封顶，
-  见「运动逻辑」那一节。上限再往下调没有意义：低于一帧的位移
-  （`speed_mm_s × frame_interval`，默认 0.25 mm）就会把斜坡自己那一格切掉。压不实就往上调
-  `stop_lead_mm`（表现为夹爪冲进来后压不住、停稳位置超出 `stop_tol`，于是 `open`/`close`
-  报 `ok=False`），调到能稳定压住、又听不到撞击声为止；默认值只是算术结果，不是真机实测值，
-  必须在真机上确认。
+  行进段的 `max_lead_mm` 上限约 `kp × max_lead_mm / rad_to_mm`，压紧段的 `stop_lead_mm` 上限约
+  `kp × stop_lead_mm / rad_to_mm`。**`kp` 取的是当下生效的那个，而标定文件里带的 `kp` 会盖过
+  `GripperConfig` 的默认值。** 按配置默认（`kp=100`、`max_lead_mm=4.0`、`stop_lead_mm=0.7`、
+  `rad_to_mm=75.44`）是 `5.30 Nm` 和 `0.93 Nm`；加载出厂标定后是 `0.33 Nm` 和 `0.06 Nm`，
+  因为那份文件把 `kp` 设成了 `5.0`。`grasp` 的闭合段则由它自己的设定值封顶，见「运动逻辑」那
+  一节。上限再往下调没有意义：低于一帧的位移（`speed_mm_s × frame_interval`，默认 0.25 mm）
+  就会把斜坡自己那一格切掉。压不实就往上调 `stop_lead_mm`（表现为夹爪冲进来后压不住、停稳位置
+  超出 `stop_tol`，于是 `open`/`close` 报 `ok=False`），调到能稳定压住、又听不到撞击声为止。
+  这里每个数都是上面两条公式的算术结果，不是真机实测值：某台机器在这几个数下压不压得实，必须
+  在那台机器上确认；出厂标定的 `kp=5.0` 让它的 `0.06 Nm` 成为第一个要查的点。
 - **持续压紧会让线圈发热。** `open` 和 `close` 现在每次都顶着限位走完保压段，连续跑要留意
   线圈温度。
 - **`open`、`close`、`grasp`、`zero` 会主动撞向机械限位或持续施力。** 除非就是要夹它，

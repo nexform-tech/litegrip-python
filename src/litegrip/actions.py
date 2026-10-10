@@ -372,7 +372,7 @@ def work_limit_target(
     """张开侧「工作行程」目标：从闭合零点起算 ``work_stroke_mm`` 处的指令位置。
 
     与 :func:`press_target` 相反 —— 它**不**越位压到机械限位，而是在限位内侧
-    留出一段余量（现场口径：机械行程 87 mm，工作只用到 80 mm，开口端留 7 mm）。
+    留出一段余量（现场口径：两爪行程 85 mm，工作只用到 80 mm，开口端留 5 mm）。
     余量是**显式**的毫米数，不是 :func:`limit_target` 那种按行程比例的 ``margin``。
 
     方向来自 :attr:`GripperConfig.close_sign`，所以反装的机器同样成立。目标按

@@ -112,6 +112,7 @@ from .models import (
     CalibrationData,
 )
 from .constants import (
+    GripperGeometry,
     GripperParams,
     UnitConversion,
     DefaultParams,
@@ -124,6 +125,30 @@ from .exceptions import (
     HardwareError,
     NotInitializedError,
 )
+
+
+def _scale_from_travel(config: GripperConfig, travel_rad: float) -> float:
+    """A probed travel in radians → millimetres per radian.
+
+    The numerator is ``max_stroke_mm + STOP_INSET_MM`` rather than
+    ``max_stroke_mm``: the probe presses *into* the open stop to find it, so the
+    two recorded extremes span about a millimetre more than the jaws can
+    actually travel.  See :class:`~litegrip.constants.GripperGeometry`.
+
+    Deriving the scale from the jaw travel alone is a 1.2% short scale — 1 mm
+    lost per full stroke — and it is what this used to do, on top of a nominal
+    stroke (120 mm) that belonged to no gripper in this family.
+
+    Raises:
+        RuntimeError: the two stops coincide, so no scale can be derived.  A
+            calibration that cannot produce a scale must not invent one.
+    """
+    if not travel_rad > 0:
+        raise RuntimeError(
+            f"标定失败：两端止点重合成 {travel_rad:.6f} rad 的行程，推不出 "
+            "mm/rad。确认夹爪真的走完了全程，再重新标定。")
+    return ((config.max_stroke_mm + GripperGeometry.STOP_INSET_MM)
+            / travel_rad)
 
 
 def default_calib_path(channel: str = DefaultParams.CAN_CHANNEL) -> str:
@@ -750,7 +775,7 @@ class LiteGrip:
                 "请重新标定。"
             )
 
-        rad_to_mm = self._config.max_stroke_mm / travel if travel > 0 else 105.26
+        rad_to_mm = _scale_from_travel(self._config, travel)
 
         result = CalibrationData(
             zero_position=round(close_rad, 6),      # closed → 0 mm
@@ -919,7 +944,7 @@ class LiteGrip:
         if travel <= 0:
             raise RuntimeError(f"行程异常: close={close_rad:.4f} == open={open_rad:.4f}")
 
-        rad_to_mm = self._config.max_stroke_mm / travel
+        rad_to_mm = _scale_from_travel(self._config, travel)
 
         result = CalibrationData(
             zero_position=round(close_rad, 6),
@@ -1493,7 +1518,9 @@ class LiteGrip:
         linear ramp from current position to *target_mm*.
 
         Args:
-            target_mm: Target position in mm (0=closed, 120=open).
+            target_mm: Target position in mm, measured from the closed stop
+                (``0`` = closed; ``config.max_stroke_mm``, 85 mm by default,
+                = fully open).
             speed_mm_s: Travel speed in mm/s (default 30).
             kp: Position stiffness (default from config).
             kd: Velocity damping.
@@ -1758,7 +1785,7 @@ class LiteGrip:
         # zero_pos = close limit, max_pos = open limit; which is numerically
         # larger depends on the mount, so take the magnitude.
         travel = abs(zero_pos - max_pos)
-        rad_to_mm = self._config.max_stroke_mm / travel if travel > 0 else 105.26
+        rad_to_mm = _scale_from_travel(self._config, travel)
 
         result = CalibrationData(
             zero_position=round(zero_pos, 6),      # closed → 0 mm
@@ -1779,7 +1806,8 @@ class LiteGrip:
 
         print(f"\n  标定结果:")
         print(f"    闭合(0mm): {result.zero_position:.6f} rad")
-        print(f"    张开(120mm): {result.max_position:.6f} rad")
+        print(f"    张开({self._config.max_stroke_mm:.0f}mm): "
+              f"{result.max_position:.6f} rad")
         print(f"    行程:     {result.travel_range:.6f} rad  "
               f"({result.travel_mm:.1f} mm)")
         print(f"    转换系数: {result.rad_to_mm:.1f} mm/rad")
