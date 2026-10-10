@@ -5,8 +5,9 @@ from __future__ import annotations
 import unittest
 
 import _sdkpath  # noqa: F401
-from litegrip import (CommandError, GraspResult, MotionConfig, limit_target,
-                      press_target, work_limit_target)
+from litegrip import (CommandError, GraspResult, MotionConfig, UnitConversion,
+                      force_approach_terms, limit_target, press_target,
+                      work_limit_target)
 from litegrip.actions import GripperActions
 
 from fake_can import (DT, POS_CLOSED_RAD, POS_OPEN_RAD, RAD_TO_MM,
@@ -383,7 +384,8 @@ class TestGrasp(unittest.TestCase):
         block = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2     # 当作工件
         g, fake = make_gripper(block_rad=block)
         g.motion_config = self._motion(0.4)
-        res = g.grasp(force_n=20.0, hold_s=0.4)
+        # 保力按 force_ramp_n_s 从交接力矩爬上去，给够时间让爬升落到设定值
+        res = g.grasp(force_n=20.0, hold_s=1.2)
 
         self.assertIsInstance(res, GraspResult)
         self.assertEqual(res.force_n, 20.0)
@@ -440,7 +442,9 @@ class TestForceHoldIsTorqueOnly(unittest.TestCase):
     def test_a_yielding_workpiece_does_not_erode_the_hold_force(self):
         g, fake = self._yielding_gripper()
         g.motion_config = self._motion()
-        res = g.grasp(force_n=20.0, hold_s=0.4)
+        # 保力先按 force_ramp_n_s 爬到设定值，之后才是这条用例要看的「停在
+        # 设定值上不被工件带走」那一段 —— 时长得容下爬升
+        res = g.grasp(force_n=20.0, hold_s=1.2)
 
         self.assertTrue(res.ok, res)
         hold = [f for f in fake.frames if f.tau_ff == 2.0]      # 20 N → 2.0 Nm
@@ -455,7 +459,8 @@ class TestForceHoldIsTorqueOnly(unittest.TestCase):
         # hold_kp / hold_kd 已废弃：显式设上也不该出现在保力帧里
         g, fake = self._yielding_gripper()
         g.motion_config = self._motion(hold_kp=300.0, hold_kd=9.0)
-        g.grasp(force_n=20.0, hold_s=0.4)
+        # 同上：给够时间让爬升落到设定值，才取得到「停在设定值上」的保力帧
+        g.grasp(force_n=20.0, hold_s=1.2)
 
         hold = [f for f in fake.frames if f.tau_ff == 2.0]
         self.assertTrue(hold, "没有保力帧")
@@ -489,17 +494,25 @@ class TestHeldForceRampsToSetpoint(unittest.TestCase):
 
     为了让交接处飞行力矩（约 10 N）低于设定值（20 N），把行进段领先上限收到
     ``max_lead_mm=0.74``：``kp × 上限 ≈ 0.997 Nm ≈ 10 N``，真机上的量级。
+    接近速度也一并降到 ``grasp_speed_mm_s=25``：闭合段现在带着设定力的预算走
+    （见 :func:`force_approach_terms`），而阻尼项 ``kd × v`` 先从预算里扣，默认
+    50 mm/s 下它要吃掉 1.35 Nm —— 20 N 的预算只剩 1.8 Nm，领先就被压到 0.74 mm
+    以下，飞行力矩不再是这 10 N。25 mm/s 下阻尼 0.67 Nm，0.74 mm 的领先上限
+    还是先绑住的那一个。
     """
 
     #: 工件：行程中段的硬挡块（不移位，专注看力矩的形状）
     OBJECT_RAD = POS_OPEN_RAD + 0.5 * (POS_CLOSED_RAD - POS_OPEN_RAD)
     #: kp=100 × 0.74/74.19 ≈ 1.0 Nm ≈ 10 N 的压紧力
     PRESS_LEAD_MM = 0.74
+    #: 让 0.74 mm 的领先上限仍然绑在预算之内的接近速度
+    APPROACH_SPEED_MM_S = 25.0
     #: force_ramp_n_s × frame_interval × 0.1 Nm/N = 20 × 0.005 × 0.1
     STEP_NM = 20.0 * DT * 0.1
     FRAMES_PER_SLICE = 40                       # hold_interval 0.2 ÷ frame_interval 0.005
 
     def _motion(self, **kw):
+        kw.setdefault("grasp_speed_mm_s", self.APPROACH_SPEED_MM_S)
         return MotionConfig(max_lead_mm=self.PRESS_LEAD_MM,
                             sleep_fn=lambda _: None,
                             monotonic_fn=tick_clock(0.1), **kw)
@@ -568,17 +581,20 @@ class TestHeldForceRampsToSetpoint(unittest.TestCase):
                                   self.STEP_NM * self.FRAMES_PER_SLICE, places=9)
 
     def test_a_torque_already_past_the_setpoint_starts_at_the_setpoint(self):
-        # 默认行进上限（4 mm）下压紧力矩 ≈ 5.4 Nm，远超 20 N 的设定值：没有可爬
-        # 的，直接从设定值起步 —— 往下走到设定值不是冲击。
+        # 交接力矩已经越过设定值时没有可爬的，直接从设定值起步 —— 往下走到设定值
+        # 不是冲击。grasp 现在走不到这一支：闭合段压出的力矩由设定力的预算封顶
+        # （press_safety=0.9），压紧力恒在设定值之下。所以这里直接进保力，把飞行
+        # 力矩摆到设定值之上，钉住这个守卫本身。
         g, fake = make_gripper(block_rad=self.OBJECT_RAD)
         g.motion_config = MotionConfig(sleep_fn=lambda _: None,
                                        monotonic_fn=tick_clock(0.1))
-        g.grasp(force_n=20.0, hold_s=0.4)
+        fake.motor.tau = 5.0                      # 飞行力矩 ≈ 50 N，远超 20 N 设定值
+        g.actions._hold_force(20.0, 0.4)
 
-        move = [f for f in fake.frames if f.kp != 0.0]
         hold = [f for f in fake.frames if f.kp == 0.0]
-        self.assertGreater(move[-1].tau_nm, 2.0)
+        self.assertTrue(hold, "没有保力帧")
         self.assertAlmostEqual(hold[0].tau_ff, 2.0, places=9)
+
 
 
 class TestSetForceRampsToo(unittest.TestCase):
@@ -840,11 +856,179 @@ class TestStallTorqueProtection(unittest.TestCase):
         g, fake = make_gripper(block_rad=block)
         g.motion_config = MotionConfig(
             sleep_fn=lambda _: None, monotonic_fn=tick_clock(0.1))
-        res = g.grasp(force_n=20.0, hold_s=0.4)
+        # 保力爬升落到设定值需要时间，不然「有保力帧」这一条抓的是爬升中的帧
+        res = g.grasp(force_n=20.0, hold_s=1.2)
 
         self.assertTrue(res.stalled, res)     # 撞上工件（位置式堵转）
         self.assertTrue(res.ok, res)          # 保力正常，没被保护打断
         self.assertTrue([f for f in fake.frames if f.tau_ff == 2.0])  # 有保力帧
+
+
+class TestForceApproachTerms(unittest.TestCase):
+    """``force_approach_terms`` 的算术：三项加起来的压紧力矩不超预算。"""
+
+    KP = 100.0
+    KD = 2.0
+    DT = 0.005
+
+    def terms(self, force_n, speed_mm_s, budget_nm=None, ceiling_mm=4.0):
+        budget = (force_n * UnitConversion.N_TO_NM * 0.9
+                  if budget_nm is None else budget_nm)
+        return force_approach_terms(self.KP, self.KD, speed_mm_s / RAD_TO_MM,
+                                    self.DT, budget, ceiling_mm / RAD_TO_MM)
+
+    def press(self, force_n, speed_mm_s, **kw):
+        """一帧撞上工件时压出的力矩：``kp × 领先 + kd × 速度``。"""
+        v_rad_s, kd, lead_rad = self.terms(force_n, speed_mm_s, **kw)
+        return self.KP * lead_rad + kd * v_rad_s
+
+    def test_the_three_terms_never_add_up_past_the_budget(self):
+        for force_n in (0.5, 1.0, 5.0, 20.0, 40.0):
+            for speed_mm_s in (5.0, 25.0, 50.0, 150.0):
+                with self.subTest(force_n=force_n, speed_mm_s=speed_mm_s):
+                    budget = force_n * UnitConversion.N_TO_NM * 0.9
+                    self.assertLessEqual(self.press(force_n, speed_mm_s),
+                                         budget + 1e-12)
+
+    def test_no_budget_changes_nothing(self):
+        v_rad_s, kd, lead_rad = force_approach_terms(
+            self.KP, self.KD, 0.5, self.DT, 0.0, 0.05)
+        self.assertAlmostEqual(v_rad_s, 0.5)
+        self.assertAlmostEqual(kd, self.KD)
+        self.assertAlmostEqual(lead_rad, 0.05)
+
+    def test_the_lead_never_drops_below_one_frame(self):
+        # 下限是一帧的位移：引擎本来就靠这条保住斜坡自己那一格，而它的力矩
+        # 恰好就是「一帧那一格」，所以这条下限不会把预算撑破。
+        for speed_mm_s in (5.0, 50.0, 150.0):
+            v_rad_s, _kd, lead_rad = self.terms(1.0, speed_mm_s)
+            self.assertGreaterEqual(lead_rad, v_rad_s * self.DT - 1e-12)
+
+    def test_the_lead_never_exceeds_the_ceiling_it_was_given(self):
+        _v, _kd, lead_rad = self.terms(400.0, 5.0, ceiling_mm=4.0)
+        self.assertAlmostEqual(lead_rad, 4.0 / RAD_TO_MM)
+
+    def test_a_setpoint_too_small_for_the_speed_slows_it_down(self):
+        v_rad_s, kd, _lead = self.terms(0.5, 150.0)
+        self.assertLess(v_rad_s * RAD_TO_MM, 150.0)
+        # 慢到一帧那一格正好等于预算：这是唯一由设定值决定的接近速度
+        self.assertAlmostEqual(self.KP * v_rad_s * self.DT,
+                               0.5 * UnitConversion.N_TO_NM * 0.9, places=12)
+        self.assertAlmostEqual(kd, 0.0, places=12)
+
+
+class TestForceApproachPressBudget(unittest.TestCase):
+    """带设定力的接近段（``grasp`` 的闭合段）压出的力矩不超过设定值。
+
+    这一段是位置帧：撞上工件时力矩由驱动器自己算，``kp × 领先 + kd × 指令
+    速度``，与这一次夹取设定的力无关。默认那条 4 mm 行进段上限按 ``kp=100``
+    折算是 5.4 Nm ≈ 54 N，所以「夹住工件」和「先拿 54 N 撞一下」曾经是同一件
+    事 —— 5 N 的夹取和 40 N 的夹取撞上去的力矩一模一样。现在这一段带着设定力
+    的预算走（见 :func:`force_approach_terms`），撞上那一下跟着设定的力走。
+    """
+
+    BLOCK = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2            # 工件
+
+    def _grasp(self, force_n, speed_mm_s=SPEED_MM_S, block=BLOCK, hold_s=0.2):
+        motion = MotionConfig(sleep_fn=lambda _: None,
+                              monotonic_fn=tick_clock(0.1))
+        motion.grasp_speed_mm_s = speed_mm_s
+        g, fake = make_gripper(block_rad=block, stops=True, motion=motion)
+        return g, fake, g.grasp(force_n=force_n, hold_s=hold_s)
+
+    @staticmethod
+    def _presses(fake, block):
+        """顶在工件上的那些帧压出的力矩。
+
+        只取夹爪真的**顶在工件上**的帧（``pos_after`` 正好停在挡块上）：假件的
+        力矩模型就是 ``kp × (指令 − 实测)``，只有顶住不动时才等于真机撞上工件
+        那一下；自由行进时它会绕着指令来回超调，|指令 − 实测| 量到的是「指令
+        落后读数多少」，不是压紧力。保力帧不算（它们只发前馈）。
+        """
+        return [abs(f.tau_nm) + f.kd * abs(f.dq)
+                for f in fake.frames
+                if f.tau_ff == 0.0 and abs(f.pos_after - block) < 1e-12]
+
+    def _budget(self, force_n):
+        return force_n * UnitConversion.N_TO_NM * MotionConfig().press_safety
+
+    def test_the_frame_never_presses_past_the_setpoint(self):
+        for force_n in (5.0, 20.0, 40.0):
+            for speed_mm_s in (25.0, 50.0, 150.0):
+                with self.subTest(force_n=force_n, speed_mm_s=speed_mm_s):
+                    _g, fake, res = self._grasp(force_n, speed_mm_s)
+                    presses = self._presses(fake, self.BLOCK)
+                    self.assertTrue(presses, "没有顶在工件上的帧")
+                    self.assertLessEqual(max(presses),
+                                         self._budget(force_n) + 1e-9)
+                    self.assertTrue(res.stalled, res)      # 照样撞得到工件
+
+    def test_the_press_follows_the_setpoint(self):
+        peaks = []
+        for force_n in (10.0, 20.0, 40.0):
+            _g, fake, _res = self._grasp(force_n)
+            peaks.append(max(self._presses(fake, self.BLOCK)))
+        for force_n, peak in zip((10.0, 20.0, 40.0), peaks):
+            self.assertAlmostEqual(peak, self._budget(force_n), places=9)
+        self.assertLess(peaks[0], peaks[1])
+        self.assertLess(peaks[1], peaks[2])
+
+    def test_the_same_block_reached_by_close_presses_fifty_four_newtons(self):
+        """不带预算那一路（普通 close）在同一块工件上还是 54 N —— 差别来自预算。"""
+        block = POS_OPEN_RAD + 0.01
+        g_close, fake_close = make_gripper(block_rad=block)
+        g_close.close(SPEED_MM_S)
+        unbounded = max(abs(f.tau_nm) for f in fake_close.frames)
+
+        _g, fake_grasp, res = self._grasp(5.0, block=block)
+
+        self.assertAlmostEqual(
+            unbounded,
+            g_close.config.kp * g_close.motion_config.max_lead_mm / RAD_TO_MM,
+            places=4)
+        self.assertGreater(unbounded, 10.0 * self._budget(5.0))   # ≈54 N 的撞
+        self.assertLess(max(self._presses(fake_grasp, block)),
+                        self._budget(5.0) + 1e-9)
+        self.assertTrue(res.stalled, res)
+
+    def test_a_low_setpoint_decides_the_speed(self):
+        """预算连一帧那一格都占满时，接近速度由设定值定 —— 不是由配置定。"""
+        g, fake, res = self._grasp(1.0, speed_mm_s=150.0)
+        cap_rad_s = self._budget(1.0) / (g.config.kp * DT)
+
+        self.assertAlmostEqual(max(abs(f.dq) for f in fake.frames),
+                               cap_rad_s, places=9)
+        self.assertLess(cap_rad_s * RAD_TO_MM, 150.0)
+        self.assertTrue(res.stalled, res)
+
+    def test_an_empty_grasp_still_reaches_the_target(self):
+        """空载不许被预算改成堵转：小领先只是压得轻，不是走不动。"""
+        g, fake, res = self._grasp(5.0, block=None)
+
+        self.assertTrue(res.reached, res)
+        self.assertFalse(res.stalled, res)
+        self.assertTrue(res.ok, res)
+        self.assertAlmostEqual(fake.motor.pos, res.target_rad,
+                               delta=g.motion_config.reach_tol)
+
+    def test_the_hold_still_lands_on_the_setpoint(self):
+        """保力段照旧走到设定值，而且是从压紧力矩**往上爬**到的，不是一帧跳上去。
+
+        时长得给够：假件只按 ``kp × (指令 − 实测)`` 报力矩（它不建阻尼），交接
+        那一刻报的是领先那一项（0.45 Nm），比真机撞上工件那一下（1.8 Nm）低，
+        按假件的尺子爬升距离就长。
+        """
+        _g, fake, res = self._grasp(20.0, hold_s=1.0)
+
+        self.assertEqual(res.force_n, 20.0)
+        self.assertTrue(res.cycles > 0, res)
+        hold = [f for f in fake.frames if f.tau_ff != 0.0]
+        self.assertTrue(hold, "没有保力帧")
+        self.assertLess(hold[0].tau_ff, 2.0)            # 交接处还在设定值之下
+        landed = [i for i, f in enumerate(hold) if f.tau_ff == 2.0]
+        self.assertTrue(landed, "保力段没有到达设定值")
+        for f in hold[landed[0]:]:
+            self.assertAlmostEqual(f.tau_ff, 2.0, places=9)
 
 
 if __name__ == "__main__":
