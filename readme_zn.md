@@ -92,15 +92,32 @@ with LiteGrip("can0") as gripper:
 `zero()` 会把爪子顶到两端的真实限位上，所以做的时候手和工件都要离开行程范围；如果夹爪的安装
 朝向会让爪子掉下来，先把它托住。
 
+`zero()` 量到的结果写进 `~/.litegrip/<channel>_calibration.json`。这个文件不会被自动读回：
+第 5 步跑的是出厂标定，除非你用 `--calib ~/.litegrip/can0_calibration.json` 点名它，或者设
+`LITEGRIP_CALIB`。
+
 ### 让标定一直可用
 
 所有 LiteGrip 共用同一个 CAN ID（`0x08`），所以一台电脑上放两台时，**通道是唯一的身份键**。
-标定**按通道各存各的**：`~/.litegrip/<channel>_calibration.json`，两台互不覆盖。
+`zero()` **按通道各存各的**：`~/.litegrip/<channel>_calibration.json`，两台互不覆盖。
 
-无参 `load_calibration()` 先读本通道这一份，再读出厂标定。出厂文件声明的是 `channel: can0`，
-所以 `can1` 自己没有标定时会**大声失败**，而不是悄悄采纳 `can0` 的方向。要给它一份，用
-`LiteGrip("can1", mount="normal")`（模板按名字加载，不理会通道）或者自己跑一次 `zero()`。
-想让所有通道共用一个显式路径，设 `LITEGRIP_CALIB`。
+**出厂标定才是标准值。** 无参 `load_calibration()` 只读这一份，本机量出来的标定绝不会被顺手
+采纳 —— 包括 `zero()` 刚写下的那份。要用它就得点名：
+
+```python
+from litegrip import LiteGrip, default_calib_path
+
+with LiteGrip("can0") as gripper:
+    gripper.load_calibration(default_calib_path("can0"))    # zero() 存下的那一份
+    gripper.enable()
+```
+
+`LITEGRIP_CALIB=/path/to/file.json` 不改代码就能对每个通道生效。无参加载只要跳过了本机的
+文件，告警就会点名它，并重复上面这两种用法。**不要指望它会自动生效。**
+
+出厂文件声明的是 `channel: can0`，所以 `can1` 根本没有隐式来源，会**大声失败**，而不是悄悄
+采纳 `can0` 的方向。要给它一份，用 `LiteGrip("can1", mount="normal")`（模板按名字加载，不
+理会通道）或者自己跑一次 `zero()`，再照上面的方式点名回来。
 
 SDK 不猜方向：没有加载标定之前，任何运动接口都会抛 `CommandError`。
 
@@ -401,7 +418,8 @@ python3 examples/trajectory.py --play pick --repeat 3
 - **崩溃安全是默认行为。** `disconnect()` 会失能电机，所以进程死掉不会留下一个还在出力的
   电机。只有在别的东西接得住这台夹爪时，才设 `disable_on_disconnect=False`。
 - **存储位置是可预期的。** `~/.litegrip/<channel>_calibration.json` 和
-  `~/.litegrip/trajectories/`。`LITEGRIP_CALIB` 和 `LITEGRIP_TRAJ_DIR` 可以改掉它们。
+  `~/.litegrip/trajectories/`。`LITEGRIP_CALIB` 和 `LITEGRIP_TRAJ_DIR` 可以改掉它们。标定
+  文件要显式点名才会被读，见第 4 步。
 - **配好 `logging` 就能看见 SDK 的判断。** 它走标准 `logging` 模块记录：加载了哪份标定、推出
   的方向、以及每一次触发的护栏。
 - **引擎可以脱机测试。** `MotionConfig.sleep_fn` 和 `monotonic_fn` 是它仅有的时间接缝，测试
@@ -434,7 +452,7 @@ python3 examples/trajectory.py --play pick --repeat 3
 | 爪子往错的方向动 | 这台是反装，不是正装。见第 3 步。 |
 | `close()` 返回 `ok=False` | 爪子停的位置离限位超过 `stop_tol`。调大 `stop_lead_mm` 直到它压到位。 |
 | `travel_guard` 置位，或 `set_force` 返回 `False` | 失控监视触发了：爪子越过了闭合侧限位。检查标定是否描述真实行程，以及限位有没有被拆掉。 |
-| `can1` 的 `load_calibration()` 返回 `False` | 它没有自己的标定，而加载链有意跳过声明别的通道的文件。给它跑一次 `zero()`。 |
+| `can1` 的 `load_calibration()` 返回 `False` | 无参加载读的是出厂文件，而它声明的是 `channel: can0`，所以这个通道没有隐式来源。给它跑一次 `zero()`，再用 `path=` 或 `LITEGRIP_CALIB` 点名那份结果。 |
 | 保住的力掉到设定值以下 | 你改了保力增益，或有东西以快于前馈的速度把爪子推回去。`hold_kp` / `hold_kd` 已废弃并被忽略。 |
 
 ## 示例
@@ -466,7 +484,8 @@ python3 examples/trajectory.py --play pick --repeat 3
   一直没变。
 - `open` 和 `close` 不再把指令发到标定限位之外，并且运动接口在未标定的配置上会拒绝运行。
 - 标定**按通道**分开：`~/.litegrip/<channel>_calibration.json`，不再是单一文件
-  `litegrip_calibration.json`。旧文件仍作为回退被读取，`LITEGRIP_CALIB` 仍覆盖一切。
+  `litegrip_calibration.json`。旧文件仍能加载，但必须点名：无参 `load_calibration()` 只读
+  出厂标定。`LITEGRIP_CALIB` 仍然覆盖它。
 
 ## 开发
 

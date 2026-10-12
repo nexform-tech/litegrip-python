@@ -71,7 +71,10 @@ def _zenoh_transport(role: str, key: str, port: int, host: Optional[str],
                                 ready_key=ready_key)
 
 
-# Path to built-in factory calibration (ships with the package, read-only fallback).
+# The calibration the SDK ships for the unit it ships with.  This is the
+# *standard* value: a no-argument load_calibration() reads it and nothing else.
+# A calibration measured on the buyer's machine is never picked up by accident
+# — name it with ``path=``, ``template=`` or ``LITEGRIP_CALIB``.
 _FACTORY_CALIB = _os.path.join(_os.path.dirname(__file__), "factory_calibration.json")
 
 # Pre-made calibration templates shipped with the package.  Each is a pair of
@@ -93,17 +96,16 @@ CALIB_TEMPLATES = {
     "reverse": _os.path.join(_os.path.dirname(__file__), "calibration_reverse.json"),
 }
 
-# The pre-per-channel location, kept so a calibration saved by an older
-# version still loads.  DEFAULT_CALIB keeps its historical value (env override
-# included); it is now the *legacy* entry of the automatic load chain rather
-# than the primary one.
+# The pre-per-channel location.  A calibration saved by an older version is
+# still on disk and still loadable — but only by naming it, like any other
+# file on the machine.
 _LEGACY_CALIB_PATH = _os.path.join(
     _os.path.expanduser("~"), ".litegrip", "litegrip_calibration.json")
 
-# Default user calibration path — a stable absolute location so that a
-# calibration saved without an explicit path is picked up on the next load
-# without an explicit path, regardless of the process working directory.
-# Override with the LITEGRIP_CALIB env var if desired.
+# The historical default calibration path, kept exported so existing imports
+# keep working.  It is NOT read by load_calibration() any more: a no-argument
+# load reads the factory file alone, and everything on this machine has to be
+# asked for by name (``path=`` or ``LITEGRIP_CALIB``).
 DEFAULT_CALIB = _os.environ.get("LITEGRIP_CALIB", _LEGACY_CALIB_PATH)
 
 
@@ -155,12 +157,17 @@ def _scale_from_travel(config: GripperConfig, travel_rad: float) -> float:
 
 
 def default_calib_path(channel: str = DefaultParams.CAN_CHANNEL) -> str:
-    """Where a calibration for *channel* is saved and read back by default.
+    """Where a calibration for *channel* is saved, and how to name it back.
 
     One gripper per channel, one file per channel —
     ``~/.litegrip/<channel>_calibration.json``.  A single shared file let two
     grippers on one machine (``can0`` / ``can1``, both at CAN ID 0x08)
     overwrite each other's direction and travel.
+
+    This is :meth:`LiteGrip.save_calibration`'s destination.  It is *not* what
+    a no-argument :meth:`LiteGrip.load_calibration` reads: that reads the
+    factory file alone.  Feed the saved path back explicitly, or set
+    ``LITEGRIP_CALIB`` to it.
 
     ``LITEGRIP_CALIB``, when set, overrides this with one explicit path for
     every channel.  ``HOME`` and the env var are read per call, so a caller
@@ -201,6 +208,49 @@ def _dedupe(paths: List[str]) -> List[str]:
             seen.add(p)
             out.append(p)
     return out
+
+
+def _ignored_calib_files(channel: str) -> List[str]:
+    """Calibrations on this machine that a no-argument load does not read.
+
+    A file written by :meth:`LiteGrip.save_calibration`, or the pre-per-channel
+    ``litegrip_calibration.json``, sits in ``~/.litegrip`` and no longer takes
+    part in a no-argument load.  Reporting it is the point: a machine that
+    quietly keeps running the factory calibration with a measured one next to
+    it is the failure this whole change exists to stop.
+
+    Only names that could belong to *channel* are listed — ``<channel>_...json``
+    and the legacy name — so a second gripper's file does not show up in the
+    first one's log.  Anything else in that directory is not this SDK's to
+    judge (see the README for which names are recognized at all).
+    """
+    directory = _os.path.join(_os.path.expanduser("~"), ".litegrip")
+    if not _os.path.isdir(directory):
+        return []
+    ignored = []
+    for name in sorted(_os.listdir(directory)):
+        if not name.endswith(".json"):
+            continue
+        if name == _os.path.basename(_LEGACY_CALIB_PATH) or name.startswith(f"{channel}_"):
+            ignored.append(_os.path.join(directory, name))
+    return ignored
+
+
+def _warn_ignored_local_calibrations(channel: str) -> None:
+    """Name every machine calibration a no-argument load walked past.
+
+    Silent fallback is the bug this reports on: without it the gripper keeps
+    running one calibration while a freshly measured one sits unused on disk.
+    """
+    ignored = _ignored_calib_files(channel)
+    if not ignored:
+        return
+    log.warning(
+        "Local calibration not read: %s. A no-argument load_calibration() "
+        "reads the shipped factory calibration only, so this run does not use "
+        "them. To use one, name it: load_calibration(path=%r), or set "
+        "LITEGRIP_CALIB=%s.",
+        ", ".join(ignored), ignored[0], ignored[0])
 
 
 log = logging.getLogger("litegrip")
@@ -989,13 +1039,16 @@ class LiteGrip:
         Args:
             path: Destination file. When omitted, saves to this channel's own
                   path (:func:`default_calib_path`, i.e.
-                  ``~/.litegrip/<channel>_calibration.json``) — the file
-                  :meth:`load_calibration` reads by default, so a calibration
-                  saved here is picked up automatically next run.  One file
-                  per channel is what keeps two grippers on one machine from
+                  ``~/.litegrip/<channel>_calibration.json``).  One file per
+                  channel is what keeps two grippers on one machine from
                   overwriting each other.  The factory calibration shipped
                   with the SDK is never overwritten; back it up separately if
                   needed.
+
+        A no-argument :meth:`load_calibration` reads the factory calibration
+        only, so what this writes is *not* read back on its own: name it
+        (``load_calibration(path=<returned>)``) or point ``LITEGRIP_CALIB`` at
+        it.  A warning says so at save time.
 
         Returns:
             The absolute path the calibration was written to.
@@ -1033,6 +1086,10 @@ class LiteGrip:
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
         log.info("Calibration saved to %s", path)
+        log.warning(
+            "The factory calibration stays the standard value, so this file is "
+            "not read back on its own. To use it: load_calibration(path=%r), or "
+            "LITEGRIP_CALIB=%s.", path, path)
         return path
 
     def load_calibration(self, path: Optional[str] = None,
@@ -1050,11 +1107,18 @@ class LiteGrip:
         * ``path=...`` — an explicit file, which may be anywhere (including a
           template's path).  Falls back to the built-in factory calibration
           if it cannot be read.
-        * neither — this channel's own file (:func:`default_calib_path`),
-          then the legacy single-file location (:data:`DEFAULT_CALIB`), then
-          the factory one.  A candidate whose ``channel`` names a different
-          interface is *skipped*, so a ``can1`` unit with no calibration of
-          its own fails loudly rather than silently adopting ``can0``'s.
+        * neither — the factory calibration the SDK ships, and nothing else.
+          A calibration measured on this machine is never picked up by
+          accident: name it with ``path=``, or point ``LITEGRIP_CALIB`` at it
+          (the env var is read here, ahead of the factory file).
+
+          The factory file declares ``channel: can0``, so a ``can1`` unit gets
+          nothing from a no-argument load — it fails loudly rather than
+          silently adopting ``can0``'s direction.  Give it a calibration with
+          ``mount=``, ``path=`` or ``LITEGRIP_CALIB``.
+
+          Any file in ``~/.litegrip`` that this load passed over is named in a
+          warning, with the call that would use it.
 
         Call this after :meth:`connect` but before :meth:`enable`.
 
@@ -1085,15 +1149,20 @@ class LiteGrip:
             sources = [_resolve_template(template)]
             strict = True
             skip_other_channels = False
+            report_ignored_local = False
         elif path is not None:
             sources = [path, _FACTORY_CALIB]
             strict = False
             skip_other_channels = False
+            report_ignored_local = False
         else:
-            sources = _dedupe([default_calib_path(self._channel),
-                               DEFAULT_CALIB, _FACTORY_CALIB])
+            # 出厂标定是这台夹爪的标准值。本机文件一律要显式点名才读 ——
+            # 一个来路不明的遗留文件不该悄悄盖过它。
+            env = _os.environ.get("LITEGRIP_CALIB")
+            sources = _dedupe([p for p in (env, _FACTORY_CALIB) if p])
             strict = False
             skip_other_channels = True
+            report_ignored_local = env is None
 
         data = None
         loaded_from: str = ""
@@ -1112,6 +1181,9 @@ class LiteGrip:
             data = candidate
             loaded_from = src
             break
+
+        if report_ignored_local:
+            _warn_ignored_local_calibrations(self._channel)
 
         if data is None:
             if strict:

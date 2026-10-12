@@ -99,17 +99,36 @@ calibration file carries, and it matters only when you re-probe.
 `zero()` drives the jaws onto both real stops, so keep hands and objects out of the travel
 range, and support the jaws if the gripper is mounted in a way they would fall.
 
+`zero()` writes what it measured to `~/.litegrip/<channel>_calibration.json`. Nothing reads
+that file back on its own: step 5 runs the factory calibration unless you name it with
+`--calib ~/.litegrip/can0_calibration.json` or set `LITEGRIP_CALIB`.
+
 ### Keep it working
 
 Every LiteGrip shares the same CAN ID (`0x08`), so **the channel is the only identity key**
-when two sit on one machine. Calibrations are stored one file per channel —
+when two sit on one machine. `zero()` saves one file per channel —
 `~/.litegrip/<channel>_calibration.json` — so two units never overwrite each other.
 
-A no-argument `load_calibration()` reads this channel's own file, then the factory one. The
-factory file declares `channel: can0`, so a `can1` unit with no calibration of its own fails
-loudly instead of silently adopting `can0`'s direction. Give it one with either
+**The factory calibration is the standard value.** A no-argument `load_calibration()` reads
+that file and nothing else, so a calibration measured on this machine is never picked up by
+accident — not even the one `zero()` just wrote. Name it to use it:
+
+```python
+from litegrip import LiteGrip, default_calib_path
+
+with LiteGrip("can0") as gripper:
+    gripper.load_calibration(default_calib_path("can0"))    # zero()'s own output
+    gripper.enable()
+```
+
+`LITEGRIP_CALIB=/path/to/file.json` does the same for every channel without touching the
+code. Whenever a no-argument load passes over a local file, the warning names it and repeats
+these two ways to use it. **Do not expect it to be picked up automatically.**
+
+The factory file declares `channel: can0`, so a `can1` unit has no implicit source at all and
+fails loudly rather than silently adopting `can0`'s direction. Give it one with either
 `LiteGrip("can1", mount="normal")` — a template loads by name and ignores the channel — or a
-`zero()` of its own. Set `LITEGRIP_CALIB` to pin one explicit path for every channel instead.
+`zero()` of its own, named back as above.
 
 The SDK never guesses a direction: until a calibration is loaded, every motion raises
 `CommandError`.
@@ -442,7 +461,8 @@ python3 examples/trajectory.py --play pick --repeat 3
   does not leave the motor holding torque. Set `disable_on_disconnect=False` only when something
   else keeps the gripper under control.
 - **Storage is predictable.** `~/.litegrip/<channel>_calibration.json` and
-  `~/.litegrip/trajectories/`. `LITEGRIP_CALIB` and `LITEGRIP_TRAJ_DIR` override them.
+  `~/.litegrip/trajectories/`. `LITEGRIP_CALIB` and `LITEGRIP_TRAJ_DIR` override them. The
+  calibration file is read only when you name it; see step 4.
 - **Configure `logging` to see what the SDK decides.** It logs through the standard `logging`
   module: the calibration it loaded, the direction it derived, and every guard that fired.
 - **The engine is testable without hardware.** `MotionConfig.sleep_fn` and `monotonic_fn` are
@@ -481,7 +501,7 @@ python3 examples/trajectory.py --play pick --repeat 3
 | The jaws move the wrong way | The unit is reverse-mounted, not normal. See step 3. |
 | `close()` returns `ok=False` | The jaw parked further than `stop_tol` from the limit. Raise `stop_lead_mm` until it presses home. |
 | `travel_guard` is set, or `set_force` returns `False` | The runaway watch tripped: the jaw walked past the closed-side stop. Check the calibration describes the real travel, and that nothing has removed the stop. |
-| A `can1` unit's `load_calibration()` returns `False` | It has no calibration of its own, and the load chain deliberately skips files naming another channel. Run `zero()` for it. |
+| A `can1` unit's `load_calibration()` returns `False` | A no-argument load reads the factory file, which declares `channel: can0`, so this unit has no implicit source. Run `zero()` for it and name the result with `path=` or `LITEGRIP_CALIB`. |
 | The held force sags below the setpoint | You changed the hold gains, or something is back-driving the jaws faster than the feed-forward. `hold_kp` / `hold_kd` are deprecated and ignored. |
 
 ## Examples
@@ -516,8 +536,9 @@ something different.
 - `open` and `close` no longer command past the calibrated limit, and the motion actions now
   refuse to run on a configuration that was never calibrated.
 - Calibrations are per channel — `~/.litegrip/<channel>_calibration.json`, not the single
-  `litegrip_calibration.json`. The old file is still read as a fallback, and `LITEGRIP_CALIB`
-  still overrides everything.
+  `litegrip_calibration.json`. The old file is still loadable, but only by naming it: a
+  no-argument `load_calibration()` reads the factory calibration alone. `LITEGRIP_CALIB` still
+  overrides it.
 
 ## Development
 

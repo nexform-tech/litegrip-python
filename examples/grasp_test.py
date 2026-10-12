@@ -141,8 +141,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "is a bare torque command.  Default: the value in "
                              "the calibration file")
     parser.add_argument("--calib", default=None,
-                        help="explicit calibration JSON; default is this "
-                             "channel's own file, then the legacy/factory one")
+                        help="explicit calibration JSON.  Without it the "
+                             "factory calibration is used: a file this machine "
+                             "measured is never read unless you name it here "
+                             "or in LITEGRIP_CALIB")
     parser.add_argument("--template", default=None,
                         help="calibration template name; see litegrip.list_templates()")
     parser.add_argument("--skip-empty", action="store_true",
@@ -218,11 +220,12 @@ def _source_note(args) -> str:
     if args.calib is not None:
         return args.calib
     own = default_calib_path(args.channel)
+    if os.environ.get("LITEGRIP_CALIB"):
+        return f"{own} (LITEGRIP_CALIB)"
     if os.path.isfile(own):
-        return own
-    return (f"{own} (missing) -> this channel has no calibration of its own, so "
-            f"the legacy/factory file is used; check it says the right mount "
-            f"(run with --verbose to see which file actually won)")
+        return (f"the factory calibration — this machine has its own at {own}, "
+                f"which is used only when named: --calib {own}")
+    return "the factory calibration"
 
 
 def _pause(prompt: str, waiting_for: str) -> bool:

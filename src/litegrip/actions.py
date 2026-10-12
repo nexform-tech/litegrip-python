@@ -718,6 +718,11 @@ class GripperActions:
         ``calib_tau_limit`` 立即停止推进 —— 顶住限位时结构让位（背隙/弹性变形）
         会让位置读数一直在动，只靠「位置不再变化」是停不下来的。
 
+        结果落在 :func:`~litegrip.default_calib_path` 那个文件里，但无参
+        ``load_calibration()`` 只读出厂标定 —— 下次要用这份，得写
+        ``load_calibration(path=default_calib_path(channel))`` 或设
+        ``LITEGRIP_CALIB``。
+
         Returns:
             :class:`CalibrationData`。
         """
