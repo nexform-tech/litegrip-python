@@ -25,7 +25,12 @@ stalls with ``python3 examples/stroke_test.py``, and try ``--open-speed 10`` —
 the stall detector's window threshold scales with the speed it was given.
 
 ``ok=True`` is expected in both cases and means only that the hold phase finished
-instead of being interrupted by a fault — it is not the interesting signal here.
+instead of being interrupted by a fault or by the runaway watch — it is not the
+interesting signal here.  (The watch drops the feed-forward torque and stops the
+hold when the jaws walk more than ``MotionConfig.hold_runaway_rad`` past the
+closed stop; a tripped watch is reported as its own problem rather than folded
+into that sentence.  Neither case here should trip it — the jaws meet something
+or a mechanical stop long before the threshold.)
 
 The script also reports what the hold applied.  ``grasp()`` ramps a feed-forward
 torque up to ``force_n x 0.1`` Nm (``MotionConfig.force_ramp_n_s``) and holds it
@@ -56,8 +61,8 @@ this unit lands on.
 **The jaws are disabled when the script exits, so whatever is being held falls.**
 Catch it, or put something soft underneath.  If you want the grip to persist,
 call ``grasp(..., hold_s=0)`` from a program instead — ``hold_s=0`` means "hold
-until a fault or Ctrl+C", which is why this script never uses it: a test that
-holds forever is a test that never finishes.
+until a fault, the runaway watch, or Ctrl+C", which is why this script never
+uses it: a test that holds forever is a test that never finishes.
 """
 
 from __future__ import annotations
@@ -167,10 +172,10 @@ def to_mm(cfg, rad: float) -> float:
 class Trace:
     """Accumulates both halves of one ``grasp()`` from the engine's callbacks.
 
-    ``GraspResult`` reports the outcome of the closing move and the fact that the
-    hold finished; it reports nothing about the hold itself.  This keeps the
-    per-sample move data and the per-slice hold data so the script can say what
-    the hold actually applied.
+    ``GraspResult`` reports the outcome of the closing move, whether the hold
+    finished, and whether the runaway watch tripped; it reports nothing about
+    what the hold applied.  This keeps the per-sample move data and the
+    per-slice hold data so the script can say what the hold actually applied.
     """
 
     def __init__(self, sample_interval_s: float):
@@ -260,7 +265,7 @@ def _report(result, trace: Trace, cfg, motion, label: str, grasped: bool) -> str
     st = result.state
     lines = [
         f"  ok={result.ok} reached={result.reached} stalled={result.stalled} "
-        f"err={st.error_code}",
+        f"runaway_watch={result.travel_guard} err={st.error_code}",
         f"  stopped at {st.position_mm:+.1f} mm ({st.position_rad:+.6f} rad), "
         f"empty target was {to_mm(cfg, result.target_rad):+.1f} mm, "
         f"off by {abs(st.position_rad - result.target_rad) * cfg.rad_to_mm:.2f} mm",
@@ -305,6 +310,24 @@ def _stall_ramp_mm(result, trace: Trace, cfg, motion) -> tuple[float, float] | N
     return None if ramp_mm >= window_mm else (ramp_mm, window_mm)
 
 
+def _hold_problem(result) -> str | None:
+    """Why the hold did not finish, if it did not.
+
+    The runaway watch drops the torque and returns on its own, so a tripped
+    guard reaches here with ``ok=False`` and ``err=1`` — calling that "ended
+    abnormally (err=1)" would name the fault code for something that was not a
+    fault, and hide the one thing worth knowing.
+    """
+    if result.travel_guard:
+        return ("the runaway watch tripped during the hold: the jaws walked past "
+                "the closed stop by more than MotionConfig.hold_runaway_rad, so "
+                "the torque was dropped — either nothing is stopping the closing "
+                "direction, or the calibration no longer describes the travel")
+    if not result.ok:
+        return f"the hold phase ended abnormally (err={result.state.error_code})"
+    return None
+
+
 def _judge_empty(result, trace: Trace, cfg, _motion) -> list[str]:
     """Clear jaws: it should reach the empty target and not report a stall."""
     problems = []
@@ -319,9 +342,9 @@ def _judge_empty(result, trace: Trace, cfg, _motion) -> list[str]:
         problems.append("reported stalled=True with nothing between the jaws — it "
                         "met an obstruction, or the closing move stalled on "
                         "friction")
-    if not result.ok:
-        problems.append(f"the hold phase ended abnormally (err="
-                        f"{result.state.error_code})")
+    problem = _hold_problem(result)
+    if problem is not None:
+        problems.append(problem)
     if result.cycles == 0:
         problems.append("the hold never ran a slice")
     return problems
@@ -347,9 +370,9 @@ def _judge_loaded(result, trace: Trace, cfg, motion) -> list[str]:
     if result.reached:
         problems.append("reached the empty target — nothing was actually between "
                         "the jaws")
-    if not result.ok:
-        problems.append(f"the hold phase ended abnormally (err="
-                        f"{result.state.error_code})")
+    problem = _hold_problem(result)
+    if problem is not None:
+        problems.append(problem)
     if result.cycles == 0:
         problems.append("the hold never ran a slice")
     return problems

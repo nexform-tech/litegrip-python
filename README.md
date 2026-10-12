@@ -368,7 +368,7 @@ outcome before reporting success, so callers do not re-implement ramps or stall 
 | --- | --- | --- |
 | `open(speed_mm_s=None)` | Ramps toward the calibrated open-side stop; the emitted command is capped at the calibrated travel, so the jaw stops on the calibrated limit and is never driven past it. The move ends on stall detection. With `GripperConfig.work_stroke_mm` set it stops at that opening instead — the shipped calibration sets it to `80.0`, so a plain `open()` ends 6 mm inside the recorded open extreme, 5 mm short of the jaws' full travel. | `MoveResult` |
 | `close(speed_mm_s=None)` | Same, toward the closed side, with the same command cap. `work_stroke_mm` is an open-side number and does not change where a close ends. | `MoveResult` |
-| `grasp(force_n=None, hold_s=0.0)` | Closes until it stalls (i.e. grips), then ramps to and holds `force_n`. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. `hold_s=0` holds forever. | `GraspResult` |
+| `grasp(force_n=None, hold_s=0.0)` | Closes until it stalls (i.e. grips), then ramps to and holds `force_n`. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. `hold_s=0` holds forever — until a fault, the runaway watch, or Ctrl+C. | `GraspResult` (`travel_guard` is set when the watch cut the hold short) |
 | `zero()` | Full calibration: probes both mechanical stops, derives travel and `rad_to_mm`, saves to disk. It preserves the direction already declared by the loaded calibration; a stall cannot tell one stop from the other. | `CalibrationData` |
 | `enable(retries=None)` | Sends enable and re-reads the status frame, retrying until it reports `err == 1`. | `EnableResult` |
 | `disable()` | Disables the motor (zero torque, back-drivable by hand). | `bool` |
@@ -430,6 +430,7 @@ with LiteGrip("can0") as gripper:
 | `force_n` | `20.0` | default `grasp` force |
 | `force_ramp_n_s` | `20.0` | rate the held force climbs to its setpoint, N/s |
 | `hold_interval` | `0.2` | force-hold slice length, seconds |
+| `hold_runaway_rad` | `0.05` | past the closed stop by this much, the force hold drops the torque and stops, radians |
 | `hold_kp` / `hold_kd` | `150.0` / `2.0` | deprecated — the force hold uses no gains; setting them changes nothing |
 | `enable_retries` / `enable_retry_interval` | `3` / `0.2` | enable retry count and gap |
 | `calib_kp` / `calib_kd` | `20.0` / `2.0` | probe stiffness used by `zero()` |
@@ -531,7 +532,9 @@ Worth reading if a gripper is behaving oddly.
   stays at the setpoint. Do not add a gain to make the hold "stiffer" — `kp × (q - measured)`
   turns into a force error the moment the jaws move, and at `kp = 150` the closed side's
   ~`0.0103 rad` stick-slip step is worth about `15 N`. `hold_kp` / `hold_kd` used to do
-  exactly that; they are now ignored.
+  exactly that; they are now ignored. The same property is why this phase carries a
+  predicate rather than a clamp (see **Torque, force and safety**): with no position error in
+  the frame there is nothing to cap, and the only way to bound the jaws is to stop pushing.
 - **The held force is ramped to its setpoint, not stepped to it.** Entering the hold, the
   torque climbs at `force_ramp_n_s` (20 N/s) from the torque already in flight — the
   closing press, about `10 N` on the bench — one step per frame, and lands exactly on the
@@ -565,8 +568,26 @@ Worth reading if a gripper is behaving oddly.
   `grasp()` that finds nothing between the jaws closes onto the mechanical stop at that force.
   That is the price of a force that does not drift when the workpiece moves. The position cap
   does not bound this phase: the frames carry `kp = kd = 0`, so there is no position error to
-  clamp — only the torque the setpoint asks for. Nothing stops the jaw at the calibrated limit
-  here, and it is the one motion path that deliberately has no position guardrail.
+  clamp — only the torque the setpoint asks for. That is why the phase carries a guard of its
+  own, which is the next bullet.
+- **A held force is watched for running away, and dropped if it does.** Those same frames carry
+  no position error, so there is nothing for a position cap to act on — the only lever is
+  removing the torque. The hold therefore runs a *predicate*, not a clamp: once the measured
+  position is `hold_runaway_rad` (`0.05 rad`, about 3 mm) past the closed-side calibrated stop,
+  `grasp()` and `set_force` stream their zero-torque release frames and return with
+  `GraspResult.travel_guard` set (`set_force` returns `False`). Only the closing side is checked,
+  because that is the side the feed-forward pushes and the side where a missing stop means the
+  jaws walk; crossing the open limit is pulled back by the same torque. This is a **runaway
+  detector, not an accuracy bound** — a normal grip never reaches it, since against an object
+  the jaws stop on the object and against nothing they stop on the mechanical stop, which sits
+  at the calibrated limit. Raise it only if a jaw that is genuinely held is being released.
+  Before it existed this was the one motion path with no position guardrail at all: on
+  2026-10-10 an empty `grasp()` on a gripper whose closed stop was broken drove a jaw 104.9 mm
+  past the calibrated zero and destroyed the mechanism.
+- **The runaway watch is off until the config is calibrated.** `set_force` has never required a
+  calibration, and the placeholder limits (`pos_closed_rad = 1.14`, `pos_open_rad = 0.0`)
+  describe no real travel — a window built from them is worse than none. `grasp()` cannot reach
+  the uncalibrated case: its closing leg already requires a calibration.
 - **Direction is data, not a switch.** Both extreme positions live in the calibration file, and
   which of the two is numerically larger is what says which way closing runs
   (`GripperConfig.close_sign`). A reverse-mounted gripper is therefore a perfectly ordinary
