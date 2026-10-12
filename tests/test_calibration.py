@@ -322,11 +322,9 @@ class TestHomeDirection(unittest.TestCase):
 
     def _home_target(self, reverse):
         g, fake = make_gripper(reverse=reverse, stops=True)
-        seen = []
-        fake.control_mit_stream = (
-            lambda q_target, **kw: seen.append(q_target) or True)
-        g.home()
-        return g, seen[0]
+        # ``home`` 现在返回 ``MoveResult``，它自己报出这次真正要走的目标
+        # （经 clamp_to_travel 夹过），不必再从帧里倒推。
+        return g, g.home().target_rad
 
     def test_normal_home_goes_to_the_high_rad(self):
         g, target = self._home_target(reverse=False)
