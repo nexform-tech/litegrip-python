@@ -113,7 +113,14 @@ with LiteGrip("can0") as gripper:
 ```
 
 `LITEGRIP_CALIB=/path/to/file.json` 不改代码就能对每个通道生效。无参加载只要跳过了本机的
-文件，告警就会点名它，并重复上面这两种用法。**不要指望它会自动生效。**
+文件、且没设 `LITEGRIP_CALIB`，告警就会点名它，并重复上面这两种用法。**不要指望它会自动
+生效。**
+
+`~/.litegrip/` 里 SDK 只认一个名字：`<channel>_calibration.json`，也就是 `zero()` 写下的
+那个。放在那里的标定文件只要是别的名字，就根本不是候选 —— 不试、不合并、也不是靠后的回退
+档。要留意的是 `can0_08_calibration.json` 这种：它是别的工具写的、不是本 SDK 写的，除非你
+把路径交给 `--calib` 或 `load_calibration(path=...)`，否则一直不起作用。**不要因为文件就躺在
+那个目录里，就以为它正在生效。**
 
 出厂文件声明的是 `channel: can0`，所以 `can1` 根本没有隐式来源，会**大声失败**，而不是悄悄
 采纳 `can0` 的方向。要给它一份，用 `LiteGrip("can1", mount="normal")`（模板按名字加载，不

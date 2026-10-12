@@ -122,8 +122,16 @@ with LiteGrip("can0") as gripper:
 ```
 
 `LITEGRIP_CALIB=/path/to/file.json` does the same for every channel without touching the
-code. Whenever a no-argument load passes over a local file, the warning names it and repeats
-these two ways to use it. **Do not expect it to be picked up automatically.**
+code. Whenever a no-argument load passes over a local file, and `LITEGRIP_CALIB` is not set, the
+warning names it and repeats these two ways to use it. **Do not expect it to be picked up
+automatically.**
+
+Only one name in `~/.litegrip/` is recognized on its own: `<channel>_calibration.json`, the one
+`zero()` writes. A calibration file there under any other name is not a candidate at all — not
+tried, not merged, not a later fallback stage. `can0_08_calibration.json` is the name to watch
+for: other tooling writes it, this SDK does not, and it stays inert until you hand its path to
+`--calib` or `load_calibration(path=...)`. **Do not assume a file in that directory is in effect
+because it is sitting there.**
 
 The factory file declares `channel: can0`, so a `can1` unit has no implicit source at all and
 fails loudly rather than silently adopting `can0`'s direction. Give it one with either
