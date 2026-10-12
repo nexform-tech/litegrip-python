@@ -511,7 +511,25 @@ python3 -m unittest discover -s tests -t tests -v
 ```
 
 `litegrip.__version__` 从已安装分发包的元数据读取，所以装好的 wheel 报的是真正发布出去的
-版本。从没 `pip install` 过的源码树会报 `0.0.0+source`；这是预期行为，不是构建坏了。
+版本。`0.0.0+source` 的含义是**这台机器上没安装任何 `litegrip` 分发包**，而不是「这一份源码树
+没装过」。只要在搜索路径里能找到一个装过的副本，这次查询就成立，所以从这份源码树里加载的模块
+也可能报出那个副本的版本号。把模块路径和版本一起打出来，才知道跑的是哪一份：
+
+```bash
+$ python3 -c "import litegrip; print(litegrip.__version__, litegrip.__file__)"
+0.14.9 /usr/lib/python3/dist-packages/litegrip/__init__.py        # 跑的是装过的副本
+$ PYTHONPATH=src python3 -c "import litegrip; print(litegrip.__version__, litegrip.__file__)"
+0.0.0+source /home/qaz/litegrip-python/src/litegrip/__init__.py   # 跑的是源码树，且什么都没装
+0.0.0 /home/qaz/litegrip-python/src/litegrip/__init__.py          # 跑的是源码树，但装过东西
+```
+
+从源码树装出来的副本报的是 manifest 里的占位版本号，不是发布号，所以这时候版本号根本说明不了
+你跑的是哪一份 —— 看模块路径。版本事实以 git tag 为准（[AGENTS.md](AGENTS.md) §3）。
+
+**装过的副本不会自己更新。** 它保留安装时的代码，`git pull` 也带不动它，于是你正在读的源码树
+和程序 `import` 到的 `litegrip` 可能是两个版本。在源码树里跑一次 `pip install -e .`，就能让
+已安装分发包指向工作区，这个问题就不存在了。**不要拿装过的副本去调试你刚 pull 下来的修复** ——
+先看 `litegrip.__file__`。
 
 仓库遵循 Conventional Commits，并在每次合入 `main` 时由 semantic-release 自动发版；贡献者
 需要遵守的规则见 [AGENTS.md](AGENTS.md)。
