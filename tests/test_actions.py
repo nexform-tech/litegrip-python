@@ -6,8 +6,8 @@ import unittest
 
 import _sdkpath  # noqa: F401
 from litegrip import (CommandError, GraspResult, LiteGrip, MotionConfig,
-                      UnitConversion, force_approach_terms, limit_target,
-                      press_target, work_limit_target)
+                      UnitConversion, clamp_to_travel, force_approach_terms,
+                      limit_target, press_target, work_limit_target)
 from litegrip.actions import GripperActions
 
 from fake_can import (DT, POS_CLOSED_RAD, POS_OPEN_RAD, RAD_TO_MM,
@@ -257,7 +257,7 @@ class TestLeadCapAndStall(unittest.TestCase):
 
 
 class TestPressZone(unittest.TestCase):
-    """顶限位的力矩是**有界**的：压紧段收窄到 stop_lead_mm。"""
+    """顶限位的力矩是**有界**的：接近段收窄到 stop_lead_mm，指令封顶在标定限位。"""
 
     def test_pressing_torque_is_under_the_rating(self):
         g, fake = make_gripper(stops=True)
@@ -265,20 +265,26 @@ class TestPressZone(unittest.TestCase):
         _, stop_cap = press_caps(g)
 
         max_tau = max(abs(f.tau_nm) for f in fake.frames)
-        self.assertAlmostEqual(max_tau, g.config.kp * stop_cap, places=4)
+        self.assertLessEqual(max_tau, g.config.kp * stop_cap + 1e-9)
         self.assertLess(max_tau, 3.0)                 # DM4310 额定 3 Nm
         self.assertTrue(res.ok, res)
+        # 力矩有界靠的是两条一起：接近段收窄 + 指令封顶在标定行程内
+        self.assertFalse([f.q for f in fake.frames
+                          if f.q > POS_CLOSED_RAD + 1e-9
+                          or f.q < POS_OPEN_RAD - 1e-9])
 
     def test_default_press_force_is_the_gentle_tier(self):
-        """默认 0.7 mm 压紧：力矩 ≈ kp × 0.7 / rad_to_mm ≈ 0.94 Nm。"""
+        """默认 0.7 mm 接近段：上界 kp × 0.7 / rad_to_mm ≈ 0.94 Nm；
+        顶住限位后的残余力矩是 0 —— 指令封顶在限位，没有越位差可压。"""
         g, fake = make_gripper(stops=True)
         g.close(SPEED_MM_S)
 
         self.assertAlmostEqual(g.motion_config.stop_lead_mm, 0.7)
-        expected = g.config.kp * 0.7 / g.config.rad_to_mm
+        bound = g.config.kp * 0.7 / g.config.rad_to_mm
         max_tau = max(abs(f.tau_nm) for f in fake.frames)
-        self.assertAlmostEqual(max_tau, expected, places=4)
-        self.assertLess(max_tau, 1.2)                 # 「不太猛」的量化断言
+        self.assertLessEqual(max_tau, bound + 1e-9)
+        self.assertLess(bound, 1.2)                   # 「不太猛」的量化断言
+        self.assertAlmostEqual(fake.frames[-1].tau_nm, 0.0, places=6)
         # 没跌到一帧位移的地板（speed × frame_interval = 0.25 mm）以下
         floor_mm = SPEED_MM_S * g.motion_config.frame_interval
         self.assertGreater(g.motion_config.stop_lead_mm, floor_mm)
@@ -306,6 +312,116 @@ class TestPressZone(unittest.TestCase):
         self.assertTrue(tail)                          # 确实进了保压段
         self.assertLessEqual(
             max(abs(f.q - f.pos_after) for f in tail), stop_cap + 1e-9)
+
+
+class TestClampToTravel(unittest.TestCase):
+    """指令位置夹进标定行程，正装反装通用。"""
+
+    def test_values_inside_the_range_are_untouched(self):
+        g, _ = make_gripper()
+        mid = (POS_CLOSED_RAD + POS_OPEN_RAD) / 2
+        self.assertAlmostEqual(clamp_to_travel(g.config, mid), mid)
+
+    def test_outside_values_snap_to_the_endpoints_both_mounts(self):
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                g, _ = make_gripper(reverse=reverse)
+                self.assertAlmostEqual(
+                    clamp_to_travel(g.config, POS_CLOSED_RAD + 1.0),
+                    POS_CLOSED_RAD)
+                self.assertAlmostEqual(
+                    clamp_to_travel(g.config, POS_OPEN_RAD - 1.0),
+                    POS_OPEN_RAD)
+
+
+class TestCommandClampedToCalibratedTravel(unittest.TestCase):
+    """``open`` / ``close`` 的**指令**不许越过标定行程 —— 标定偏了也一样。
+
+    目标是越过标定限位的（``press_target``）那一套仍然成立，但每一帧下发的指令
+    都封顶在标定行程上，所以真限位不在标定位置上、甚至根本没有限位，夹爪也不会
+    被驱动到标定行程之外。
+    """
+
+    LO = POS_OPEN_RAD                            # 数值小的一端
+    HI = POS_CLOSED_RAD                          # 数值大的一端
+
+    def _outside(self, fake):
+        return [f.q for f in fake.frames
+                if f.q > self.HI + 1e-9 or f.q < self.LO - 1e-9]
+
+    def test_close_saturates_at_the_calibrated_limit(self):
+        g, fake = make_gripper(stops=True)
+        res = g.close(SPEED_MM_S)
+
+        self.assertEqual(self._outside(fake), [])
+        self.assertAlmostEqual(max(f.q for f in fake.frames), POS_CLOSED_RAD,
+                               places=9)
+        self.assertTrue(res.ok, res)
+
+    def test_open_saturates_at_the_calibrated_limit(self):
+        g, fake = make_gripper(start_rad=POS_CLOSED_RAD, stops=True)
+        res = g.open(SPEED_MM_S)
+
+        self.assertEqual(self._outside(fake), [])
+        self.assertAlmostEqual(min(f.q for f in fake.frames), POS_OPEN_RAD,
+                               places=9)
+        self.assertTrue(res.ok, res)
+
+    def test_no_stop_at_all_still_cannot_walk_past_the_limit(self):
+        """真限位缺席（机械限位已经损坏）时，指令封顶是唯一的护栏。
+
+        夹爪一路跟到标定限位就停在那里（引擎自己的「停在限位上」口径
+        ``stop_tol``），不会像越位目标那样继续走下去。
+        """
+        g, fake = make_gripper(stops=False)
+        g.close(SPEED_MM_S)
+
+        self.assertEqual(self._outside(fake), [])
+        self.assertLess(abs(fake.motor.pos - POS_CLOSED_RAD),
+                        g.motion_config.stop_tol)
+
+    def test_real_stop_beyond_the_calibration_stops_at_the_calibration(self):
+        g, fake = make_gripper(stops=True)
+        fake.motor.limit_hi = POS_CLOSED_RAD + 0.5      # 真限位在标定外侧
+
+        g.close(SPEED_MM_S)
+
+        self.assertEqual(self._outside(fake), [])
+        self.assertLess(abs(fake.motor.pos - POS_CLOSED_RAD),
+                        g.motion_config.stop_tol)
+
+    def test_real_stop_inside_the_calibration_is_not_pushed_through(self):
+        """真限位在标定内侧时，夹爪停在真限位上 —— 封顶不能抹掉「被挡住」这个
+        信号：离标定限位还很远就停住，仍然报堵转、不报成功。"""
+        g, fake = make_gripper(stops=True)
+        fake.motor.limit_hi = POS_CLOSED_RAD - 0.3      # 真限位在标定内侧
+
+        res = g.close(SPEED_MM_S)
+
+        self.assertEqual(self._outside(fake), [])
+        self.assertTrue(res.stalled, res)
+        self.assertFalse(res.ok, res)
+        self.assertGreater(abs(res.state.position_rad - POS_CLOSED_RAD),
+                           g.motion_config.stop_tol)
+
+    def test_reverse_mount_clamps_the_other_end(self):
+        g, fake = make_gripper(reverse=True, stops=True)
+        g.close(SPEED_MM_S)
+
+        self.assertEqual(self._outside(fake), [])
+        self.assertAlmostEqual(min(f.q for f in fake.frames), POS_OPEN_RAD,
+                               places=9)
+
+    def test_final_cmd_and_progress_report_the_emitted_value(self):
+        seen = []
+        g, fake = make_gripper(stops=True)
+        res = g.close(SPEED_MM_S, progress=seen.append)
+
+        self.assertAlmostEqual(res.final_cmd_rad, fake.frames[-1].q, places=9)
+        self.assertTrue(seen)
+        for p in seen:
+            self.assertLessEqual(p.cmd_rad, self.HI + 1e-9)
+            self.assertGreaterEqual(p.cmd_rad, self.LO - 1e-9)
 
 
 class TestStallFalsePositives(unittest.TestCase):

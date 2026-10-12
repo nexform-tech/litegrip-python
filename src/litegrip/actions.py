@@ -21,9 +21,11 @@ ROS 2 桥接、RPC 服务、产品代码都能直接调 :attr:`LiteGrip.actions`
 着实测冻结，误差永远涨不上去，会误判堵转。
 
 ``open()`` / ``close()`` 的目标是**越过**标定限位一点（
-:attr:`MotionConfig.press_overshoot`），靠堵转停在物理限位上，终点不依赖标定
-精度。``grasp()`` 的闭合段仍停在限位内侧（:attr:`MotionConfig.margin`）——
-夹取要停在工件上，不能压向空载限位。
+:attr:`MotionConfig.press_overshoot`），好让运动靠堵转结束在限位上；但**下发的
+指令**由 :func:`clamp_to_travel` 封顶在标定限位，夹爪不可能被驱动到标定行程
+之外。「目标越位、指令不越位」是一次移动的两面：目标决定什么时候判堵转，指令
+决定夹爪能走到哪。``grasp()`` 的闭合段仍停在限位内侧
+（:attr:`MotionConfig.margin`）—— 夹取要停在工件上，不能压向空载限位。
 
 **带设定力的接近段另有一条预算**（``grasp`` 的闭合段，见
 :func:`force_approach_terms`）：上面那条 ``kp × 领先上限`` 对默认的 4 mm 上限、
@@ -92,8 +94,11 @@ class MotionConfig:
     settle_s: float = 0.3               # 斜坡后原地保目标时长 s（不判堵转）
     reach_tol: float = 0.02             # 到位容差 rad（闭合侧死区 0.0103）
 
-    # ── open/close 顶限位压紧 ──────────────────────────────────────────
-    press_overshoot: float = 0.05       # 指令越过标定限位的行程比例
+    # ── open/close 顶限位 ──────────────────────────────────────────────
+    # 这几个数只影响**目标的排程**和接近段的领先：真正下发的指令被
+    # :func:`clamp_to_travel` 封顶在标定限位，所以越位量调多大都不会把夹爪送
+    # 到标定行程之外。
+    press_overshoot: float = 0.05       # 目标越过标定限位的行程比例（不是指令）
     press_zone_mm: float = 2.0          # 距限位这么近就切到 stop_lead_mm
     stop_lead_mm: float = 0.7           # 压紧段领先上限 mm（≈ kp × 上限）
     stop_tol: float = 0.02              # 停稳位置距限位多近算「顶在限位上」rad
@@ -202,9 +207,10 @@ class MoveResult:
 
     ``ok`` 是「这次动作算不算成功」，``__bool__`` 用它。注意含义随目标而变：
 
-    - ``open()`` / ``close()``：成功 = **顶到机械限位堵转**，所以
-      ``ok=True`` 时 ``stalled=True`` 而 ``reached`` 基本为 ``False``。
-      半路被工件挡住也算堵转，但离标定限位很远，``ok=False``。
+    - ``open()`` / ``close()``：成功 = **堵转停在标定限位近旁**（下发的指令
+      被封顶在标定限位上，见 :func:`clamp_to_travel`），所以 ``ok=True`` 时
+      ``stalled=True`` 而 ``reached`` 基本为 ``False``。半路被工件挡住也算
+      堵转，但离标定限位很远，``ok=False``。
     - ``grasp()`` 的闭合段：成功 = 走到空载目标且没堵转，即
       ``reached and not stalled``，与旧行为一致。
     """
@@ -293,6 +299,33 @@ def _check_calibrated(config: GripperConfig) -> None:
             f"pos_open_rad={config.pos_open_rad} 相同，重新标定。")
 
 
+def clamp_to_travel(config: GripperConfig, q: float) -> float:
+    """把位置指令夹进标定行程 ``[pos_closed_rad, pos_open_rad]``。
+
+    两端谁大谁小取决于安装方向（``close_sign``），所以这里取 ``min`` / ``max``，
+    不假设顺序 —— 与 :func:`limit_target` 一样，正装、反装通用。
+
+    这是引擎**最后一道**位置护栏：:func:`press_target` 故意把 ``open`` / ``close``
+    的**目标**放在标定限位之外，但**下发**的指令不许越过去。指令一旦越过去，夹爪
+    就朝那边一直走 —— 真限位不在那儿（标定偏了、机械限位已经损坏、或者本来就
+    没有）时，没有东西拦得住它。
+
+    非有限值不归这里兜底：``min`` / ``max`` 与 NaN 的比较全为假，NaN 会被静默
+    折到量程的一端。调用方必须在进来之前拒绝非有限值 —— CAN 层
+    :meth:`LiteGripCAN._check_motion_command` 已经在做这件事。
+
+    Args:
+        config: 夹爪配置（用 ``pos_closed_rad`` / ``pos_open_rad``）。
+        q: 待下发的指令位置 rad。
+
+    Returns:
+        夹进标定行程后的位置 rad。
+    """
+    lo = min(config.pos_closed_rad, config.pos_open_rad)
+    hi = max(config.pos_closed_rad, config.pos_open_rad)
+    return max(lo, min(hi, q))
+
+
 def limit_target(
     config: GripperConfig,
     toward: str,
@@ -336,10 +369,14 @@ def press_target(
 ) -> Tuple[float, float, float, float]:
     """算出一端的目标位置：**越过**标定限位 ``overshoot`` 比例的行程。
 
-    与 :func:`limit_target` 相反 —— 目标是「压过去」，让夹爪顶着机械限位堵转，
-    终点由物理限位决定，不依赖标定精度。压紧段的领先上限由
-    :attr:`MotionConfig.stop_lead_mm` 收窄，所以压紧力矩 ≈
-    ``kp × stop_lead_mm / rad_to_mm``，不会一路顶到 ``kp × 越位量``。
+    与 :func:`limit_target` 相反 —— 目标是「压过去」，让运动靠堵转结束在限位上。
+    它算的只是**目标**：真正下发的指令由 :func:`clamp_to_travel` 封顶在标定
+    限位，所以终点是标定限位，不是物理限位。标定偏了（或真实限位不在标定位置
+    上）只会让夹爪停得更早，不会让它走得更远。
+
+    压紧段的领先上限由 :attr:`MotionConfig.stop_lead_mm` 收窄，接近段的力矩
+    因此不超过 ``kp × stop_lead_mm / rad_to_mm``；指令封顶在限位上之后，顶住
+    限位时的残余领先更小，力矩只会更低。
 
     方向来自 :attr:`GripperConfig.close_sign`，正向与反装都成立。
 
@@ -511,11 +548,13 @@ class GripperActions:
     ) -> MoveResult:
         """全开。
 
-        默认顶到张开侧机械限位堵转（压紧段轻压，不会撞），``ok=True`` 时
-        ``stalled=True``、``reached`` 基本为 ``False``。
+        默认走到张开侧标定限位上堵转停下，``ok=True`` 时 ``stalled=True``、
+        ``reached`` 基本为 ``False``。下发的指令被封顶在标定限位
+        （:func:`clamp_to_travel`），所以标定偏了、真实限位不在标定位置上、甚至
+        限位已经损坏，夹爪也不会被驱动到标定行程之外。
 
         但若配置带了**工作行程**（:attr:`GripperConfig.work_stroke_mm` 且小于
-        机械行程），只走到那里就停 —— 开口端留出余量，不再压机械限位。这时是
+        机械行程），只走到那里就停 —— 开口端留出余量，不再走向机械限位。这时是
         一次普通定位（``ok = reached and not stalled``），``limit_rad`` 仍是
         张开侧标定限位，示意目标停在它内侧。
         """
@@ -535,9 +574,11 @@ class GripperActions:
         *,
         progress: Optional[Callable[[MoveProgress], None]] = None,
     ) -> MoveResult:
-        """全合：直接顶到闭合侧机械限位堵转（压紧段轻压，不会撞）。
+        """全合：走到闭合侧标定限位上堵转停下。
 
-        ``ok=True`` 时 ``stalled=True``、``reached`` 基本为 ``False`` ——
+        下发的指令被封顶在标定限位（:func:`clamp_to_travel`），所以标定偏了、
+        真实限位不在标定位置上、甚至限位已经损坏，夹爪也不会被驱动到标定行程
+        之外。``ok=True`` 时 ``stalled=True``、``reached`` 基本为 ``False`` ——
         见 :class:`MoveResult`。
         """
         speed = self.config.speed_mm_s if speed_mm_s is None else speed_mm_s
@@ -670,10 +711,21 @@ class GripperActions:
     # ═══════════════════════════════════════════════════════════════════
 
     def _emit(self, q: float, dq: float = 0.0, tau: float = 0.0,
-              kp: Optional[float] = None, kd: Optional[float] = None) -> None:
-        """下发一帧 MIT 并等待一帧的时间。"""
+              kp: Optional[float] = None, kd: Optional[float] = None) -> float:
+        """下发一帧 MIT 并等待一帧的时间。
+
+        位置先过 :func:`clamp_to_travel`：这是引擎所有帧的必经之路，所以「指令
+        不越标定行程」是引擎级不变式，而不是某一处算术的性质。``open`` /
+        ``close`` 的目标本来就在限位外（:func:`press_target`），夹的就是它。
+
+        Returns:
+            真正下发的那个 ``q``（夹过之后的值）—— 调用方拿它填
+            ``MoveResult.final_cmd_rad`` / ``MoveProgress.cmd_rad``，报的是发出去
+            的指令，不是算出来又没发的。
+        """
         cfg = self.config
         g = self._g
+        q = clamp_to_travel(g.config, q)
         sent = g.send_mit_frame(
             q,
             g.config.kp if kp is None else kp,
@@ -684,6 +736,7 @@ class GripperActions:
         if not sent:
             raise CommandError("MIT 帧下发失败（未连接或未使能）")
         cfg.sleep_fn(cfg.frame_interval)
+        return q
 
     def _move_to_limit(
         self,
@@ -701,8 +754,11 @@ class GripperActions:
         ``press=False``：目标是「限位内侧留 :attr:`MotionConfig.margin`」，
         到位即成功（``grasp`` 的闭合段用这个）。
         ``press=True``：目标是「越过限位 :attr:`MotionConfig.press_overshoot`」，
-        靠堵转停在物理限位上；距限位 :attr:`MotionConfig.press_zone_mm` 之内
-        领先上限切到 :attr:`MotionConfig.stop_lead_mm`，压紧力矩有界。
+        靠堵转停在限位上；距限位 :attr:`MotionConfig.press_zone_mm` 之内领先
+        上限切到 :attr:`MotionConfig.stop_lead_mm`，接近段的力矩有界。
+
+        无论走哪一条，每一帧真正下发的指令都经 :func:`clamp_to_travel` 封顶在
+        标定行程内（见 :meth:`_emit`）—— 目标可以越位，指令不许。
 
         ``target_rad``：显式目标（如 :func:`work_limit_target` 算出的工作行程
         点）。给了它就走**普通定位**语义（``press`` 视为 False），``limit`` 取该
@@ -781,11 +837,14 @@ class GripperActions:
         press_zone_rad = cfg.press_zone_mm / gcfg.rad_to_mm
 
         log.info("%s %.4f → %.4f rad（%.1f mm/s，%.1f mm，%d+%d 帧，"
-                 "堵转阈值 %.5f rad，领先上限 %.5f/%.5f rad%s%s）",
+                 "堵转阈值 %.5f rad，领先上限 %.5f/%.5f rad，"
+                 "标定行程 [%.4f, %.4f] 封顶%s%s）",
                  "闭合" if toward == "close" else "张开",
                  before.position_rad, target, speed_mm_s, dist_mm,
                  ramp_steps, settle_steps, win_thresh_rad,
                  travel_cap_rad, stop_cap_rad,
+                 min(gcfg.pos_closed_rad, gcfg.pos_open_rad),
+                 max(gcfg.pos_closed_rad, gcfg.pos_open_rad),
                  "，顶限位" if press else "",
                  "" if force_n is None else
                  "，力预算 %.3f Nm（kd %.2f）" % (
@@ -800,6 +859,7 @@ class GripperActions:
         st = before
         last_cmd = before.position_rad
         last_i = 0
+        clamped_once = False                     # 本次移动只记一条封顶 debug 日志
 
         for i in range(1, total_steps + 1):
             st = g.get_state(wait=False)
@@ -818,8 +878,15 @@ class GripperActions:
                 lead_cap_rad = stop_cap_rad
             lead = (q_sched - pos) * sign
             cmd = pos + sign * lead_cap_rad if lead > lead_cap_rad else q_sched
-            last_cmd = cmd
-            self._emit(cmd, dq, 0.0, kd=kd_frame)
+            # _emit 会把位置夹进标定行程，返回值才是真正下发的指令：领先项
+            # 会让 cmd 跑到限位外侧，尤其 press=True 时（目标本身就在外侧）。
+            last_cmd = self._emit(cmd, dq, 0.0, kd=kd_frame)
+            if last_cmd != cmd and not clamped_once:
+                clamped_once = True
+                log.debug("%s 指令封顶标定行程：%.5f → %.5f rad（标定 [%.5f, %.5f]）",
+                          toward, cmd, last_cmd,
+                          min(gcfg.pos_closed_rad, gcfg.pos_open_rad),
+                          max(gcfg.pos_closed_rad, gcfg.pos_open_rad))
             last_i = i
 
             if i % sample_every and i != total_steps:
@@ -835,7 +902,7 @@ class GripperActions:
                     phase="move",
                     i=i,
                     total_steps=total_steps,
-                    cmd_rad=cmd,
+                    cmd_rad=last_cmd,
                     pos_rad=pos,
                     delta_rad=hist[-1] - hist[-2],
                     win_delta_rad=win_delta,
@@ -843,9 +910,10 @@ class GripperActions:
                     temperature_coil=st.temperature_coil,
                 ))
             # 保压段 (i > ramp_steps) 本来就该不动，所以默认不判堵转。
-            # 但 press=True 时保压段的指令在限位外侧，夹爪本来就该顶着不动 ——
-            # 那里的「不动」正是我们要的堵转。而且越位量（5% 行程）往往短于一个
-            # 采样窗口，只在斜坡段判会永远判不到，动作得白跑完保压段。
+            # 但 press=True 时保压段的**目标**在限位外侧（下发的指令被夹在限位上），
+            # 夹爪到了那里就该顶着不动 —— 那里的「不动」正是我们要的堵转。而且
+            # 越位量（5% 行程）往往短于一个采样窗口，只在斜坡段判会永远判不到，
+            # 动作得白跑完保压段。
             if (win_delta is not None and (press or i <= ramp_steps)
                     and win_delta < win_thresh_rad):
                 stalled = True
