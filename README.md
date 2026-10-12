@@ -308,7 +308,7 @@ with LiteGrip("can0") as gripper:
 | `stop_lead_mm` | `0.7` | the same cap on the approach to a stop, so the pressing torque stays bounded |
 | `press_safety` | `0.9` | fraction of the setpoint a force-carrying approach may spend |
 | `reach_tol` | `0.02` | position tolerance for `reached`, radians |
-| `stop_tol` | `0.02` | how close to the calibrated stop the jaw must park to count as pressed home |
+| `stop_tol` | `0.03` | how close to the calibrated stop the jaw must park to count as pressed home |
 | `settle_s` | `0.3` | time spent holding the target after the ramp |
 
 Every other field — the stall window, the probe settings, the frame timing — is documented on

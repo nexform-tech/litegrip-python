@@ -471,6 +471,68 @@ class TestCommandClampedToCalibratedTravel(unittest.TestCase):
             self.assertGreaterEqual(p.cmd_rad, self.LO - 1e-9)
 
 
+class TestParkTolerance(unittest.TestCase):
+    """``stop_tol`` 的两条边：什么算「压到位」，什么不算（#46）。
+
+    记录的限位总是比 ``close()`` 能到的地方深一点，因为两者用力不同：
+    ``zero()`` 用 ``calib_kp 20 × calib_step_rad 0.05``（≈1.0 Nm）顶进去，而
+    ``close()`` 按自己的刚度压。台架实测缺口 0.92–1.27 mm，在它的
+    ``rad_to_mm=57.55`` 下是 0.016–0.022 rad —— 原来的 0.02 只差 0.001 rad
+    就够不着，于是按文档顺序跑 ``stroke_test`` 第一遍就 exit 1。
+
+    放宽 ``stop_tol`` 等于放宽「真的顶在限位上」这个判据本身，``open()`` 走同一
+    段代码会一起变松，所以两条边都要钉住：真限位落在标定限位内侧 0.022 rad 处
+    要判成功（原来判失败），落在再内侧 0.02 rad 以上仍要判失败。
+    """
+
+    # 台架最坏的一次缺口（1.27 mm @ 57.55 mm/rad），换算成 rad 与机器无关。
+    BENCH_GAP_RAD = 0.022
+
+    def _close_onto_a_stop_inside(self, gap_rad, sticky_rad=0.0):
+        """真限位放在标定闭合限位内侧 ``gap_rad`` 处，闭合一次。"""
+        g, fake = make_gripper(sticky_rad=sticky_rad, stops=True)
+        fake.motor.limit_hi = POS_CLOSED_RAD - gap_rad
+        return g, g.close(SPEED_MM_S)
+
+    def test_a_stop_inside_the_calibration_counts_as_pressed_home(self):
+        """#46 那一格：缺口比旧容差大，但它就是「顶到真限位了」。"""
+        g, res = self._close_onto_a_stop_inside(self.BENCH_GAP_RAD)
+
+        self.assertTrue(res.ok, res)
+        self.assertTrue(res.stalled, res)
+        self.assertLess(abs(res.state.position_rad - POS_CLOSED_RAD),
+                        g.motion_config.stop_tol)
+
+    def test_the_closing_side_dead_band_is_absorbed_too(self):
+        """带上闭合侧约 0.0103 rad 的粘滑死区，读数一跳也不该翻过这条线。"""
+        g, res = self._close_onto_a_stop_inside(self.BENCH_GAP_RAD,
+                                                sticky_rad=0.0103)
+
+        self.assertTrue(res.ok, res)
+        self.assertLess(abs(res.state.position_rad - POS_CLOSED_RAD),
+                        g.motion_config.stop_tol)
+
+    def test_a_stop_further_inside_is_not_pressed_home(self):
+        """放宽后的反面 —— 没有这条，放宽就成了「怎么都算成功」。"""
+        tol = MotionConfig().stop_tol
+        g, res = self._close_onto_a_stop_inside(tol + 0.02)
+
+        self.assertFalse(res.ok, res)
+        self.assertTrue(res.stalled, res)
+        self.assertGreater(abs(res.state.position_rad - POS_CLOSED_RAD), tol)
+
+    def test_the_open_side_loosens_with_it(self):
+        """``open()`` 走同一段代码：判据变松它一起变松，这条把它钉住。"""
+        g, fake = make_gripper(start_rad=POS_CLOSED_RAD, stops=True)
+        fake.motor.limit_lo = POS_OPEN_RAD + self.BENCH_GAP_RAD
+        res = g.open(SPEED_MM_S)
+
+        self.assertTrue(res.ok, res)
+        self.assertTrue(res.stalled, res)
+        self.assertLess(abs(res.state.position_rad - POS_OPEN_RAD),
+                        g.motion_config.stop_tol)
+
+
 class TestStallFalsePositives(unittest.TestCase):
     """8 / 9：粘滑不能误判堵转；非顶限位路径的保压段不算堵转。"""
 

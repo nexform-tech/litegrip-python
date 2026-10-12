@@ -107,7 +107,13 @@ class MotionConfig:
     press_overshoot: float = 0.05       # 目标越过标定限位的行程比例（不是指令）
     press_zone_mm: float = 2.0          # 距限位这么近就切到 stop_lead_mm
     stop_lead_mm: float = 0.7           # 压紧段领先上限 mm（≈ kp × 上限）
-    stop_tol: float = 0.02              # 停稳位置距限位多近算「顶在限位上」rad
+    # 停稳位置距限位多近算「顶在限位上」rad。这个数必须容得下「记录限位比
+    # 压紧能到的地方深一点」：``zero()`` 用 calib_kp × calib_step_rad（≈1.0 Nm）
+    # 探测，而 close() 按自己的刚度压，两者用力不同。台架实测缺口 0.92–1.27 mm
+    # （@57.55 mm/rad 即 0.016–0.022 rad），0.02 只差 0.001 rad 就够不着，于是
+    # 照文档顺序跑 stroke_test 第一遍就 exit 1。0.03 留了约 36% 余量，仍只占
+    # 1.41 rad 行程的 2.1%。
+    stop_tol: float = 0.03              # 停稳位置距限位多近算「顶在限位上」rad
 
     # ── 堵转判据 ───────────────────────────────────────────────────────
     stall_cycles: int = 5               # 窗口采样点数
