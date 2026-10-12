@@ -46,32 +46,32 @@ sudo ip link set can0 up
 两条命令都需要 root。如果 `can0` 根本不存在，那是 CAN 适配器的驱动还没加载。做产品时，
 把这两条命令放进开机启动的 init 脚本，别让应用程序自己去起接口。
 
-## 3. 确认装法
+## 3. 只有反装才需要声明装法
 
-夹爪闭合时电机往哪个方向数，不是固定的。电机反着装的夹爪就是**反装**，对它来说闭合是 rad
-减小。SDK 两种都不预设 —— 方向由两个标定限位的**数值顺序**推出来。
+出厂的都是**正装** —— 闭合时电机的 rad 读数是增大的 —— 而 SDK 随包发布的出厂标定描述的
+就是它们。正装的夹爪**什么都不用声明**：下一节的 `load_calibration()` 会给出正确的方向，
+第 5 步再确认一遍。
 
-装法靠**名字**声明。`list_templates()` 返回可选名字，给 UI 做下拉框用；选中后用 `mount=` 加载：
+电机反着装的夹爪是**反装**，对它来说闭合是 rad **减小**。SDK 两种都不预设 —— 方向由两个
+标定限位的**数值顺序**推出来。你的夹爪是反装的话，按名字声明：
 
 ```python
-from litegrip import LiteGrip, list_templates
+from litegrip import LiteGrip
 
-list_templates()                       # ["normal", "reverse"] —— 给 UI 用
-
-with LiteGrip("can0", mount="normal") as gripper:
+with LiteGrip("can0", mount="reverse") as gripper:
     gripper.enable()
-    print(gripper.mount)               # "normal" —— 从限位数值读回
-    gripper.close()                    # 看爪子往哪边动
+    print(gripper.mount)    # "reverse" —— 从限位数值读回
+    gripper.close()         # 爪子应该合上，而不是张开
 ```
 
-判断只需要看一眼：跑上面那句 `close()`，看爪子是不是合上。如果它反而张开，那就是另一种
-装法 —— 换成 `mount="reverse"` 重来。
+如果它反而张开，那这台其实就是正装 —— 把参数去掉即可。
+
+`list_templates()` 返回 SDK 接受的全部名字，给 UI 做下拉框用。`gripper.mount` 读回
+`"normal"`、`"reverse"`，未标定时是 `None`；名字不在 `list_templates()` 里会抛
+`CommandError` 并列出合法名字。
 
 即使几何还不是你这台的，用模板跑运动也是安全的：`open` 和 `close` 永远不会把指令发到标定
-行程之外，所以装法选错也顶不出限位。它选错的只是方向，而这一点你立刻就能看见。
-
-`gripper.mount` 是 `"normal"`、`"reverse"`，未标定时是 `None`。名字不在 `list_templates()`
-里会抛 `CommandError` 并列出合法名字。
+行程之外，所以方向选错也顶不出限位。它只会朝错的方向走，而这一点你立刻就能看见。
 
 ## 4. 量出行程
 
@@ -80,7 +80,7 @@ with LiteGrip("can0", mount="normal") as gripper:
 探两端机械限位、推出比例并存盘：
 
 ```python
-with LiteGrip("can0", mount="normal") as gripper:
+with LiteGrip("can0") as gripper:
     gripper.enable()
     gripper.config.max_stroke_mm = 87.5     # 你的卡尺读数
     gripper.zero()                          # 探两端限位，按通道存盘
@@ -97,8 +97,9 @@ with LiteGrip("can0", mount="normal") as gripper:
 所有 LiteGrip 共用同一个 CAN ID（`0x08`），所以一台电脑上放两台时，**通道是唯一的身份键**。
 标定**按通道各存各的**：`~/.litegrip/<channel>_calibration.json`，两台互不覆盖。
 
-无参 `load_calibration()` 先读本通道这一份，再读出厂标定。自动链里凡是声明了**别的**通道的
-候选文件一律跳过 —— 所以 `can1` 自己没有标定时会**大声失败**，而不是悄悄采纳 `can0` 的方向。
+无参 `load_calibration()` 先读本通道这一份，再读出厂标定。出厂文件声明的是 `channel: can0`，
+所以 `can1` 自己没有标定时会**大声失败**，而不是悄悄采纳 `can0` 的方向。要给它一份，用
+`LiteGrip("can1", mount="normal")`（模板按名字加载，不理会通道）或者自己跑一次 `zero()`。
 想让所有通道共用一个显式路径，设 `LITEGRIP_CALIB`。
 
 SDK 不猜方向：没有加载标定之前，任何运动接口都会抛 `CommandError`。
@@ -430,7 +431,7 @@ python3 examples/trajectory.py --play pick --repeat 3
 | `CommandError` 提到标定 | 这个通道没加载标定。走第 4 步。 |
 | `ConnectError`，或一直收不到状态帧 | `can0` 没起，或波特率不是 1 Mbit/s。见第 2 步。 |
 | `enable()` 抛 `HardwareError` | 电机始终没报 `err == 1`。先查供电，再 `clear_fault()`。 |
-| 爪子往错的方向动 | 装法是另一种。见第 3 步。 |
+| 爪子往错的方向动 | 这台是反装，不是正装。见第 3 步。 |
 | `close()` 返回 `ok=False` | 爪子停的位置离限位超过 `stop_tol`。调大 `stop_lead_mm` 直到它压到位。 |
 | `travel_guard` 置位，或 `set_force` 返回 `False` | 失控监视触发了：爪子越过了闭合侧限位。检查标定是否描述真实行程，以及限位有没有被拆掉。 |
 | `can1` 的 `load_calibration()` 返回 `False` | 它没有自己的标定，而加载链有意跳过声明别的通道的文件。给它跑一次 `zero()`。 |
