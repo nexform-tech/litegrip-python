@@ -49,35 +49,35 @@ Both commands need root. If `can0` does not exist at all, the CAN adapter is not
 In a product, run these two commands at boot from your init system, so the application never
 has to start the interface itself.
 
-## 3. Decide the mount
+## 3. Declare a reverse mount (only if you have one)
 
-Which way the motor counts when the jaws close is not fixed. A gripper whose motor is mounted
-the other way round is a *reverse mount*, and there closing means decreasing radians. The SDK
-assumes neither: it derives the direction from the ordering of the two calibrated limits.
+The shipped units are **normal mount** — closing increases the motor's rad count — and the
+factory calibration the SDK ships describes them. On a normal-mount gripper you declare
+nothing: `load_calibration()` in the next section gives you the right direction, and step 5
+confirms it.
 
-Say which one you have by name. `list_templates()` returns the choices for a UI to offer, and
-`mount=` loads the one you pick:
+A gripper whose motor is mounted the other way round is a **reverse mount**, and for it closing
+means *decreasing* radians. The SDK assumes neither direction; it derives one from the ordering
+of the two calibrated limits. If yours is reverse, say so by name:
 
 ```python
-from litegrip import LiteGrip, list_templates
+from litegrip import LiteGrip
 
-list_templates()                       # ["normal", "reverse"] — for a UI
-
-with LiteGrip("can0", mount="normal") as gripper:
+with LiteGrip("can0", mount="reverse") as gripper:
     gripper.enable()
-    print(gripper.mount)               # "normal" — read back from the limits
-    gripper.close()                    # watch which way the jaws travel
+    print(gripper.mount)    # "reverse" — read back from the limits
+    gripper.close()         # the jaws should shut, not open
 ```
 
-Deciding takes one look: run that `close()` and see whether the jaws shut. If they open
-instead, you have the other mount — start again with `mount="reverse"`.
+If they open instead, the unit is normal after all — drop the argument.
+
+`list_templates()` returns every name the SDK accepts, for a UI to offer. `gripper.mount` reads
+back `"normal"`, `"reverse"`, or `None` until calibrated; a name outside `list_templates()`
+raises `CommandError` listing the valid ones.
 
 Running a move under a template is safe even though the geometry is not yours yet: `open` and
-`close` never send a command outside the calibrated travel, so a wrong mount cannot drive the
-jaws past a stop. It only chooses the wrong direction, which you will see immediately.
-
-`gripper.mount` is `"normal"`, `"reverse"`, or `None` until calibrated. A name outside
-`list_templates()` raises `CommandError` listing the valid ones.
+`close` never send a command outside the calibrated travel, so a wrong direction cannot drive
+the jaws past a stop. It only sends them the wrong way, which you see immediately.
 
 ## 4. Measure the travel
 
@@ -87,7 +87,7 @@ which is the shipped hardware — and `zero()` probes both mechanical stops, der
 and saves it:
 
 ```python
-with LiteGrip("can0", mount="normal") as gripper:
+with LiteGrip("can0") as gripper:
     gripper.enable()
     gripper.config.max_stroke_mm = 87.5     # your caliper measurement
     gripper.zero()                          # probes both stops, saves per channel
@@ -105,10 +105,11 @@ Every LiteGrip shares the same CAN ID (`0x08`), so **the channel is the only ide
 when two sit on one machine. Calibrations are stored one file per channel —
 `~/.litegrip/<channel>_calibration.json` — so two units never overwrite each other.
 
-A no-argument `load_calibration()` reads this channel's own file, then the factory one. A
-candidate naming a *different* channel is skipped, so a `can1` unit with no calibration of its
-own fails loudly instead of silently adopting `can0`'s direction. Set `LITEGRIP_CALIB` to pin
-one explicit path for every channel instead.
+A no-argument `load_calibration()` reads this channel's own file, then the factory one. The
+factory file declares `channel: can0`, so a `can1` unit with no calibration of its own fails
+loudly instead of silently adopting `can0`'s direction. Give it one with either
+`LiteGrip("can1", mount="normal")` — a template loads by name and ignores the channel — or a
+`zero()` of its own. Set `LITEGRIP_CALIB` to pin one explicit path for every channel instead.
 
 The SDK never guesses a direction: until a calibration is loaded, every motion raises
 `CommandError`.
@@ -477,7 +478,7 @@ python3 examples/trajectory.py --play pick --repeat 3
 | `CommandError` naming a calibration | No calibration loaded for this channel. Run step 4. |
 | `ConnectError`, or no status frame ever | `can0` is down, or the bitrate is not 1 Mbit/s. See step 2. |
 | `HardwareError` from `enable()` | The motor never reported `err == 1`. Check power, then `clear_fault()`. |
-| The jaws move the wrong way | The mount is the other one. See step 3. |
+| The jaws move the wrong way | The unit is reverse-mounted, not normal. See step 3. |
 | `close()` returns `ok=False` | The jaw parked further than `stop_tol` from the limit. Raise `stop_lead_mm` until it presses home. |
 | `travel_guard` is set, or `set_force` returns `False` | The runaway watch tripped: the jaw walked past the closed-side stop. Check the calibration describes the real travel, and that nothing has removed the stop. |
 | A `can1` unit's `load_calibration()` returns `False` | It has no calibration of its own, and the load chain deliberately skips files naming another channel. Run `zero()` for it. |
