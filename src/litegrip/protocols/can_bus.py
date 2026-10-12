@@ -365,7 +365,10 @@ class LiteGripCAN:
             tau_feedforward: Feed-forward torque (Nm).
 
         Returns:
-            True if the frame was sent, False when there is no connection.
+            True if the frame was sent, False when there is no connection or the
+                send failed.  A failed send leaves a warning naming the reason —
+                ``False`` alone cannot tell "not enabled" from "the buffer was
+                full for 100 ms", and those need different fixes.
 
         Raises:
             CommandError: a field is NaN/infinite, or the torque exceeds the
@@ -382,7 +385,8 @@ class LiteGripCAN:
                 self._motor, kp=kp, kd=kd,
                 q=q_target, dq=dq_target, tau=tau_feedforward)
             return True
-        except Exception:
+        except Exception as e:
+            log.warning("MIT 帧下发失败（%s）：%r", self._channel, e)
             return False
 
     def poll(self, timeout_s: float = 0.0) -> bool:
@@ -412,11 +416,21 @@ class LiteGripCAN:
 
         DM motors require continuous MIT frames to sustain motion.
 
+        Returns:
+            True only when every frame of the stream went out.  A stream with
+            failed frames returns False and logs how many — a single dropped
+            frame no longer aborts the stream, because the motor needs the rest
+            of the frames, but it must not come back as success either.
+
         Raises:
             CommandError: a field is NaN/infinite, the torque exceeds the
                 frame's range, or the timing is not usable — the same rule as
                 :meth:`control_mit`, checked once before the first frame rather
                 than per frame.
+            CommError: not one frame could be sent.  The bus or the enable is
+                broken, and streaming nothing for the whole duration while
+                returning success is exactly the silent failure this method used
+                to have.
         """
         self._check_motion_command(q_target, kp, kd, dq_target,
                                    tau_feedforward)
@@ -427,6 +441,11 @@ class LiteGripCAN:
                     f"{name} 不是有限数：{value!r}。拒绝下发：duration_s 为 "
                     "NaN 时 ``while now < deadline`` 恒为假 —— 整段一帧都不发"
                     "却返回 True，调用方以为夹爪动了。")
+        if duration_s <= 0.0:
+            # 与上面 NaN 同一个洞：0 或负数让循环体一次都不进，一帧不发。
+            raise CommandError(
+                f"duration_s 必须为正：{duration_s!r}。这个时长里一帧都不会"
+                "下发，而返回成功就是谎报运动。")
         if interval_s < 0.0:
             raise CommandError(f"interval_s 不能为负：{interval_s!r}。")
         if self._controller is None or self._motor is None:
@@ -436,15 +455,31 @@ class LiteGripCAN:
         m = self._motor
         deadline = time.monotonic() + duration_s
 
-        try:
-            while time.monotonic() < deadline:
+        attempts = 0
+        sent = 0
+        last_error: Optional[Exception] = None
+        while time.monotonic() < deadline:
+            attempts += 1
+            try:
                 ctrl.control_mit(m, kp=kp, kd=kd,
-                                 q=q_target, dq=dq_target, tau=tau_feedforward)
-                ctrl.poll(timeout_s=0.0)
-                time.sleep(interval_s)
-            return True
-        except Exception:
-            return False
+                                 q=q_target, dq=dq_target,
+                                 tau=tau_feedforward)
+                sent += 1
+            except Exception as e:
+                last_error = e
+            ctrl.poll(timeout_s=0.0)
+            time.sleep(interval_s)
+
+        failed = attempts - sent
+        if failed:
+            log.warning("%s：%d 帧里 %d 帧没发出去（最后一次：%r）",
+                        self._channel, attempts, failed, last_error)
+        if sent == 0:
+            raise CommError(
+                f"MIT 流一帧都没发出去（{failed} 次尝试全部失败，最后一次："
+                f"{last_error!r}）。整段 {duration_s:.3f} s 一帧都没下发 —— "
+                "报成功就是谎报运动。")
+        return failed == 0
 
     # ═══════════════════════════════════════════════════════════════════
     # Status
