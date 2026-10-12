@@ -427,6 +427,25 @@ class TestRampedGoto(unittest.TestCase):
             self.assertEqual(f.tau_ff, 0.0)
             self.assertAlmostEqual(f.q, f.pos_after, places=6)
 
+    def test_a_target_the_jaws_are_almost_on_is_not_a_stall(self):
+        """差一点点（不是一点都不差）也是到位，不是堵转。
+
+        ``duration`` 定的是**时长**，所以排程的帧数不随距离缩短 —— 间距趋近 0 时
+        排程速度也趋近 0，爪子整整一个采样窗口一动不动，被堵转窗口读成堵转，一次
+        成功的定位就报成失败。bench 假台上 ``close()`` 之后紧跟 ``home()``（两个
+        都瞄着闭合端）跑出来的就是这个形状。
+        """
+        g, fake = make_gripper(start_rad=POS_OPEN_RAD)
+        here_mm = TRAVEL_RAD * RAD_TO_MM
+        target_mm = here_mm - 0.3          # 差 0.3 mm，远在 reach_tol 之内
+
+        res = g.goto(target_mm, duration=1.0)
+
+        self.assertTrue(res.reached, res)
+        self.assertFalse(res.stalled, f"原地不动被读成堵转：{res}")
+        self.assertTrue(res.ok, f"一次已经到位的定位被报成失败：{res}")
+        self.assertFalse(res.released, "到了位还撤力 —— 那不是定位的收尾")
+
     def test_the_gains_reach_the_frames(self):
         g, fake = make_gripper()
         g.goto(self.TARGET_MM, duration=self.DURATION_S, kp=50.0, kd=1.0)

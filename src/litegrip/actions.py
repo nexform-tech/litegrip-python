@@ -1050,6 +1050,13 @@ class GripperActions:
         win_s = win * sample_every * interval
         win_expect_rad = speed_rad_s * win_s
         win_thresh_rad = max(cfg.stall_delta, cfg.stall_ratio * win_expect_rad)
+        # 「这一趟本来就没事可做」不判堵转。目标落在到位容差里时，夹爪原地不动
+        # 就是到位，读成堵转会把一次成功的定位报成失败 —— 而它会真的发生：排程
+        # 的帧数由 duration 定、不随距离缩短，间距趋近 0 时排程速度也趋近 0，
+        # 整段斜坡都是「不动」。`home()` 紧跟在 `close()` 之后（两个都瞄着闭合
+        # 端，只剩一点点齿隙）就是这个形状。压紧路径不受影响：那里目标在限位
+        # 外侧，「到了还不动」正是要判的堵转。
+        judge_stall = press or dist_mm > cfg.reach_tol * gcfg.rad_to_mm
 
         # 两档领先上限：行进段用 max_lead_mm 破静摩擦，贴近限位后收窄到
         # stop_lead_mm，压紧力矩 ≈ kp × stop_lead_mm。下限都是一帧的位移，
@@ -1137,7 +1144,8 @@ class GripperActions:
             # 夹爪到了那里就该顶着不动 —— 那里的「不动」正是我们要的堵转。而且
             # 越位量（5% 行程）往往短于一个采样窗口，只在斜坡段判会永远判不到，
             # 动作得白跑完保压段。
-            if (win_delta is not None and (press or i <= ramp_steps)
+            if (judge_stall and win_delta is not None
+                    and (press or i <= ramp_steps)
                     and win_delta < win_thresh_rad):
                 stalled = True
                 log.info("堵转：最近 %d 次采样(%.2f s)净位移仅 %.5f rad "
