@@ -66,9 +66,16 @@ with LiteGrip("can0", mount="reverse") as gripper:
 
 如果它反而张开，那这台其实就是正装 —— 把参数去掉即可。
 
-`list_templates()` 返回 SDK 接受的全部名字，给 UI 做下拉框用。`gripper.mount` 读回
-`"normal"`、`"reverse"`，未标定时是 `None`；名字不在 `list_templates()` 里会抛
-`CommandError` 并列出合法名字。
+`list_templates()` 是模块级函数，不是夹爪上的方法，要按名字导入：
+
+```python
+from litegrip import list_templates
+
+list_templates()        # ['normal', 'reverse'] —— SDK 接受的全部名字，给 UI 做下拉框用
+```
+
+`gripper.mount` 读回 `"normal"`、`"reverse"`，未标定时是 `None`；名字不在 `list_templates()`
+里会抛 `CommandError` 并列出合法名字。
 
 即使几何还不是你这台的，用模板跑运动也是安全的：`open` 和 `close` 永远不会把指令发到标定
 行程之外，所以方向选错也顶不出限位。它只会朝错的方向走，而这一点你立刻就能看见。
