@@ -146,6 +146,26 @@ class TestShippedCalibrationFiles(unittest.TestCase):
                     sorted([data["zero_position_rad"], data["max_position_rad"]]),
                     sorted([self.FACTORY_OPEN_RAD, self.FACTORY_CLOSED_RAD]))
 
+    def test_the_factory_file_does_not_carry_its_own_stiffness(self):
+        """文档指的两条入口必须描述同一台夹爪 —— 几何一样，刚度也得一样。
+
+        ``--template normal`` 的模板不带增益，落回 :class:`GripperConfig` 的
+        默认 ``kp``/``kd``；出厂文件要是自带另一套，这两条入口压紧限位的刚度就
+        差一个倍数，而几何看起来分毫不差 —— 正是这种「只差一个字段」的不一致
+        最难看出来。``kp`` 曾经是 ``5.0``（PR #12 顺手降的，没人问过 5.0 是哪
+        台机器量出来的），实测压紧力矩因此只有 ``0.08 Nm``，连 ``zero()`` 探测
+        用的 ``1.0 Nm`` 都够不着。
+        """
+        by_template = LiteGrip("can0", mount="normal")
+        by_path = LiteGrip("can0")
+        self.assertTrue(by_path.load_calibration(_FACTORY_CALIB))
+
+        default = GripperConfig()
+        self.assertAlmostEqual(by_path.config.kp, default.kp)
+        self.assertAlmostEqual(by_path.config.kd, default.kd)
+        self.assertAlmostEqual(by_template.config.kp, by_path.config.kp)
+        self.assertAlmostEqual(by_template.config.kd, by_path.config.kd)
+
 
 class TestPersistence(unittest.TestCase):
     def setUp(self):
