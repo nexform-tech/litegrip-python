@@ -475,6 +475,27 @@ class TestPerChannelPaths(unittest.TestCase):
         with _patched_calib_env(self.dir):
             self.assertFalse(LiteGrip("can1").load_calibration())
 
+    def test_an_unrecognized_name_is_never_a_candidate(self):
+        """#45 台架上那份 ``can0_08_calibration.json`` 连候选都不是。
+
+        无参加载只认 ``<channel>_calibration.json`` 这一个名字，所以一台标定
+        躺在 ``~/.litegrip/`` 里、夹爪却跑在出厂值上。它声明了 ``channel: can0``
+        也不管用 —— README 里承诺的就是这条。文件本身没问题，点名它就能加载。
+        """
+        path = self._seed(os.path.join(".litegrip", "can0_08_calibration.json"), {
+            "schema_version": 1, "device_key": "can0_08", "channel": "can0",
+            "can_id": 8, "calibrated": True, "kp": 20,
+            "zero_position_rad": 0.114, "max_position_rad": -1.491,
+            "rad_to_mm": 63.42})
+        with _patched_calib_env(self.dir):
+            g = LiteGrip("can0")
+            warnings = _capture_warnings(lambda: g.load_calibration())
+            self._assert_factory_geometry(g)
+            # 躺在那里就该被点出来，否则用户以为它正在生效。
+            self.assertTrue(any(path in m for m in warnings), warnings)
+            self.assertTrue(g.load_calibration(path))
+            self.assertAlmostEqual(g.config.rad_to_mm, 63.42)
+
     def test_isolated_home_finds_nothing_and_says_so(self):
         # 空 HOME 只是背景。真正让 can1 取不到的是出厂文件声明了
         # ``channel: can0`` —— 宁可大声失败，也不静默采纳别的通道的方向。
