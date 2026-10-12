@@ -976,9 +976,11 @@ class GripperTeleop:
                 self._last_position_mm = float(first[1])
                 self._last_force_n = float(first[2])
                 # [遥操对齐块] 定速斜坡 + 领先上限对齐（说明见 _ramp_to() 上方）。
-                # 退回旧行为就把下一行换成：
+                # 退回旧写法就把下一行换成：
                 # self._g.goto_rad(q_cmd, kp=self._resolve_kp(),
                 #                  kd=self._resolve_kd(), duration=1.0)
+                # （goto_rad 现在走的是同一条有界斜坡 —— 那一行不再是「第一帧满
+                #   力矩」；但它不经过本块的 _update_torque_guard。）
                 self._ramp_to(q_cmd)
             else:
                 log.warning("[slave] no frame within align timeout; "
@@ -1207,11 +1209,12 @@ class GripperTeleop:
     #
     # 临时停用（不动代码）：teleop_start(lead_cap_mm=0) 关掉领先上限；
     #   align_speed_mm_s 只调对齐速度。
-    # 整块移除：删掉上面清单，并把 _ramp_to(q_cmd) 换回旧行为 ——
+    # 整块移除：删掉上面清单，并把 _ramp_to(q_cmd) 换成
     #   self._g.goto_rad(q_cmd, kp=self._resolve_kp(),
     #                    kd=self._resolve_kd(), duration=1.0)
-    #   （注意：旧的 duration 只是 deadline、不是斜坡，第一帧即满误差；这正是
-    #    本块要修的隐患。）
+    #   （写这一块时 duration 只是 deadline、不是斜坡，所以第一帧就是满误差 ——
+    #    那正是本块要修的隐患。goto_rad 现在自己也走同一条有界斜坡，那一行不再
+    #    是满力矩阶跃；但它不经过本块的 _update_torque_guard。）
     # ═══════════════════════════════════════════════════════════════════════
 
     def _lead_cap_rad(self) -> float:

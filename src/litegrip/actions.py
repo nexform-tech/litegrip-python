@@ -5,12 +5,15 @@
 ROS 2 桥接、RPC 服务、产品代码都能直接调 :attr:`LiteGrip.actions`，而不用各自
 重写一遍斜坡和堵转判据。
 
-为什么不用 ``goto_rad()`` / ``control_mit_stream()``
----------------------------------------------------
+为什么不用 ``control_mit_stream()``
+-----------------------------------
 ``control_mit_stream`` 在整段时长里反复下发**同一个** ``q_target``：伺服几十
-毫秒就贴上去，剩下时间空转 —— 慢速时表现为一顿一停。这里的做法和 SDK 自己的
-``move_at_speed`` 一样，按固定帧间隔推进一条线性斜坡，并给 ``dq_target`` 速度
-前馈，所以是匀速连续运动。
+毫秒就贴上去，剩下时间空转 —— 慢速时表现为一顿一停。这里按固定帧间隔推进一条
+线性斜坡，并给 ``dq_target`` 速度前馈，所以是匀速连续运动。
+
+``goto`` 一族（``goto`` / ``goto_rad`` / ``move_to`` / ``home``）和
+``move_at_speed`` 一族原来各自就是那个 ``control_mit_stream`` 式的硬阶跃；现在
+它们都转发到这里（:meth:`GripperActions.ramp_to`），「怎么动」只剩这一份实现。
 
 指令领先实测位置的部分由领先上限封顶，分两档：行进段用
 :attr:`MotionConfig.max_lead_mm`（大领先量破静摩擦），距限位

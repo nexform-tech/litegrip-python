@@ -138,18 +138,28 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 | --- | --- |
 | `open(speed_mm_s=None, *, progress=None)` → `MoveResult` | Ramps toward the calibrated open-side stop. With `GripperConfig.work_stroke_mm` set it stops at that opening instead — the shipped calibration sets `80.0` against the unit's 85 mm of travel, so a plain `open()` ends 5 mm short of the open end. |
 | `close(speed_mm_s=None, *, progress=None)` → `MoveResult` | The same, toward the closed side. `work_stroke_mm` is an open-side number and does not change where a close ends. |
-| `home()` → `bool` | Returns to the calibrated closed position. |
+| `home()` → `MoveResult` | Ramps to the calibrated closed position. |
 | `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | Closes until it stalls (i.e. grips), then ramps to and holds `force_n` N. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. `hold_s=0` holds until a fault, the runaway watch, or Ctrl+C. `force_n=None` uses `MotionConfig.force_n` (20 N). |
 | `set_force(force_n, duration=0.3)` → `bool` | Holds `force_n` where the jaws already are, for `duration` seconds. |
-| `goto(position_mm, kp=None, kd=None, duration=0.5)` → `bool` | Position move in millimetres. |
-| `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `bool` | The same in radians, with an optional velocity and torque feed-forward. |
-| `move_to(target_rad, kp=None, kd=None, tau_feedforward=0.0, duration=1.0)` → `bool` | Slower, force-budgeted variant of `goto_rad`. |
-| `move_at_speed(target_mm, speed_mm_s=30.0, kp=None, kd=None)` → `bool` | Constant-speed travel to a millimetre target. |
-| `move_at_speed_rad(target_rad, speed_rad_s=0.5, kp=None, kd=None)` → `bool` | The same in radians. |
+| `goto(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | Ramp to a position in millimetres. |
+| `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | The same in radians. `dq_target` and `tau_feedforward` must be 0: the ramp derives the velocity feed-forward from its own schedule, so both are refused with `CommandError` rather than ignored. |
+| `move_to(target_rad, kp=None, kd=None, tau_feedforward=0.0, duration=1.0)` → `MoveResult` | The same as `goto_rad`, with a longer default `duration`. |
+| `move_at_speed(target_mm, speed_mm_s=30.0, kp=None, kd=None)` → `MoveResult` | Ramp to a millimetre target at `speed_mm_s`. |
+| `move_at_speed_rad(target_rad, speed_rad_s=0.5, kp=None, kd=None)` → `MoveResult` | The same in radians. |
 
 `kp` and `kd` fall back to `GripperConfig.kp` (`100.0`) and `.kd` (`2.0`) on every call that takes
-them. `duration` is a deadline, not a ramp: the command steps to the target and holds it until
-then, so a large step is a torque step. `open` and `close` are the ramped ones, and they cap the
+them. Every positioning call — the `goto` family and the `move_at_speed` family alike — runs one
+ramp of one frame per `MotionConfig.frame_interval`, and **`duration` is the length of that ramp**,
+not a deadline: a 40 mm target with `duration=0.5` travels at 80 mm/s and takes 0.5 s, then holds
+the target for `settle_s` (`0.3`) while arrival is decided. The two families differ only in how the
+speed is given (a duration, a speed in mm/s, or a speed in rad/s).
+
+The ramp is bounded, and that bound is the point of it. Each frame's command leads the measured
+position by at most `MotionConfig.max_lead_mm` (4 mm), which caps the frame's torque near
+`kp × 4 mm` — about 6.6 N·m against the shipped `rad_to_mm` of `61.01`, under the DM4310's ±10 N·m
+frame limit. A hard step to the target is not bounded: at the shipped `kp` of `100 Nm/rad` any
+error past about `0.1 rad` saturates that limit, and a saturated frame overshoots the target
+instead of stopping on it. `open` and `close` press onto a calibrated stop on purpose; they cap the
 emitted command at the calibrated extreme, so the jaw stops on the limit and is never driven past
 it. A NaN or ±inf position is refused with `CommandError`, never clamped.
 
@@ -232,7 +242,7 @@ What it *means*, and what to check, is per action:
 
 | Type | Fields | `bool()` is |
 | --- | --- | --- |
-| `MoveResult` | `ok`, `reached`, `stalled`, `state`, `target_rad`, `limit_rad`, `final_cmd_rad`, `steps` | `ok` |
+| `MoveResult` | `ok`, `reached`, `stalled`, `state`, `target_rad`, `limit_rad`, `final_cmd_rad`, `steps`, `protected`, `released` | `ok` |
 | `GraspResult` | `ok`, `reached`, `stalled`, `state`, `target_rad`, `force_n`, `cycles`, `travel_guard` | `ok` |
 | `EnableResult` | `ok`, `state`, `tries` | `ok` |
 
@@ -250,6 +260,15 @@ What it *means*, and what to check, is per action:
 
 Stalling far from the limit gives `ok=False`: something blocked the travel. The diagnostic fields
 — `final_cmd_rad`, `steps`, `state` — are what you log when it is false.
+
+The positioning calls read differently, because their target is a point inside the travel rather
+than a stop: `goto`, `goto_rad`, `move_to`, `home` and `move_at_speed*` are `ok` only when the
+jaws arrived and did not stall (`reached and not stalled`). Blocked halfway, they come back
+`ok=False, stalled=True` — and with `released=True`, meaning the drive's force was taken off
+(`kp = kd = tau = 0`) after the stall instead of being left pressing the part. `protected=True` is
+the other way a move can end early: the in-travel torque guard (~7 N, see
+`MotionConfig.stop_torque_nm`) tripped. That guard takes the force off on its own, so `protected`
+leaves `released` at `False`, and it always forces `ok=False`.
 
 ### Progress reporting
 

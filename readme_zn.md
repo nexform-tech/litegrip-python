@@ -132,19 +132,28 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 | --- | --- |
 | `open(speed_mm_s=None, *, progress=None)` → `MoveResult` | 爬坡走向标定的张开侧限位。若 `GripperConfig.work_stroke_mm` 有值，则停在那段行程处 —— 出厂标定设的是 `80.0`，对着这台机器 85 mm 的行程，所以裸调 `open()` 会在距张开端 5 mm 处停下。 |
 | `close(speed_mm_s=None, *, progress=None)` → `MoveResult` | 一样，方向朝闭合侧。`work_stroke_mm` 是张开侧的数字，不改变 `close()` 的落点。 |
-| `home()` → `bool` | 回到标定的闭合位置。 |
+| `home()` → `MoveResult` | 爬坡回到标定的闭合位置。 |
 | `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | 闭到堵转（即夹住），再爬到 `force_n` N 并保持。闭合段就把 `force_n` 当力矩预算，所以顶到工件时压得不会比设定值更狠。`hold_s=0` 表示保持到故障、失控监视触发或 Ctrl+C。`force_n=None` 用 `MotionConfig.force_n`（20 N）。 |
 | `set_force(force_n, duration=0.3)` → `bool` | 在爪子**当前**位置保持 `force_n`，持续 `duration` 秒。 |
-| `goto(position_mm, kp=None, kd=None, duration=0.5)` → `bool` | 按毫米做位置运动。 |
-| `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `bool` | 一样的，单位 rad，可带速度与力矩前馈。 |
-| `move_to(target_rad, kp=None, kd=None, tau_feedforward=0.0, duration=1.0)` → `bool` | 更慢、带力矩预算的 `goto_rad`。 |
-| `move_at_speed(target_mm, speed_mm_s=30.0, kp=None, kd=None)` → `bool` | 定速走到毫米目标。 |
-| `move_at_speed_rad(target_rad, speed_rad_s=0.5, kp=None, kd=None)` → `bool` | 一样的，单位 rad。 |
+| `goto(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | 爬坡走到毫米目标。 |
+| `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | 一样的，单位 rad。`dq_target` 与 `tau_feedforward` 必须是 0：速度前馈由斜坡按自己的排程给出，所以这两个值一律拒绝并抛 `CommandError`，不是静默忽略。 |
+| `move_to(target_rad, kp=None, kd=None, tau_feedforward=0.0, duration=1.0)` → `MoveResult` | 和 `goto_rad` 一样，只是 `duration` 的默认值更长。 |
+| `move_at_speed(target_mm, speed_mm_s=30.0, kp=None, kd=None)` → `MoveResult` | 按 `speed_mm_s` 爬坡走到毫米目标。 |
+| `move_at_speed_rad(target_rad, speed_rad_s=0.5, kp=None, kd=None)` → `MoveResult` | 一样的，单位 rad。 |
 
 凡是收 `kp` / `kd` 的调用，都回落到 `GripperConfig.kp`（`100.0`）和 `.kd`（`2.0`）。
-`duration` 是**截止时间，不是爬坡**：指令一步跳到目标并保持到那一刻，所以步子大就是力矩冲击。
-爬坡的是 `open` 和 `close`，它们把发出的指令夹在标定极值上，所以爪子停在限位处，永远不会被
-驱过限位。NaN 或 ±inf 位置一律拒绝并抛 `CommandError`，不会被夹取。
+所有定位调用 —— `goto` 一族与 `move_at_speed` 一族都是 —— 走的都是同一条斜坡，每
+`MotionConfig.frame_interval` 一帧，而 **`duration` 就是这条斜坡走多久**，不是截止时间：
+40 mm 的目标配 `duration=0.5` 就是 80 mm/s、走 0.5 s，之后原地保目标 `settle_s`（`0.3`）秒
+用于判到位。两族之间的差别只有速度怎么给（给时长、给 mm/s，还是给 rad/s）。
+
+这条斜坡**有上限**，上限正是它的意义所在：每一帧的指令相对实测位置的领先不超过
+`MotionConfig.max_lead_mm`（4 mm），于是这一帧的力矩被压在 `kp × 4 mm` 附近 —— 按出厂标定
+`rad_to_mm = 61.01` 算约 6.6 N·m，在 DM4310 的 ±10 N·m 帧量程之内。一步跳到目标则没有这个
+上界：出厂 `kp` 是 `100 Nm/rad`，误差一过约 `0.1 rad` 就把帧量程顶到饱和，而饱和的那一帧会
+冲过目标，不是停在目标上。`open` 和 `close` 是**故意**压上标定限位的：它们把发出的指令夹在
+标定极值上，所以爪子停在限位处，永远不会被驱过限位。NaN 或 ±inf 位置一律拒绝并抛
+`CommandError`，不会被夹取。
 
 ### 夹持与力控
 
@@ -217,7 +226,7 @@ with LiteGrip("can0") as gripper:
 
 | 类型 | 字段 | `bool()` 是 |
 | --- | --- | --- |
-| `MoveResult` | `ok`、`reached`、`stalled`、`state`、`target_rad`、`limit_rad`、`final_cmd_rad`、`steps` | `ok` |
+| `MoveResult` | `ok`、`reached`、`stalled`、`state`、`target_rad`、`limit_rad`、`final_cmd_rad`、`steps`、`protected`、`released` | `ok` |
 | `GraspResult` | `ok`、`reached`、`stalled`、`state`、`target_rad`、`force_n`、`cycles`、`travel_guard` | `ok` |
 | `EnableResult` | `ok`、`state`、`tries` | `ok` |
 
@@ -233,6 +242,14 @@ with LiteGrip("can0") as gripper:
 
 在离限位很远的地方堵转，才会给 `ok=False`：有东西挡住了行程。为假时该记的，就是那几个诊断
 字段 —— `final_cmd_rad`、`steps`、`state`。
+
+定位调用的读法不同，因为它的目标是行程内的**一点**，不是一端的限位：`goto`、`goto_rad`、
+`move_to`、`home` 和 `move_at_speed*` 只有在**走到了且没堵转**（`reached and not stalled`）
+时才算 `ok`。半路被挡住时返回 `ok=False, stalled=True`，并且 `released=True` —— 意思是堵转
+之后把驱动器的力**撤掉**了（`kp = kd = tau = 0`），不是留在那儿一直压着工件。
+`protected=True` 是移动提前结束的另一条路：行进段那条力矩保护（约 7 N，见
+`MotionConfig.stop_torque_nm`）触发了。那条保护自己就会撤力，所以 `protected` 时
+`released` 仍是 `False`，而它一定让 `ok=False`。
 
 ### 进度回传
 
