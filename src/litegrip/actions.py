@@ -46,6 +46,12 @@ ROS 2 桥接、RPC 服务、产品代码都能直接调 :attr:`LiteGrip.actions`
 力控要的是力，带增益就会随夹爪的位移衰减，详见
 :meth:`GripperActions._hold_force`。
 
+纯力矩帧里**没有位置误差**，所以上面那条「指令领先上限」的位置护栏对它无能为
+力 —— 它有自己的那条：越出闭合侧标定限位超过
+:attr:`MotionConfig.hold_runaway_rad` 即撤力中止
+（:func:`closing_travel_excursion_rad`）。两段护栏守的是两件事：那一端封顶的是
+**指令**，这一端止住的是**失控**。
+
 本模块**不 print**：进度通过 ``progress`` 回调交给调用方（CLI 打印、ROS 节点
 记日志、RPC 服务转发都行）。
 """
@@ -152,6 +158,17 @@ class MotionConfig:
     # 同一个单位，两边保持同步。
     force_ramp_n_s: float = 20.0        # 保力爬升速率 N/s
     hold_interval: float = 0.2          # 保力分片时长 s
+    # 保力段的**失控检测**阈值 rad：实测位置越过闭合侧标定限位这么多就失力中止
+    # （判据见 closing_travel_excursion_rad，触发后的动作见 _hold_force）。纯力矩
+    # 帧里没有位置误差可夹，撤掉力矩是唯一能用的手段，所以这里是判据不是夹子。
+    #
+    # 这是检测**失控**，不是给保力定精度：正常保力根本走不到这里 —— 夹着工件时
+    # 夹爪停在工件上；空载时它顶到真限位就停，而真限位在标定限位附近（zero() 探
+    # 测时是压进限位的，所以标定出来的限位比夹爪真正能到的位置还宽约 1 mm，空载
+    # 保力的越位量因此接近 0）。0.05 rad 是给「标定略微偏了」和「真限位不在标定
+    # 位置上」留的余量，按出厂标定的 rad_to_mm=61.01 折算约 3.05 mm。真出问题时
+    # 越位量是毫米级往上走的 —— 2026-10-10 那台是 104.9 mm。
+    hold_runaway_rad: float = 0.05
     # [Deprecated] 保力不再用增益（见上）。留着只为兼容老配置，设了也不生效。
     hold_kp: float = 150.0              # 已废弃：保力刚度
     hold_kd: float = 2.0                # 已废弃：保力阻尼
@@ -243,6 +260,28 @@ class GraspResult:
     target_rad: float                   # 闭合段的空载目标位置
     force_n: float                      # 实际用的夹持力 N
     cycles: int                         # 保力片数
+    # 保力段被**位置护栏**中止：实测位置越过闭合侧标定限位超过
+    # MotionConfig.hold_runaway_rad，于是撤力返回。触发即 ``ok=False``。
+    # 含义与 :attr:`MoveResult.protected` 对称 —— 那一路守的是移动段的力矩，
+    # 这一路守的是保力段的越位。正常夹取不会置位：夹着工件时夹爪停在工件上，
+    # 空载时顶到真限位就停。置位说明闭合侧没有东西拦着它。
+    travel_guard: bool = False
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+@dataclass
+class HoldResult:
+    """保力段（:meth:`GripperActions._hold_force`）的结果。
+
+    引擎内部的返回类型，``grasp`` 把它折进 :class:`GraspResult`。
+    """
+
+    ok: bool                            # 是否保到时间自然结束（没被故障/护栏打断）
+    cycles: int                         # 保力片数
+    state: Optional[GripperState]       # 最后一次状态
+    guarded: bool = False               # 是否被位置护栏中止（详见 GraspResult）
 
     def __bool__(self) -> bool:
         return self.ok
@@ -324,6 +363,38 @@ def clamp_to_travel(config: GripperConfig, q: float) -> float:
     lo = min(config.pos_closed_rad, config.pos_open_rad)
     hi = max(config.pos_closed_rad, config.pos_open_rad)
     return max(lo, min(hi, q))
+
+
+def closing_travel_excursion_rad(config: GripperConfig, q: float) -> float:
+    """``q`` 越过闭合侧标定限位、朝闭合方向又多走出来的量 rad（没越过为 0）。
+
+    力控段（``grasp`` 的保力段与 :meth:`LiteGrip.set_force`）的护栏用的就是它。那
+    两处下发的是 ``kp = kd = 0`` 的纯前馈力矩帧：帧里只有力矩，没有位置误差，
+    :func:`clamp_to_travel` 那条位置护栏也就无从下手（它夹的是指令位置）。纯力矩源
+    能用的手段只剩一个 —— **撤掉力矩**。所以那两处的护栏是**判据**，不是夹子：
+    越位即失力，而不是把夹爪按在某个位置上。两条护栏守的是两件事：位置指令那条
+    封顶的是**指令**，这一条止住的是**失控**。
+
+    只判闭合侧。帧里下的是 ``close_sign × force``，力矩朝闭合方向压，所以越过闭合
+    限位才是失控 —— 那里一旦没有真限位（标定偏了、机械限位已经损坏），就是一路走
+    到底。越过张开限位会被同一份力矩自己推回来，不算失控；把那边也算进来只会让
+    「松手把夹爪推过张开限位、接着合上」这种正常操作误触发。
+
+    反装（``pos_closed_rad < pos_open_rad``）由 :attr:`GripperConfig.close_sign`
+    统一处理，正装反装共用这一份写法。
+
+    配置没标定时**不要用**：占位默认值（``pos_closed_rad=1.14`` /
+    ``pos_open_rad=0.0``）描述的不是任何真实行程，由它算出来的越位量没有意义。
+    调用方负责先看 :attr:`GripperConfig.calibrated`。
+
+    Args:
+        config: 夹爪配置（用 ``pos_closed_rad`` 与 ``close_sign``）。
+        q: 实测位置 rad。
+
+    Returns:
+        越位量 rad；没越过为 ``0.0``。
+    """
+    return max(0.0, config.close_sign * (q - config.pos_closed_rad))
 
 
 def limit_target(
@@ -597,10 +668,14 @@ class GripperActions:
         :func:`force_approach_terms`），撞上工件时压出的力矩不超过它 —— 空载时
         它才一路走到底。
 
+        保力段是纯力矩源，没有位置指令可夹，所以它有自己的一条护栏
+        （:attr:`MotionConfig.hold_runaway_rad`）：越出闭合侧标定限位太多就撤力
+        返回，结果里 ``ok=False`` / ``travel_guard=True``。正常夹取不会触发。
+
         Args:
             force_n: 夹持力 N，``None`` = 用 :attr:`MotionConfig.force_n`。
                 按 SDK 近似换算 1 N = 0.1 Nm。
-            hold_s: 保力时长 s。``0`` = 一直保到出错或 Ctrl+C。
+            hold_s: 保力时长 s。``0`` = 一直保到出错、被护栏中止或 Ctrl+C。
             progress: 进度回调。
 
         Returns:
@@ -623,15 +698,16 @@ class GripperActions:
 
         move = self._move_to_limit(
             "close", cfg.grasp_speed_mm_s, force_n=force, progress=progress)
-        ok, cycles, st = self._hold_force(force, hold_s, progress=progress)
+        hold = self._hold_force(force, hold_s, progress=progress)
         return GraspResult(
-            ok=ok,
+            ok=hold.ok,
             reached=move.reached,
             stalled=move.stalled,
-            state=st if st is not None else move.state,
+            state=hold.state if hold.state is not None else move.state,
             target_rad=move.target_rad,
             force_n=force,
-            cycles=cycles,
+            cycles=hold.cycles,
+            travel_guard=hold.guarded,
         )
 
     def zero(self) -> CalibrationData:
@@ -737,6 +813,25 @@ class GripperActions:
             raise CommandError("MIT 帧下发失败（未连接或未使能）")
         cfg.sleep_fn(cfg.frame_interval)
         return q
+
+    def _release(self, pos: float) -> int:
+        """失力：连发 :attr:`MotionConfig.stop_release_s` 的 ``kp=kd=tau=0`` 帧。
+
+        两处保护性中止（行进段的力矩保护、保力段的位置护栏）共用这一份 —— 触发即
+        失力，夹爪能被手掰动，而不是继续压着。``q`` 用当前读数：零增益下 ``q`` 不
+        产生任何力，只是给个位置合理的指令，免得下游把它当成一次正常定位。
+
+        Args:
+            pos: 当前实测位置 rad，作为释放帧的 ``q``。
+
+        Returns:
+            实际下发的帧数。
+        """
+        cfg = self.config
+        frames = max(1, int(round(cfg.stop_release_s / cfg.frame_interval)))
+        for _ in range(frames):
+            self._emit(pos, 0.0, 0.0, kp=0.0, kd=0.0)
+        return frames
 
     def _move_to_limit(
         self,
@@ -943,13 +1038,7 @@ class GripperActions:
                     break
 
         if protected:
-            # 触发即失力：连发 kp=kd=tau=0 的帧，让夹爪能被手掰动，而不是继续
-            # 压着。q 用当前读数 —— 零增益下 q 不产生任何力，只是给个不越位的
-            # 指令，免得下游把它当一次正常定位。
-            release_frames = max(
-                1, int(round(cfg.stop_release_s / cfg.frame_interval)))
-            for _ in range(release_frames):
-                self._emit(pos, 0.0, 0.0, kp=0.0, kd=0.0)
+            self._release(pos)
 
         st = g.get_state()                         # 阻塞等一帧新状态再判到位
         reached = abs(st.position_rad - target) < cfg.reach_tol
@@ -979,7 +1068,7 @@ class GripperActions:
         hold_s: float,
         *,
         progress: Optional[Callable[[MoveProgress], None]] = None,
-    ) -> Tuple[bool, int, Optional[GripperState]]:
+    ) -> HoldResult:
         """持续输出夹持力：整段只下发前馈力矩。
 
         帧里 ``kp=kd=0`` —— 保力要的是**力**，而 MIT 律里 ``kp × (q - 实测位置)``
@@ -1002,19 +1091,32 @@ class GripperActions:
         每片 :attr:`MotionConfig.hold_interval` 回读一次状态查故障（一帧一步的爬升
         都在片内完成，见上面的速率）。
 
-        代价：零增益下夹爪可以被外力推动，夹到空载时也会一路顶到机械限位
-        （和 ``close()`` 的压紧段一样，只是力矩小得多）。
+        代价：零增益下夹爪可以被外力推动，所以保力段**没有位置指令可夹**
+        （:func:`closing_travel_excursion_rad` 的 docstring 讲了为什么）。这一路
+        的护栏因此是**判据**：每回读一片就看实测位置是否越出闭合侧标定限位超过
+        :attr:`MotionConfig.hold_runaway_rad`，越了就撤力返回。空载时它仍然会顶
+        到真限位（和 ``close()`` 的压紧段一样，只是力矩小得多），但真限位不在那
+        儿时不会再一路走到底 —— 那正是 2026-10-10 把夹爪顶坏的工况。
 
-        ``hold_s <= 0`` 表示不限时长（直到出错或 Ctrl+C）。
+        护栏在**两处**判：进循环之前（已经在护栏之外就直接失力，不往里再推）和
+        每个回读片。配置没标定时不启用 —— 占位限位描述的不是真实行程。经
+        ``grasp()`` 进来时标定一定在：它的闭合段先过 ``_move_to_limit``。
+
+        ``hold_s <= 0`` 表示不限时长（直到出错、被护栏中止或 Ctrl+C）。
 
         Returns:
-            ``(是否正常结束, 保力片数, 最后一次状态)``。
+            :class:`HoldResult`。
         """
         cfg = self.config
         g = self._g
+        gcfg = g.config
         # 夹紧方向的力矩符号随安装方向翻转：正装时 rad 增大是闭合，
         # 反装时反过来。力矩大小不变，只是要让前馈往「夹」而不是「撑」。
-        target_nm = g.config.close_sign * force_n * UnitConversion.N_TO_NM
+        target_nm = gcfg.close_sign * force_n * UnitConversion.N_TO_NM
+        # 位置护栏。没标定时不启用：占位限位（pos_closed_rad=1.14 /
+        # pos_open_rad=0.0）描述的不是任何真实行程，拿它算越位量比没有更糟。
+        guard_rad = cfg.hold_runaway_rad
+        guarded = gcfg.calibrated
 
         deadline = None if hold_s <= 0 else cfg.monotonic_fn() + hold_s
         frames_per_slice = max(1, int(round(cfg.hold_interval
@@ -1029,6 +1131,18 @@ class GripperActions:
         # 直接从设定值起步（那一步是往下走到设定值，不是往上，不构成冲击）。
         tau_cmd = st.torque_nm if abs(st.torque_nm) < abs(target_nm) else target_nm
 
+        # 护栏判在**第一帧之前**：已经在外面就直接失力。放进循环里判就晚了 ——
+        # 那一片 frames_per_slice 帧的力矩已经发出去了，正是要拦住的东西。
+        if guarded:
+            out_rad = closing_travel_excursion_rad(gcfg, pos)
+            if out_rad > guard_rad:
+                log.warning("保力未开始：实测位置 %+.5f rad 已经越出闭合侧标定"
+                            "限位 %+.5f rad 共 %.5f rad（> %.5f）—— 判定闭合侧"
+                            "没有东西拦着它，撤力。",
+                            pos, gcfg.pos_closed_rad, out_rad, guard_rad)
+                self._release(pos)
+                return HoldResult(ok=False, cycles=0, state=st, guarded=True)
+
         while deadline is None or cfg.monotonic_fn() < deadline:
             # 用上一次读到的位置当 q 下发（kp=0 时 q 不产生任何力，只是给下游
             # 一个不越位的指令），每帧把力矩朝设定值推一步，再回读状态查故障
@@ -1041,8 +1155,20 @@ class GripperActions:
             if st.error_code != 1:
                 log.warning("保力中断：状态帧 err=%d"
                             "（1=使能中；0=被禁用；其他=故障）", st.error_code)
-                return False, cycles, st
+                return HoldResult(ok=False, cycles=cycles, state=st)
             pos = st.position_rad
+
+            if guarded:
+                out_rad = closing_travel_excursion_rad(gcfg, pos)
+                if out_rad > guard_rad:
+                    log.warning("保力中止：实测位置 %+.5f rad 越出闭合侧标定限位"
+                                " %+.5f rad 共 %.5f rad（> %.5f）—— 判定闭合侧"
+                                "没有东西拦着它，撤力。保力 %.1f N 到此为止。",
+                                pos, gcfg.pos_closed_rad, out_rad, guard_rad,
+                                force_n)
+                    self._release(pos)
+                    return HoldResult(ok=False, cycles=cycles, state=st,
+                                      guarded=True)
 
             if progress is not None:
                 progress(MoveProgress(
@@ -1057,4 +1183,4 @@ class GripperActions:
                     temperature_coil=st.temperature_coil,
                 ))
 
-        return True, cycles, st
+        return HoldResult(ok=True, cycles=cycles, state=st)

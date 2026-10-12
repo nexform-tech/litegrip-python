@@ -45,6 +45,7 @@ from .actions import (
     WriteZeroResult,
     _check_calibrated,
     _toward,
+    closing_travel_excursion_rad,
 )
 from .teleop import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX, DEFAULT_GRIP_ID,
                      DEFAULT_GRIP_PORT, DEFAULT_LEAD_CAP_MM,
@@ -1511,9 +1512,26 @@ class LiteGrip:
         shortens the hold.  ``duration=0`` means "ramp to the setpoint and
         return" — the climb still completes.
 
+        A held force has no position command to clamp — the frames carry no
+        error term — so this path carries its own guard, the same one
+        ``grasp``'s hold phase uses: once the measured position has run
+        ``MotionConfig.hold_runaway_rad`` past the closed-side calibrated
+        limit, the torque is dropped and the call returns ``False``.  Only the
+        closing side is watched, because that is the side the feed-forward
+        pushes and the side where a missing stop means the jaws walk away.  A
+        normal grip never trips it: against an object the jaws stop on the
+        object, and against nothing they stop on the mechanical stop, which
+        sits at the calibrated limit.  The guard is off while the config is
+        uncalibrated, since this method has never required a calibration and
+        the placeholder limits describe no real travel.
+
         Args:
             force_n: Target force in newtons.
             duration: Hold time in seconds after the ramp, ``0`` to just ramp.
+
+        Returns:
+            ``False`` when the guard tripped or a frame could not be sent;
+            ``True`` when the climb and the hold both ran to completion.
 
         Raises:
             CommandError: ``force_n`` or ``duration`` is not a finite number,
@@ -1570,8 +1588,44 @@ class LiteGrip:
         # duration 是爬到设定值以后**继续保力**的时间，不含爬升本身。
         hold_frames = max(0, int(round(duration / motion.frame_interval)))
 
+        # Position guard, the same predicate ``grasp``'s hold phase uses.  The
+        # frames carry ``kp = kd = 0``: there is no position error to clamp, so
+        # the only lever is dropping the torque.  Only the closing side is
+        # checked — the feed-forward pushes that way, and running past the open
+        # limit is pulled back by the same torque.
+        #
+        # Off while the config is uncalibrated, as ``set_force`` has never
+        # required a calibration: the placeholder limits describe no real
+        # travel, and a window built from them is worse than none.
+        guarded = self._config.calibrated
+        guard_rad = motion.hold_runaway_rad
+
         try:
             for i in range(climb_frames + hold_frames):
+                # Checked before the frame goes out, so the first one is
+                # covered too: a call that starts outside the guard sends no
+                # torque at all.
+                if guarded:
+                    pos = self._can.get_position()
+                    out_rad = closing_travel_excursion_rad(self._config, pos)
+                    if out_rad > guard_rad:
+                        log.warning(
+                            "力控中止：实测位置 %+.5f rad 越出闭合侧标定限位 "
+                            "%+.5f rad 共 %.5f rad（> %.5f）—— 判定闭合侧没有"
+                            "东西拦着它，撤力。设定力 %.1f N 到此为止。",
+                            pos, self._config.pos_closed_rad, out_rad,
+                            guard_rad, force_n)
+                        # Trip means let go: the jaws must be pushable by hand
+                        # again rather than still pressed.  Shared with
+                        # ``grasp``'s hold phase so the two cannot drift.  A
+                        # frame that does not go out is reported the way this
+                        # method reports every other send failure, not as an
+                        # exception.
+                        try:
+                            self._actions._release(self._can.get_position())
+                        except CommandError:
+                            pass
+                        return False
                 if i < climb_frames:
                     tau_cmd = _toward(tau_cmd, target_nm, step_nm)
                 else:

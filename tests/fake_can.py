@@ -9,6 +9,12 @@
 （``yield_rad_s`` + ``yield_tau_nm`` —— 载荷过门槛就按给定速度退让，载荷掉回
 门槛以下就自己停）。后者用来守住「保力段不给增益，所以力不随工件屈服而衰减」
 这条逻辑。
+
+长度上还有一条**纯前馈力矩下的蠕变**（``creep_rad_s_per_nm``，默认 0）：位置项
+按 ``kp`` 缩放，所以保力帧（``kp = kd = 0``）在默认模型里一点不动 —— 而真机上
+闭合侧没有限位时，恒定前馈力矩会把夹爪一路推走（2026-10-10 那台走了 104.9 mm）。
+它和 ``yield_rad_s`` 同一路数：给定速率，不建动力学。0 为默认，所以别的用例逐位
+不变；打开它是为了让力控段的位置护栏能被测到。
 """
 
 from __future__ import annotations
@@ -72,7 +78,8 @@ class FakeMotor:
                  sticky_rad: float = 0.0, err: int = 1,
                  limit_lo: Optional[float] = None,
                  limit_hi: Optional[float] = None,
-                 yield_rad_s: float = 0.0, yield_tau_nm: float = 0.0):
+                 yield_rad_s: float = 0.0, yield_tau_nm: float = 0.0,
+                 creep_rad_s_per_nm: float = 0.0):
         self.pos = pos
         self.vel = 0.0
         self.tau = 0.0
@@ -83,6 +90,9 @@ class FakeMotor:
         # yield_tau_nm 时，block_rad 按 yield_rad_s 朝受力方向退让。0 = 硬挡块。
         self.yield_rad_s = yield_rad_s
         self.yield_tau_nm = yield_tau_nm
+        # 纯前馈力矩下的蠕变 rad/s per Nm：真机上闭合侧没有限位时，恒定前馈
+        # 力矩会把夹爪一路推走。0 = 不动（保力帧在默认模型里的行为）。
+        self.creep_rad_s_per_nm = creep_rad_s_per_nm
         # 两端机械限位（真实夹爪本来就有）。block_rad 是单向的「障碍物」，
         # 用来模拟行程中途被挡住。
         self.limit_lo = limit_lo
@@ -116,6 +126,8 @@ class FakeMotor:
         # 位置项按 kp 缩放：kp=0（失力 / stop）时不产生任何跟随速度 —— 真电机
         # 零刚度就是这样，可被外力推动。kp=KP_NOMINAL 时与原来完全一致。
         v = dq + self.GAIN * (kp / self.KP_NOMINAL) * (q - self.pos)
+        # 纯前馈力矩下的蠕变（见类上方的说明）。默认 0 时不参与运算。
+        v += self.creep_rad_s_per_nm * tau_ff
         v = max(-self.VMAX, min(self.VMAX, v))
         new = self.pos + v * dt
         if self.block_rad is not None:
@@ -153,12 +165,14 @@ class FakeLiteGripCAN:
                  initialize_results: Optional[List[bool]] = None,
                  limit_lo: Optional[float] = None,
                  limit_hi: Optional[float] = None,
-                 yield_rad_s: float = 0.0, yield_tau_nm: float = 0.0):
+                 yield_rad_s: float = 0.0, yield_tau_nm: float = 0.0,
+                 creep_rad_s_per_nm: float = 0.0):
         self.motor = FakeMotor(pos=pos, block_rad=block_rad,
                                sticky_rad=sticky_rad, err=err,
                                limit_lo=limit_lo, limit_hi=limit_hi,
                                yield_rad_s=yield_rad_s,
-                               yield_tau_nm=yield_tau_nm)
+                               yield_tau_nm=yield_tau_nm,
+                               creep_rad_s_per_nm=creep_rad_s_per_nm)
         self.frames: List[Frame] = []
         self.initialize_results = list(initialize_results or [])
         self.initialize_calls = 0
@@ -277,6 +291,7 @@ def make_gripper(
     reverse: bool = False,
     yield_rad_s: float = 0.0,
     yield_tau_nm: float = 0.0,
+    creep_rad_s_per_nm: float = 0.0,
 ):
     """造一个「已连接、已使能、已标定」的 LiteGrip，底层换成 :class:`FakeLiteGripCAN`。
 
@@ -292,6 +307,10 @@ def make_gripper(
     ``yield_rad_s`` / ``yield_tau_nm`` 把 ``block_rad`` 处的工件改成**会屈服**
     的：被顶住且载荷过门槛就按 ``yield_rad_s`` 退让，用来复现「夹到工件后工件
     缓慢让位」的保力场景。
+
+    ``creep_rad_s_per_nm`` 让夹爪在**纯前馈力矩**下被推着走 —— 保力帧（``kp=0``）
+    在默认模型里一点不动，而真机上闭合侧没有限位时恒定力矩会把夹爪一路推走。
+    配合 ``stops=False`` 复现那条失控路径，用来验证力控段的位置护栏。
 
     ``start_rad`` 默认停在张开侧（两种装法各自的那一端）。
 
@@ -316,7 +335,8 @@ def make_gripper(
                            limit_lo=LIMIT_LO_RAD if stops else None,
                            limit_hi=LIMIT_HI_RAD if stops else None,
                            yield_rad_s=yield_rad_s,
-                           yield_tau_nm=yield_tau_nm)
+                           yield_tau_nm=yield_tau_nm,
+                           creep_rad_s_per_nm=creep_rad_s_per_nm)
     g._can = fake
     g._connected = True
     g._enabled = True

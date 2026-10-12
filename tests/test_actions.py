@@ -5,8 +5,9 @@ from __future__ import annotations
 import unittest
 
 import _sdkpath  # noqa: F401
-from litegrip import (CommandError, GraspResult, LiteGrip, MotionConfig,
-                      UnitConversion, clamp_to_travel, force_approach_terms,
+from litegrip import (CommandError, GraspResult, GripperConfig, LiteGrip,
+                      MotionConfig, UnitConversion, clamp_to_travel,
+                      closing_travel_excursion_rad, force_approach_terms,
                       limit_target, press_target, work_limit_target)
 from litegrip.actions import GripperActions
 
@@ -24,6 +25,17 @@ def press_caps(g):
     min_cap = SPEED_RAD_S * cfg.frame_interval
     return (max(cfg.max_lead_mm / RAD_TO_MM, min_cap),
             max(cfg.stop_lead_mm / RAD_TO_MM, min_cap))
+
+
+def _calibrated_config(reverse: bool = False) -> GripperConfig:
+    """一份标定好的配置，只用来算几何 —— 不建夹爪、不发帧。"""
+    cfg = GripperConfig(calibrated=True)
+    if reverse:
+        cfg.pos_closed_rad, cfg.pos_open_rad = POS_OPEN_RAD, POS_CLOSED_RAD
+    else:
+        cfg.pos_closed_rad, cfg.pos_open_rad = POS_CLOSED_RAD, POS_OPEN_RAD
+    cfg.rad_to_mm = RAD_TO_MM
+    return cfg
 
 
 class TestLimitTarget(unittest.TestCase):
@@ -107,6 +119,41 @@ class TestPressTarget(unittest.TestCase):
         g.config.calibrated = False
         with self.assertRaises(CommandError):
             press_target(g.config, "close", 0.05)
+
+
+class TestClosingTravelExcursion(unittest.TestCase):
+    """力控段护栏的判据：越过**闭合侧**限位、朝闭合方向又多走了多少。
+
+    只判闭合侧是有意的 —— 前馈力矩朝那边压，只有那边越过去才叫失控；越过张开
+    限位会被同一份力矩自己推回来。
+    """
+
+    def test_inside_the_travel_is_zero(self):
+        cfg = _calibrated_config()
+        for q in (POS_OPEN_RAD, POS_OPEN_RAD + 0.5, POS_CLOSED_RAD, 0.0):
+            self.assertEqual(closing_travel_excursion_rad(cfg, q), 0.0, q)
+
+    def test_past_the_closed_limit_is_the_distance(self):
+        self.assertAlmostEqual(
+            closing_travel_excursion_rad(_calibrated_config(),
+                                         POS_CLOSED_RAD + 0.03),
+            0.03, places=12)
+
+    def test_past_the_open_limit_is_not_an_excursion(self):
+        # 那边不算：力矩会把它推回来，报出来只会让正常操作误触发
+        self.assertEqual(
+            closing_travel_excursion_rad(_calibrated_config(),
+                                         POS_OPEN_RAD - 5.0), 0.0)
+
+    def test_reverse_mount_mirrors_the_direction(self):
+        rev = _calibrated_config(reverse=True)
+        self.assertLess(rev.close_sign, 0.0)               # 确认真是反装
+        self.assertEqual(closing_travel_excursion_rad(rev, POS_CLOSED_RAD), 0.0)
+        self.assertEqual(closing_travel_excursion_rad(rev, POS_OPEN_RAD + 5.0),
+                         0.0)
+        self.assertAlmostEqual(
+            closing_travel_excursion_rad(rev, POS_OPEN_RAD - 0.03), 0.03,
+            places=12)
 
 
 class TestRamp(unittest.TestCase):
@@ -713,6 +760,154 @@ class TestHeldForceRampsToSetpoint(unittest.TestCase):
 
 
 
+class TestHoldTravelGuard(unittest.TestCase):
+    """保力段的位置护栏：越出闭合侧标定限位太多就撤力。
+
+    保力帧是纯力矩源（``kp=kd=0``），没有位置指令可夹，所以护栏是**判据**不是
+    夹子 —— 撤掉力矩是唯一能用的手段。默认的假电机在 ``kp=0`` 时一点不动（位置
+    项按 ``kp`` 缩放），所以要开 ``creep_rad_s_per_nm`` 才复现得出那条失控路径：
+    真机上闭合侧限位缺席时，恒定前馈力矩会把夹爪一路推走（2026-10-10 那台被推到
+    越过标定点 104.9 mm）。
+    """
+
+    FORCE_N = 20.0
+    #: 纯前馈力矩下的蠕变 rad/s per Nm。20 N = 2.0 Nm ⇒ 0.1 rad/s；一片
+    #: （hold_interval=0.2 s）走 0.02 rad，所以护栏的越位量以一片为粒度。
+    CREEP = 0.05
+
+    def _motion(self, **kw):
+        return MotionConfig(sleep_fn=lambda _: None,
+                            monotonic_fn=tick_clock(0.1), **kw)
+
+    def _slice_travel_rad(self, g):
+        """一个回读片里、在设定力矩下最多能多走出来的量 rad。"""
+        cfg = g.motion_config
+        return (cfg.hold_interval * self.CREEP * self.FORCE_N
+                * UnitConversion.N_TO_NM)
+
+    def _release_frames(self, g, fake):
+        """保力段尾部那些力矩为 0 的帧（= 触发后连发的释放帧）。"""
+        hold = [f for f in fake.frames if f.kp == 0.0]
+        zero_at = [i for i, f in enumerate(hold) if f.tau_ff == 0.0]
+        self.assertTrue(zero_at, "触发之后一帧释放帧都没有")
+        return hold[zero_at[0]:]
+
+    def test_a_hold_that_walks_out_of_the_travel_is_cut_short(self):
+        g, fake = make_gripper(stops=False, creep_rad_s_per_nm=self.CREEP)
+        g.motion_config = self._motion()
+
+        res = g.grasp(force_n=self.FORCE_N, hold_s=5.0)
+
+        self.assertFalse(res.ok, res)
+        self.assertTrue(res.travel_guard, res)
+        # 放开的位置就在阈值旁边 —— 以一片为粒度，不是「一路走到底」
+        out_rad = closing_travel_excursion_rad(g.config, fake.motor.pos)
+        self.assertGreater(out_rad, 0.0, "根本没走出去，这条用例没测到护栏")
+        self.assertLessEqual(out_rad,
+                             g.motion_config.hold_runaway_rad
+                             + self._slice_travel_rad(g) + 1e-9)
+        # 触发即失力：尾巴上全是 kp=kd=tau=0 的帧，数目就是 stop_release_s
+        release = self._release_frames(g, fake)
+        self.assertEqual(len(release),
+                         int(round(g.motion_config.stop_release_s
+                                   / g.motion_config.frame_interval)))
+        for f in release:
+            self.assertEqual(f.tau_ff, 0.0)
+            self.assertEqual(f.kp, 0.0)
+            self.assertEqual(f.kd, 0.0)
+
+    def test_the_guard_does_not_fire_when_the_stop_is_there(self):
+        """误报那一侧：真限位就在标定限位上，空载保力顶到它就停住。
+
+        配了机械限位（``LIMIT_HI_RAD == POS_CLOSED_RAD``）时，恒定力矩把夹爪推到
+        真限位就走不动了 —— 越位量正好 0，护栏不该响，保力该走完 ``hold_s``。
+        """
+        g, fake = make_gripper(stops=True, creep_rad_s_per_nm=self.CREEP)
+        g.motion_config = self._motion()
+
+        res = g.grasp(force_n=self.FORCE_N, hold_s=2.0)
+
+        self.assertFalse(res.travel_guard, res)
+        self.assertTrue(res.ok, res)
+        self.assertAlmostEqual(fake.motor.pos, POS_CLOSED_RAD, places=9)
+
+    def test_a_yielding_workpiece_does_not_trip_the_guard(self):
+        """工件让位时夹爪跟着走 —— 那是保力该有的样子，不是失控。
+
+        工件在行程中段，离闭合侧限位还有一大截；它让位多少、夹爪就跟多少，护栏
+        不该响。
+        """
+        obj = POS_OPEN_RAD + 0.5 * TRAVEL_RAD
+        g, fake = make_gripper(block_rad=obj, yield_rad_s=0.02,
+                               yield_tau_nm=0.5,
+                               creep_rad_s_per_nm=self.CREEP)
+        g.motion_config = self._motion()
+
+        res = g.grasp(force_n=self.FORCE_N, hold_s=1.0)
+
+        self.assertFalse(res.travel_guard, res)
+        self.assertTrue(res.ok, res)
+        # 半路被工件挡住：判到堵转，压不到空载目标位置
+        self.assertTrue(res.stalled, res)
+        self.assertFalse(res.reached, res)
+
+    def test_the_guard_follows_the_mount_direction(self):
+        """反装：闭合方向是 rad 减小，闭合侧限位是数值小的那一个。"""
+        g, fake = make_gripper(reverse=True, stops=False,
+                               creep_rad_s_per_nm=self.CREEP)
+        g.motion_config = self._motion()
+        self.assertLess(g.config.close_sign, 0.0)          # 确认这真是反装
+
+        res = g.grasp(force_n=self.FORCE_N, hold_s=5.0)
+
+        self.assertTrue(res.travel_guard, res)
+        self.assertFalse(res.ok, res)
+        out_rad = closing_travel_excursion_rad(g.config, fake.motor.pos)
+        self.assertGreater(out_rad, 0.0, "根本没走出去，这条用例没测到护栏")
+        self.assertLessEqual(out_rad,
+                             g.motion_config.hold_runaway_rad
+                             + self._slice_travel_rad(g) + 1e-9)
+
+    def test_a_hold_entered_outside_the_travel_pushes_nothing(self):
+        """已经在护栏之外的，一帧力矩都不发。
+
+        夹爪被手推过去、或者换了标定之后读数落在限位外侧 —— 这时再保力只会把它
+        推得更远。判在**第一帧之前**，所以整段一帧力矩都没有，直接失力返回。
+        """
+        g, fake = make_gripper(stops=False, creep_rad_s_per_nm=self.CREEP)
+        g.motion_config = self._motion()
+        fake.motor.pos = POS_CLOSED_RAD + 2.0 * g.motion_config.hold_runaway_rad
+
+        hold = g.actions._hold_force(self.FORCE_N, 0.6)
+
+        self.assertFalse(hold.ok, hold)
+        self.assertTrue(hold.guarded, hold)
+        self.assertEqual(hold.cycles, 0, "进了循环就已经把力矩发出去了")
+        self.assertTrue(fake.frames, "连释放帧都没有")
+        for f in fake.frames:
+            self.assertEqual(f.tau_ff, 0.0, "护栏之外还发了力矩")
+
+    def test_an_uncalibrated_config_gets_no_guard(self):
+        """没标定时护栏不启用：占位限位描述的不是任何真实行程。
+
+        ``grasp`` 走不到这里（它的闭合段先要求标定），但 ``_hold_force`` 是公开给
+        同仓动作层的引擎，直接调用时也要给出这个行为。
+        """
+        g, fake = make_gripper(stops=False, creep_rad_s_per_nm=self.CREEP)
+        g.motion_config = self._motion()
+        g.config.calibrated = False
+        fake.motor.pos = POS_CLOSED_RAD + 1.0
+        # 这条用例要证明的是「已经越位了，但护栏没介入」
+        self.assertGreater(
+            closing_travel_excursion_rad(g.config, fake.motor.pos),
+            g.motion_config.hold_runaway_rad)
+
+        hold = g.actions._hold_force(self.FORCE_N, 0.4)
+
+        self.assertTrue(hold.ok, hold)
+        self.assertFalse(hold.guarded, hold)
+
+
 class TestSetForceRampsToo(unittest.TestCase):
     """``set_force`` 是另一条下发恒定前馈力矩的保力路径，同样按时率爬。
 
@@ -797,6 +992,73 @@ class TestSetForceRampsToo(unittest.TestCase):
 
         self.assertEqual(len(fake.frames), 240)
         self.assertEqual(fake.poll_calls, len(fake.frames))
+
+
+class TestSetForceTravelGuard(unittest.TestCase):
+    """``set_force`` 走的是自己的帧循环（不共用保力段），但护栏是同一条。
+
+    它和 ``grasp`` 的保力段一样是纯力矩源，也同样有一条失控路径。判据是
+    :func:`closing_travel_excursion_rad`，触发动作也一样：撤力、返回 ``False``。
+    """
+
+    FORCE_N = 20.0
+    CREEP = 0.05
+
+    def _motion(self, **kw):
+        return MotionConfig(sleep_fn=lambda _: None,
+                            monotonic_fn=tick_clock(0.1), **kw)
+
+    def test_set_force_stops_when_the_jaw_runs_out_of_the_travel(self):
+        g, fake = make_gripper(stops=False, creep_rad_s_per_nm=self.CREEP)
+        g.motion_config = self._motion()
+        # 起点在限位内侧一点：爬升段走掉 0.05 rad，剩下的在保力段走完 —— 触发点
+        # 落在保力段正中间，不骑在任一段的边界上
+        fake.motor.pos = POS_CLOSED_RAD - 0.02
+
+        ok = g.set_force(self.FORCE_N, duration=5.0)
+
+        self.assertFalse(ok, "越位走出去之后还报成功")
+        out_rad = closing_travel_excursion_rad(g.config, fake.motor.pos)
+        self.assertGreater(out_rad, 0.0)
+        # 每帧判一次，所以粒度是一帧的蠕变量，不是一片
+        frame_travel_rad = (self.CREEP * self.FORCE_N
+                            * UnitConversion.N_TO_NM * DT)
+        self.assertLessEqual(out_rad, g.motion_config.hold_runaway_rad
+                             + frame_travel_rad + 1e-9)
+        # 触发即失力：尾巴上只有 kp=kd=tau=0 的释放帧
+        taus = [f.tau_ff for f in fake.frames]
+        zero_at = [i for i, t in enumerate(taus) if t == 0.0]
+        self.assertTrue(zero_at, "触发之后一帧释放帧都没有")
+        release = fake.frames[zero_at[0]:]
+        self.assertEqual(len(release),
+                         int(round(g.motion_config.stop_release_s
+                                   / g.motion_config.frame_interval)))
+        for f in release:
+            self.assertEqual(f.tau_ff, 0.0)
+            self.assertEqual(f.kp, 0.0)
+            self.assertEqual(f.kd, 0.0)
+
+    def test_set_force_leaves_an_uncalibrated_config_alone(self):
+        """没标定时护栏不介入 —— ``set_force`` 本来就不要求标定。
+
+        占位限位描述的不是任何真实行程，拿它当窗口比没有更糟。行为与改动前一致：
+        照常把力发完，返回 ``True``。
+        """
+        g, fake = make_gripper(stops=False, creep_rad_s_per_nm=self.CREEP)
+        g.motion_config = self._motion()
+        g.config.calibrated = False
+        fake.motor.pos = POS_CLOSED_RAD + 1.0
+        # 这条用例要证明的是「已经越位了，但护栏没介入」
+        self.assertGreater(
+            closing_travel_excursion_rad(g.config, fake.motor.pos),
+            g.motion_config.hold_runaway_rad)
+
+        ok = g.set_force(self.FORCE_N, duration=0.2)
+
+        self.assertTrue(ok, "未标定时护栏不该介入")
+        self.assertAlmostEqual(fake.frames[-1].tau_ff,
+                               self.FORCE_N * UnitConversion.N_TO_NM,
+                               places=9)
 
 
 class TestEnable(unittest.TestCase):
