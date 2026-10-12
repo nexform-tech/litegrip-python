@@ -566,8 +566,28 @@ python3 -m unittest discover -s tests -t tests -v
 ```
 
 `litegrip.__version__` is read from the installed distribution metadata, so an installed wheel
-reports the version that was actually released. A checkout that was never `pip install`ed
-reports `0.0.0+source`; that is expected, not a broken build.
+reports the version that was actually released. `0.0.0+source` means no `litegrip` distribution is
+installed at all — not that this particular tree was never installed. Any installed copy in reach
+satisfies that lookup, so a module loaded from this checkout can still report the installed
+version's number. Print the path beside the version to see which code is live:
+
+```bash
+$ python3 -c "import litegrip; print(litegrip.__version__, litegrip.__file__)"
+0.14.9 /usr/lib/python3/dist-packages/litegrip/__init__.py        # the installed copy
+$ PYTHONPATH=src python3 -c "import litegrip; print(litegrip.__version__, litegrip.__file__)"
+0.0.0+source /home/qaz/litegrip-python/src/litegrip/__init__.py   # the checkout, nothing installed
+0.0.0 /home/qaz/litegrip-python/src/litegrip/__init__.py          # the checkout, something installed
+```
+
+An install made from a checkout reports the manifest's placeholder, not a released number, so at
+that point the number says nothing about which of the two you are in. The module path is what
+settles it. The git tag is the version fact ([AGENTS.md](AGENTS.md) §3).
+
+**An installed copy does not update itself.** It keeps the code that was installed, `git pull`
+included, so the checkout you are reading and the `litegrip` your program imports can be different
+versions of the SDK. `pip install -e .` from the checkout points the installed distribution at the
+working tree instead, which removes the question. **Do not debug a fix you just pulled against an
+installed copy** — check `litegrip.__file__` first.
 
 The repository follows Conventional Commits and automated semantic-release versioning on every
 merge to `main`; the operating rules for contributors are in [AGENTS.md](AGENTS.md).

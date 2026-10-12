@@ -22,15 +22,15 @@ Subpackages
   Use directly if you need fine-grained control or multi-motor setups.
 """
 
-# Version of a package that is on disk but not installed as a distribution — a
-# source checkout, a vendored copy, or the files dropped in by a system package.
+# Version reported when no ``litegrip`` distribution is installed in reach at all —
+# no wheel, no editable install, nothing in ``site-packages``/``dist-packages``.
 # The ``+`` local segment keeps it valid PEP 440 and makes it obvious in a bug
 # report that nobody is looking at an official build.
 _VERSION_SOURCE_TREE = "0.0.0+source"
 
 
 def _detect_version(dist_name: str = "litegrip") -> str:
-    """Report the installed distribution's version, or a marker for a raw checkout.
+    """Report the installed distribution's version, or a marker for a bare machine.
 
     The repository never commits a version back (AGENTS.md §3): semantic-release
     derives it from the commit prefixes and writes it only into the publish
@@ -40,8 +40,12 @@ def _detect_version(dist_name: str = "litegrip") -> str:
     user actually installed in one place.
 
     Returns:
-        The installed distribution version, or ``"0.0.0+source"`` when this module
-        was imported from loose files rather than an installed distribution.
+        The installed distribution version, or ``"0.0.0+source"`` when no
+        ``litegrip`` distribution is installed at all.  The marker is about what
+        is installed, not about where this file came from: a module loaded out of
+        the source tree still reports an installed copy's version, and the two
+        spells of "not the released build" are told apart by the module path, not
+        by the number.
     """
     from importlib.metadata import PackageNotFoundError, version
 
