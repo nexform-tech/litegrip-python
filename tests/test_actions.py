@@ -250,15 +250,22 @@ class TestReverseMount(unittest.TestCase):
         self.assertAlmostEqual(g.get_state().force_n, +5.0, places=9)
 
     def test_goto_rad_clamps_between_the_two_limits(self):
+        """越界目标夹到标定限位 —— 哪个数值算哪一端由装法决定。
+
+        ``goto_rad`` 现在走引擎斜坡，目标先经 :func:`clamp_to_travel` 再排程，
+        所以看两处：结果里的 ``target_rad`` 是夹过的目标，下发的帧没有一帧越过
+        标定行程。
+        """
         g, fake = make_gripper(reverse=True)
         lo, hi = POS_OPEN_RAD, POS_CLOSED_RAD
-        seen = []
-        fake.control_mit_stream = lambda q_target, **kw: seen.append(q_target) or True
 
-        g.goto_rad(hi + 5.0)
-        g.goto_rad(lo - 5.0)
-        self.assertAlmostEqual(seen[0], hi)
-        self.assertAlmostEqual(seen[1], lo)
+        over = g.goto_rad(hi + 5.0)
+        under = g.goto_rad(lo - 5.0)
+
+        self.assertAlmostEqual(over.target_rad, hi)
+        self.assertAlmostEqual(under.target_rad, lo)
+        self.assertLessEqual(max(f.q for f in fake.frames), hi)
+        self.assertGreaterEqual(min(f.q for f in fake.frames), lo)
 
     def test_close_sign_follows_the_ordering(self):
         g, _ = make_gripper()
@@ -301,6 +308,245 @@ class TestLeadCapAndStall(unittest.TestCase):
         self.assertFalse(res.ok, res)
         self.assertLess(res.steps, total)
         self.assertAlmostEqual(fake.motor.pos, block, places=6)
+
+
+def frame_leads(fake, start_rad):
+    """每一帧下发的指令相对**下发前**实测位置的领先量 rad。
+
+    引擎的领先上限是相对它下发前读到的那一帧位置算的，所以基准是上一帧的
+    ``pos_after``（第一帧的基准是起点），不是这一帧自己的。
+    """
+    prev = start_rad
+    leads = []
+    for f in fake.frames:
+        leads.append(f.q - prev)
+        prev = f.pos_after
+    return leads
+
+
+class TestRampedGoto(unittest.TestCase):
+    """``goto`` 一族走引擎斜坡 —— 2026-10-12 那次「大幅抖动」的机理就在这里。
+
+    旧的 ``goto`` 是硬阶跃：第一帧就把目标当指令下发，``dq=0``、``tau_ff=0``。
+    kp=100 Nm/rad 配上 0.54 rad 的误差就是 54 Nm，而 DM4310 的帧量程只有 ±10 Nm
+    —— 饱和的那一帧冲过目标，下一帧再拉回来，来回就是抖动。现在这一族（``goto``
+    / ``goto_rad`` / ``move_to`` / ``home`` / ``move_at_speed*``）都走
+    :meth:`GripperActions.ramp_to` 那条斜坡，领先上限与 open/close 共用
+    ``max_lead_mm``。
+    """
+
+    TARGET_MM = 40.0
+    DURATION_S = 0.5
+
+    def _ramped_goto(self):
+        """从张开侧朝行程中段走 40 mm（≈0.54 rad），返回 ``(爪, fake, 结果, 目标 rad)``。"""
+        g, fake = make_gripper()
+        target_rad = g.config.pos_closed_rad - self.TARGET_MM / RAD_TO_MM
+        res = g.goto(self.TARGET_MM, duration=self.DURATION_S)
+        return g, fake, res, target_rad
+
+    def test_the_scenario_is_one_that_used_to_saturate(self):
+        """先证明这个用例真踩在旧路径的饱和上，否则下面几条测不到东西。"""
+        g, _ = make_gripper()
+        target_rad = g.config.pos_closed_rad - self.TARGET_MM / RAD_TO_MM
+        jump_tau = g.config.kp * abs(target_rad - g.config.pos_open_rad)
+        cap_rad = g.motion_config.max_lead_mm / RAD_TO_MM
+
+        # 旧实现第一帧下的就是这个阶跃：54 Nm 塞进 ±10 Nm 的帧 —— 顶到饱和
+        self.assertGreater(jump_tau, 10.0)
+        # 斜坡用同一条 kp，但把每帧的误差压到领先上限以内，力矩就回到量程里
+        self.assertLess(g.config.kp * cap_rad, 10.0)
+
+    def test_the_first_frame_is_a_ramp_step_not_a_jump_to_the_target(self):
+        g, fake, res, target_rad = self._ramped_goto()
+        start = g.config.pos_open_rad
+        first = fake.frames[0]
+        travel_rad = abs(target_rad - start)
+
+        self.assertLess(abs(first.q - start), 0.02 * travel_rad,
+                        "第一帧就贴到目标上 —— 那就是阶跃，不是斜坡")
+        self.assertGreater(abs(target_rad - first.q), 0.98 * travel_rad,
+                           "第一帧已经走掉大半路程 —— 不是斜坡")
+        self.assertGreater(first.dq, 0.0)      # 闭合方向 = +rad，带速度前馈
+
+    def test_no_frame_leads_the_jaws_more_than_max_lead_mm(self):
+        g, fake, res, _ = self._ramped_goto()
+        cap_rad = g.motion_config.max_lead_mm / RAD_TO_MM
+
+        worst = max(abs(lead) for lead in
+                    frame_leads(fake, g.config.pos_open_rad))
+
+        self.assertLessEqual(worst, cap_rad + 1e-9,
+                             "有一帧的指令领先超过了领先上限 —— 领先就是力矩")
+        # 实测里那次抖动就是这条上界失守：帧里的力矩被顶到 ±10 Nm 饱和
+        self.assertLess(max(abs(f.tau_nm) for f in fake.frames),
+                        fake.motor.TAU_MAX)
+
+    def test_the_ramp_reaches_the_target_and_the_result_says_so(self):
+        g, fake, res, target_rad = self._ramped_goto()
+
+        self.assertTrue(res.ok, res)
+        self.assertTrue(res.reached, res)
+        self.assertFalse(res.stalled, res)
+        self.assertFalse(res.released, "到位了就该一直保着目标，不是撤力")
+        self.assertAlmostEqual(res.target_rad, target_rad, places=9)
+        self.assertAlmostEqual(fake.motor.pos, target_rad, places=3)
+        self.assertGreater(res.steps, 1)
+
+    def test_the_reported_limit_is_the_nearer_calibrated_end(self):
+        g, fake, res, target_rad = self._ramped_goto()
+
+        self.assertAlmostEqual(res.limit_rad, POS_CLOSED_RAD)
+        self.assertLess(abs(target_rad - POS_CLOSED_RAD),
+                        abs(target_rad - POS_OPEN_RAD))
+
+    def test_blocked_halfway_reports_the_stall_and_takes_the_force_off(self):
+        """半路被挡住：报堵转、判不成功，并且**撤力**。
+
+        引擎在 ``press=False`` 下判到堵转就 ``break``，最后一帧指令停在
+        「实测位置 + 领先上限」上 —— 留着它，驱动器会按 kp × 上限（≈6.6 Nm）
+        一直压着工件。定位到行程内的某点压着不是意图，所以 ``ramp_to`` 补了撤力。
+        """
+        block = POS_OPEN_RAD + 0.03          # 刚起步就顶住，堵转窗口来得及填满
+        g, fake = make_gripper(block_rad=block)
+        res = g.goto(self.TARGET_MM, duration=self.DURATION_S)
+
+        self.assertFalse(res.ok, res)
+        self.assertFalse(res.reached, res)
+        self.assertTrue(res.stalled, res)
+        self.assertTrue(res.released, res)
+        self.assertAlmostEqual(fake.motor.pos, block, places=6)
+        # 堵在半路，不是「顶在标定限位上」
+        self.assertGreater(abs(fake.motor.pos - res.limit_rad),
+                           g.motion_config.stop_tol)
+
+        off = [f for f in fake.frames if f.kp == 0.0]
+        self.assertTrue(off, "报堵转却没有撤力帧 —— 驱动器还在压着")
+        for f in off:
+            self.assertEqual(f.kd, 0.0)
+            self.assertEqual(f.tau_ff, 0.0)
+            self.assertAlmostEqual(f.q, f.pos_after, places=6)
+
+    def test_a_target_the_jaws_are_almost_on_is_not_a_stall(self):
+        """差一点点（不是一点都不差）也是到位，不是堵转。
+
+        ``duration`` 定的是**时长**，所以排程的帧数不随距离缩短 —— 间距趋近 0 时
+        排程速度也趋近 0，爪子整整一个采样窗口一动不动，被堵转窗口读成堵转，一次
+        成功的定位就报成失败。bench 假台上 ``close()`` 之后紧跟 ``home()``（两个
+        都瞄着闭合端）跑出来的就是这个形状。
+        """
+        g, fake = make_gripper(start_rad=POS_OPEN_RAD)
+        here_mm = TRAVEL_RAD * RAD_TO_MM
+        target_mm = here_mm - 0.3          # 差 0.3 mm，远在 reach_tol 之内
+
+        res = g.goto(target_mm, duration=1.0)
+
+        self.assertTrue(res.reached, res)
+        self.assertFalse(res.stalled, f"原地不动被读成堵转：{res}")
+        self.assertTrue(res.ok, f"一次已经到位的定位被报成失败：{res}")
+        self.assertFalse(res.released, "到了位还撤力 —— 那不是定位的收尾")
+
+    def test_the_gains_reach_the_frames(self):
+        g, fake = make_gripper()
+        g.goto(self.TARGET_MM, duration=self.DURATION_S, kp=50.0, kd=1.0)
+
+        self.assertEqual({f.kp for f in fake.frames}, {50.0})
+        self.assertEqual({f.kd for f in fake.frames}, {1.0})
+
+
+class TestGotoRefusesWhatTheRampCannotHonour(unittest.TestCase):
+    """斜坡给不了的参数：拒绝并说明原因，不是静默忽略 —— 而且一帧都不发。"""
+
+    NON_POSITIVE = (0.0, -0.5, float("nan"), float("inf"))
+
+    def test_a_non_positive_duration_is_refused(self):
+        for bad in self.NON_POSITIVE:
+            g, fake = make_gripper()
+            with self.assertRaises(CommandError) as ctx:
+                g.goto(40.0, duration=bad)
+            self.assertIn("duration", str(ctx.exception))
+            self.assertEqual(fake.frames, [], f"duration={bad!r} 竟然发帧了")
+
+    def test_a_velocity_feedforward_of_its_own_is_refused(self):
+        """速度前馈由斜坡按「距离 ÷ 时长」自己给，再给一个会和它打架。"""
+        g, fake = make_gripper()
+        with self.assertRaises(CommandError) as ctx:
+            g.goto_rad(0.0, dq_target=0.5)
+        self.assertIn("dq_target", str(ctx.exception))
+        self.assertEqual(fake.frames, [])
+
+    def test_a_torque_feedforward_is_refused(self):
+        g, fake = make_gripper()
+        with self.assertRaises(CommandError) as ctx:
+            g.goto_rad(0.0, tau_feedforward=1.0)
+        self.assertIn("tau_feedforward", str(ctx.exception))
+        self.assertEqual(fake.frames, [])
+        # 要出力走这条路，不是往定位帧里塞力矩
+        self.assertIn("set_force", str(ctx.exception))
+
+
+class TestMoveAtSpeedUsesTheSameRamp(unittest.TestCase):
+    """``move_at_speed`` 一族收编进同一条斜坡，不再是第二套实现。"""
+
+    TARGET_MM = 40.0
+    SPEED_MM_S = 80.0
+
+    def test_speed_and_duration_pick_the_same_ramp(self):
+        """同一个速度给两次：一次按 mm/s，一次换算成「这段路走多久」。"""
+        by_speed, fake_speed = make_gripper()
+        by_duration, fake_duration = make_gripper()
+        # 夹爪停在张开侧，离 40 mm 那个目标还有 travel − 40 mm
+        distance_mm = TRAVEL_RAD * RAD_TO_MM - self.TARGET_MM
+
+        res_speed = by_speed.move_at_speed(self.TARGET_MM,
+                                           speed_mm_s=self.SPEED_MM_S)
+        res_duration = by_duration.goto(
+            self.TARGET_MM, duration=distance_mm / self.SPEED_MM_S)
+
+        self.assertTrue(res_speed.ok, res_speed)
+        self.assertAlmostEqual(res_speed.target_rad, res_duration.target_rad)
+        self.assertEqual(res_speed.steps, res_duration.steps)
+        self.assertEqual([f.q for f in fake_speed.frames],
+                         [f.q for f in fake_duration.frames])
+
+    def test_the_rad_s_spelling_picks_the_same_ramp(self):
+        a, fake_a = make_gripper()
+        b, fake_b = make_gripper()
+        target_rad = a.config.pos_closed_rad - self.TARGET_MM / RAD_TO_MM
+
+        res_a = a.move_at_speed(self.TARGET_MM, speed_mm_s=self.SPEED_MM_S)
+        res_b = b.move_at_speed_rad(target_rad,
+                                    speed_rad_s=self.SPEED_MM_S / RAD_TO_MM)
+
+        self.assertTrue(res_b.ok, res_b)
+        self.assertAlmostEqual(res_a.target_rad, res_b.target_rad)
+        self.assertEqual([f.q for f in fake_a.frames],
+                         [f.q for f in fake_b.frames])
+
+    def test_a_non_positive_speed_is_refused_instead_of_reported_as_success(self):
+        """旧实现在这里返回 True —— 「以 0 mm/s 移动」被报成了成功。"""
+        for bad in (0.0, -30.0):
+            g, fake = make_gripper()
+            with self.assertRaises(CommandError) as ctx:
+                g.move_at_speed(self.TARGET_MM, speed_mm_s=bad)
+            self.assertIn("速度必须为正", str(ctx.exception))
+            self.assertEqual(fake.frames, [], "拒绝了却还是发了帧")
+
+            g, fake = make_gripper()
+            with self.assertRaises(CommandError):
+                g.move_at_speed_rad(0.0, speed_rad_s=bad)
+            self.assertEqual(fake.frames, [])
+
+    def test_a_target_the_jaws_are_already_on_counts_as_reached(self):
+        """零距离不再走「什么都没做就 return True」那条捷径，而是走完一格的斜坡。"""
+        g, fake = make_gripper(start_rad=POS_OPEN_RAD)
+        already_mm = TRAVEL_RAD * RAD_TO_MM
+
+        res = g.move_at_speed(already_mm, speed_mm_s=self.SPEED_MM_S)
+
+        self.assertTrue(res.ok, res)
+        self.assertTrue(res.reached, res)
+        self.assertAlmostEqual(fake.motor.pos, POS_OPEN_RAD, places=6)
 
 
 class TestPressZone(unittest.TestCase):

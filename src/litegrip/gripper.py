@@ -45,6 +45,7 @@ from .actions import (
     WriteZeroResult,
     _check_calibrated,
     _toward,
+    clamp_to_travel,
     closing_travel_excursion_rad,
 )
 from .teleop import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX, DEFAULT_GRIP_ID,
@@ -1268,11 +1269,13 @@ class LiteGrip:
     # Motion — high-level
     # ═══════════════════════════════════════════════════════════════════
 
-    def home(self) -> bool:
-        """Move to the closed (zero) position.
+    def home(self) -> MoveResult:
+        """Ramp to the closed (zero) position and stop there.
 
         Uses this instance's calibrated closed limit, so a reverse-mounted
-        gripper homes to the correct end.
+        gripper homes to the correct end.  The stop is the closed end of the
+        travel, not a squeeze: the ramp's command lead is capped at
+        :attr:`MotionConfig.max_lead_mm`, so the jaws arrive without pressing.
 
         Raises:
             CommandError: the configuration is uncalibrated — the "calibrated
@@ -1445,8 +1448,11 @@ class LiteGrip:
         kp: Optional[float] = None,
         kd: Optional[float] = None,
         duration: float = 0.5,
-    ) -> bool:
-        """Move to an absolute position in millimetres.
+    ) -> MoveResult:
+        """Ramp to an absolute position in millimetres.
+
+        The target is one point on the closed-to-open travel; the move itself is
+        the bounded ramp described in :meth:`goto_rad`.
 
         Raises:
             CommandError: ``position_mm`` is not a finite number, or the
@@ -1477,21 +1483,37 @@ class LiteGrip:
         dq_target: float = 0.0,
         tau_feedforward: float = 0.0,
         duration: float = 0.5,
-    ) -> bool:
-        """Move to an absolute position in radians (streams MIT frames).
+    ) -> MoveResult:
+        """Ramp to an absolute position in radians.
 
-        The target is clamped into the calibrated range; the other fields
-        (``kp`` / ``kd`` / ``dq_target`` / ``tau_feedforward`` / ``duration``)
-        are checked by the bus layer, which refuses a value the frame cannot
-        honestly carry.
+        One linear ramp over ``duration`` seconds: the speed is the measured
+        distance divided by it, every frame carries the matching velocity
+        feed-forward, and each frame's command leads the measured position by at
+        most :attr:`MotionConfig.max_lead_mm`.  The first frame is one ramp step,
+        never a step command to the target — at the shipped ``kp`` of 100 Nm/rad
+        any error past ~0.1 rad saturates the DM4310's ±10 Nm frame range, and a
+        saturated frame overshoots the target instead of stopping on it.
+
+        The target is clamped into the calibrated range.  Arrival is decided
+        after the ramp, while the jaws hold the target for
+        :attr:`MotionConfig.settle_s`, so a call takes about ``duration`` plus
+        that hold.
+
+        Returns:
+            :class:`MoveResult`.  ``ok`` means the jaws arrived inside
+            :attr:`MotionConfig.reach_tol` without stalling.  A call whose frames
+            never went out, or that was blocked on the way, comes back ``False``:
+            running the command and moving +0.000 mm is not success, whatever the
+            screen said before (measured on 2026-10-12).
 
         Raises:
-            CommandError: ``position_rad`` is not a finite number, the
-                configuration is uncalibrated, or the bus layer refused a field.
-                The finiteness check is deliberately *above* the clamp: ``min`` /
-                ``max`` compare false against a NaN, so the clamp would answer it
-                with one of the calibrated limits — a real position that was
-                never asked for.
+            CommandError: ``position_rad`` is not a finite number, ``duration``
+                is not a positive finite number, ``dq_target`` or
+                ``tau_feedforward`` is not 0, or the configuration is
+                uncalibrated.  The finiteness check is deliberately *above* the
+                clamp: ``min`` / ``max`` compare false against a NaN, so the
+                clamp would answer it with one of the calibrated limits — a real
+                position that was never asked for.
 
                 The calibration check is there because the clamp below is not a
                 safety net while ``pos_closed_rad`` / ``pos_open_rad`` are still
@@ -1501,41 +1523,28 @@ class LiteGrip:
                 closed stop at ``+0.05 rad``, so the jaws are driven into it and
                 press there.  Every other motion already refuses through
                 ``_check_calibrated``; this was the way around it.
+
+                ``dq_target`` / ``tau_feedforward`` are refused rather than
+                ignored: the ramp derives its velocity feed-forward from the
+                schedule, and silently dropping a value the caller passed is
+                worse than saying no.
         """
-        self._check_connected()
-        self._check_enabled()
-        _check_calibrated(self._config)
-        if not math.isfinite(position_rad):
+        if dq_target != 0.0:
             raise CommandError(
-                f"目标位置不是有限数：position_rad={position_rad!r}。"
-                "拒绝下发：NaN 落在下面的限位 clamp 里会变成量程的一端，"
-                "也就是一个调用方没要过的真实位置。")
-        if self._can is None:
-            return False
-
-        kp = kp if kp is not None else self._config.kp
-        kd = kd if kd is not None else self._config.kd
-
-        # Clamp between the two calibrated limits, whichever is numerically
-        # larger (the ordering flips on a reverse mount).
-        lo = min(self._config.pos_closed_rad, self._config.pos_open_rad)
-        hi = max(self._config.pos_closed_rad, self._config.pos_open_rad)
-        position_rad = max(lo, min(hi, position_rad))
-
-        try:
-            return self._can.control_mit_stream(
-                q_target=position_rad,
-                kp=kp, kd=kd,
-                duration_s=duration,
-                dq_target=dq_target,
-                tau_feedforward=tau_feedforward,
-            )
-        except CommandError:
-            # 已经是一个带原因的拒绝，别再包成「位置控制失败」把它变成
-            # 看起来像通信问题。
-            raise
-        except Exception as e:
-            raise CommError(f"位置控制失败: {e}")
+                f"goto_rad 不再接受 dq_target={dq_target!r}：定位走的是按帧排程"
+                "的斜坡，速度前馈由斜坡自己按「距离 ÷ 时长」给，再给一个会和它"
+                "打架。")
+        if tau_feedforward != 0.0:
+            raise CommandError(
+                f"goto_rad 不再接受 tau_feedforward={tau_feedforward!r}：斜坡"
+                "不带前馈力矩。要出力请用 set_force() 或 grasp()。")
+        if not math.isfinite(duration) or duration <= 0.0:
+            raise CommandError(
+                f"duration 必须是正的有限数：{duration!r}。整段斜坡的时长就是"
+                "它，速度由实测距离除以它反推 —— 0 或负数没有对应的斜坡（旧实现"
+                "在这个时长里一帧都不发，却返回成功）。")
+        return self._ramp_to_rad(position_rad, duration_s=duration,
+                                 kp=kp, kd=kd)
 
     def move_to(
         self,
@@ -1544,16 +1553,53 @@ class LiteGrip:
         kd: Optional[float] = None,
         tau_feedforward: float = 0.0,
         duration: float = 1.0,
-    ) -> bool:
-        """Sustained move to a target position (longer default duration).
+    ) -> MoveResult:
+        """Ramp to a target position (longer default duration).
+
+        The same move as :meth:`goto_rad`; only the default duration differs.
 
         Raises:
-            CommandError: the configuration is uncalibrated — see
-                :meth:`goto_rad`.
+            CommandError: the configuration is uncalibrated, or a field is
+                refused — see :meth:`goto_rad`.
         """
         return self.goto_rad(target_rad, kp=kp, kd=kd,
                              tau_feedforward=tau_feedforward,
                              duration=duration)
+
+    def _ramp_to_rad(
+        self,
+        target_rad: float,
+        *,
+        speed_mm_s: float = 0.0,
+        duration_s: Optional[float] = None,
+        kp: Optional[float] = None,
+        kd: Optional[float] = None,
+    ) -> MoveResult:
+        """定位的共用入口：闸门 + clamp + 交给引擎。
+
+        :meth:`goto` / :meth:`goto_rad` / :meth:`move_to` / :meth:`home` /
+        :meth:`move_at_speed` / :meth:`move_at_speed_rad` 六条路径都走这里。它们
+        本来就只差三件事：目标怎么给（mm 还是 rad）、给速度还是给时长、以及各自
+        的输入校验；运动本身必须是同一条，见
+        :meth:`GripperActions.ramp_to`。
+        """
+        self._check_connected()
+        self._check_enabled()
+        _check_calibrated(self._config)
+        # 非有限值必须在 clamp 之前拦下：min/max 与 NaN 的比较全为假，clamp 会
+        # 把它折成量程的一端 —— 一个没人要过的真实位置。
+        if not math.isfinite(target_rad):
+            raise CommandError(
+                f"目标位置不是有限数：target_rad={target_rad!r}。"
+                "拒绝下发：NaN 落在下面的限位 clamp 里会变成量程的一端，"
+                "也就是一个调用方没要过的真实位置。")
+        if self._can is None:
+            raise NotInitializedError("没有 CAN 通道 — 请先 connect()")
+        # clamp 的目标直接经 clamp_to_travel 夹进标定行程（两端谁大谁小由安装
+        # 方向决定，它用 min/max，不假设顺序）。
+        return self._actions.ramp_to(
+            clamp_to_travel(self._config, target_rad),
+            speed_mm_s, duration_s=duration_s, kp=kp, kd=kd)
 
     def set_force(self, force_n: float, duration: float = 0.3) -> bool:
         """Apply a gripping force at the current position.
@@ -1718,7 +1764,7 @@ class LiteGrip:
             raise CommError(f"力控失败: {e}")
 
     # ═══════════════════════════════════════════════════════════════════
-    # Velocity-controlled moves
+    # Moves specified by speed (the same ramp as the goto family)
     # ═══════════════════════════════════════════════════════════════════
 
     def move_at_speed(
@@ -1727,11 +1773,16 @@ class LiteGrip:
         speed_mm_s: float = 30.0,
         kp: Optional[float] = None,
         kd: Optional[float] = None,
-    ) -> bool:
-        """Move to a target position at a constant linear speed (mm/s).
+    ) -> MoveResult:
+        """Ramp to a target position at a constant linear speed (mm/s).
 
-        Uses MIT mode with velocity feedforward.  The trajectory is a
-        linear ramp from current position to *target_mm*.
+        The same bounded ramp as :meth:`goto_rad`; only the way the speed is
+        given differs — here it is mm/s, which fixes the ramp duration from the
+        measured distance.  There is no separate velocity-controlled
+        implementation any more: the old one stepped a fixed 200 Hz schedule
+        (ignoring :attr:`MotionConfig.frame_interval`), held the target for 20
+        frames regardless of where the jaws were, and dropped every frame's send
+        result.
 
         Args:
             target_mm: Target position in mm, measured from the closed stop
@@ -1742,14 +1793,17 @@ class LiteGrip:
             kd: Velocity damping.
 
         Returns:
-            True on success.
+            :class:`MoveResult` — the same arrival check as :meth:`goto_rad`,
+            which the old implementation had none of (it returned ``True`` after
+            sending, whatever the jaws did).
 
         Raises:
             CommandError: ``target_mm`` or ``speed_mm_s`` is not a finite
-                number, or the configuration is uncalibrated — see
-                :meth:`goto_rad`.  Both of the shortcuts below compare false
-                against a NaN, so it would slip past them and reach the ramp
-                arithmetic.
+                number, ``speed_mm_s`` is not positive, or the configuration is
+                uncalibrated — see :meth:`goto_rad`.  Both of the shortcuts this
+                method used to take compare false against a NaN, so it would slip
+                past them and reach the ramp arithmetic; and ``speed_mm_s <= 0``
+                used to return ``True`` — "move at 0 mm/s" reported as success.
         """
         self._check_connected()
         self._check_enabled()
@@ -1761,23 +1815,17 @@ class LiteGrip:
             if not math.isfinite(value):
                 raise CommandError(
                     f"{name} 不是有限数：{value!r}。拒绝下发。")
+        if speed_mm_s <= 0.0:
+            raise CommandError(
+                f"速度必须为正：speed_mm_s={speed_mm_s!r}。速度为 0 或负的"
+                "移动没有对应的斜坡（旧实现把它当成功返回 True）。")
 
-        current_mm = self.get_state().position_mm
-        distance_mm = abs(target_mm - current_mm)
-        if distance_mm < 0.01 or speed_mm_s <= 0:
-            return True
-
-        duration_s = distance_mm / speed_mm_s
-        # Convert to rad (close_sign handles the reverse mount)
-        s = self._config.close_sign
-        current_rad = (self._config.pos_closed_rad
-                       - s * current_mm / self._config.rad_to_mm)
+        # close_sign handles the reverse mount, as in ``goto``.
         target_rad = (self._config.pos_closed_rad
-                      - s * target_mm / self._config.rad_to_mm)
-        speed_rad_s = speed_mm_s / self._config.rad_to_mm
-
-        return self._move_at_speed_rad(
-            current_rad, target_rad, speed_rad_s, duration_s, kp, kd)
+                      - self._config.close_sign * target_mm
+                      / self._config.rad_to_mm)
+        return self._ramp_to_rad(target_rad, speed_mm_s=speed_mm_s,
+                                 kp=kp, kd=kd)
 
     def move_at_speed_rad(
         self,
@@ -1785,8 +1833,11 @@ class LiteGrip:
         speed_rad_s: float = 0.5,
         kp: Optional[float] = None,
         kd: Optional[float] = None,
-    ) -> bool:
-        """Move to a target position at a constant motor speed (rad/s).
+    ) -> MoveResult:
+        """Ramp to a target position at a constant motor speed (rad/s).
+
+        The rad/s spelling of :meth:`move_at_speed`; the ramp is the same one
+        (see :meth:`goto_rad`).
 
         Args:
             target_rad: Target position in rad.
@@ -1795,98 +1846,33 @@ class LiteGrip:
             kd: Velocity damping.
 
         Returns:
-            True on success.
+            :class:`MoveResult`.
 
         Raises:
             CommandError: ``target_rad`` or ``speed_rad_s`` is not a finite
-                number, or the configuration is uncalibrated — see
-                :meth:`goto_rad`.  The clamp further down would otherwise answer
-                a NaN target with a calibrated limit.
+                number, ``speed_rad_s`` is not positive, or the configuration is
+                uncalibrated — see :meth:`goto_rad`.  The clamp would otherwise
+                answer a NaN target with a calibrated limit.
         """
         self._check_connected()
         self._check_enabled()
-        # Same as ``move_at_speed``: refuse before the "nothing to do" shortcut.
+        # Same as ``move_at_speed``: the check runs before the ramp arithmetic,
+        # where a NaN would quietly pick a real speed.
         _check_calibrated(self._config)
         for name, value in (("target_rad", target_rad),
                             ("speed_rad_s", speed_rad_s)):
             if not math.isfinite(value):
                 raise CommandError(
                     f"{name} 不是有限数：{value!r}。拒绝下发。")
+        if speed_rad_s <= 0.0:
+            raise CommandError(
+                f"速度必须为正：speed_rad_s={speed_rad_s!r}。速度为 0 或负的"
+                "移动没有对应的斜坡（旧实现把它当成功返回 True）。")
 
-        current_rad = self.get_position_rad()
-        distance_rad = abs(target_rad - current_rad)
-        if distance_rad < 0.0001 or speed_rad_s <= 0:
-            return True
-
-        duration_s = distance_rad / speed_rad_s
-        return self._move_at_speed_rad(
-            current_rad, target_rad, speed_rad_s, duration_s, kp, kd)
-
-    def _move_at_speed_rad(
-        self,
-        start_rad: float,
-        target_rad: float,
-        speed_rad_s: float,
-        duration_s: float,
-        kp: Optional[float],
-        kd: Optional[float],
-    ) -> bool:
-        """Core: linear ramp from start to target at constant speed.
-
-        Raises:
-            CommandError: ``target_rad`` or ``duration_s`` is not a finite
-                number.  Both callers derive the duration from finite inputs
-                and the bus layer refuses a non-finite frame anyway; this is
-                the backstop that keeps ``int(duration_s / interval)`` from
-                becoming a bare ValueError / OverflowError.
-        """
-        if self._can is None:
-            return False
-
-        for name, value in (("target_rad", target_rad),
-                            ("duration_s", duration_s)):
-            if not math.isfinite(value):
-                raise CommandError(
-                    f"{name} 不是有限数：{value!r}。拒绝下发。")
-
-        kp = kp if kp is not None else self._config.kp
-        kd = kd if kd is not None else self._config.kd
-
-        # Clamp target
-        lo = min(self._config.pos_closed_rad, self._config.pos_open_rad)
-        hi = max(self._config.pos_closed_rad, self._config.pos_open_rad)
-        target_rad = max(lo, min(hi, target_rad))
-
-        direction = 1.0 if target_rad > start_rad else -1.0
-
-        interval = 0.005  # 200 Hz
-        steps = max(1, int(duration_s / interval))
-        actual_interval = duration_s / steps
-
-        log.info("move_at_speed: %.4f → %.4f rad @ %.2f rad/s (%.2f s, %d steps)",
-                 start_rad, target_rad, speed_rad_s, duration_s, steps)
-
-        for i in range(steps + 1):
-            frac = i / steps
-            q = start_rad + (target_rad - start_rad) * frac
-            dq = direction * speed_rad_s if i < steps else 0.0
-
-            self._can.control_mit(
-                q_target=q, kp=kp, kd=kd,
-                dq_target=dq, tau_feedforward=0.0)
-
-            if i < steps:
-                self._can.poll(timeout_s=0.0)
-                time.sleep(actual_interval)
-
-        # Hold at target briefly
-        for _ in range(20):
-            self._can.control_mit(
-                q_target=target_rad, kp=kp, kd=kd,
-                dq_target=0.0, tau_feedforward=0.0)
-            time.sleep(0.005)
-
-        return True
+        return self._ramp_to_rad(
+            target_rad,
+            speed_mm_s=speed_rad_s * self._config.rad_to_mm,
+            kp=kp, kd=kd)
 
     # ═══════════════════════════════════════════════════════════════════
     # Calibration

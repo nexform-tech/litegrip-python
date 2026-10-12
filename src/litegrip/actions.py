@@ -5,12 +5,15 @@
 ROS 2 桥接、RPC 服务、产品代码都能直接调 :attr:`LiteGrip.actions`，而不用各自
 重写一遍斜坡和堵转判据。
 
-为什么不用 ``goto_rad()`` / ``control_mit_stream()``
----------------------------------------------------
+为什么不用 ``control_mit_stream()``
+-----------------------------------
 ``control_mit_stream`` 在整段时长里反复下发**同一个** ``q_target``：伺服几十
-毫秒就贴上去，剩下时间空转 —— 慢速时表现为一顿一停。这里的做法和 SDK 自己的
-``move_at_speed`` 一样，按固定帧间隔推进一条线性斜坡，并给 ``dq_target`` 速度
-前馈，所以是匀速连续运动。
+毫秒就贴上去，剩下时间空转 —— 慢速时表现为一顿一停。这里按固定帧间隔推进一条
+线性斜坡，并给 ``dq_target`` 速度前馈，所以是匀速连续运动。
+
+``goto`` 一族（``goto`` / ``goto_rad`` / ``move_to`` / ``home``）和
+``move_at_speed`` 一族原来各自就是那个 ``control_mit_stream`` 式的硬阶跃；现在
+它们都转发到这里（:meth:`GripperActions.ramp_to`），「怎么动」只剩这一份实现。
 
 指令领先实测位置的部分由领先上限封顶，分两档：行进段用
 :attr:`MotionConfig.max_lead_mm`（大领先量破静摩擦），距限位
@@ -226,7 +229,7 @@ class MoveProgress:
 
 @dataclass
 class MoveResult:
-    """open / close 的结果。
+    """一次移动的结果。
 
     ``ok`` 是「这次动作算不算成功」，``__bool__`` 用它。注意含义随目标而变：
 
@@ -236,6 +239,10 @@ class MoveResult:
       堵转，但离标定限位很远，``ok=False``。
     - ``grasp()`` 的闭合段：成功 = 走到空载目标且没堵转，即
       ``reached and not stalled``，与旧行为一致。
+    - 定位（``goto`` 一族、``move_at_speed`` 一族，都走
+      :meth:`GripperActions.ramp_to`）：成功 = 同上 ``reached and not
+      stalled``。半路被挡住、整段一帧都没发出去、或者根本没走到，都是
+      ``False`` —— 目标在行程内，「顶在限位上」不是它的成功终点。
     """
 
     ok: bool                            # 本次动作是否成功（__bool__ 用它）
@@ -250,6 +257,10 @@ class MoveResult:
     # 与 ``stalled`` 的区别：``stalled`` 也会由「顶到标定限位」成立（那是
     # open/close 的正常成功终点），``protected`` 只报这一路力矩保护。
     protected: bool = False
+    # 没到位之后的撤力（只有 ramp_to 会置上）：定位半路被挡住时，最后一帧的
+    # 指令停在 ``实测位置 + 领先上限`` 上，留着它驱动器会按约 6.6 N·m 一直压着。
+    # 只报「撤了力」，不改变 ``ok``。
+    released: bool = False
 
     def __bool__(self) -> bool:
         return self.ok
@@ -595,8 +606,8 @@ def _toward(value: float, target: float, step: float) -> float:
 
 
 class GripperActions:
-    """夹爪的六个动作：``open`` / ``close`` / ``grasp`` / ``zero`` /
-    ``enable`` / ``disable``。
+    """夹爪的七个动作：``open`` / ``close`` / ``grasp`` / ``ramp_to`` /
+    ``zero`` / ``enable`` / ``disable``。
 
     一般不直接构造，用 :attr:`LiteGrip.actions`::
 
@@ -715,6 +726,81 @@ class GripperActions:
             cycles=hold.cycles,
             travel_guard=hold.guarded,
         )
+
+    def ramp_to(
+        self,
+        target_rad: float,
+        speed_mm_s: float = 0.0,
+        *,
+        duration_s: Optional[float] = None,
+        kp: Optional[float] = None,
+        kd: Optional[float] = None,
+        progress: Optional[Callable[[MoveProgress], None]] = None,
+    ) -> MoveResult:
+        """斜坡走到行程内的任意一点：普通定位，不顶限位。
+
+        ``open`` / ``close`` 的终点在标定限位外侧（靠堵转停下）；这里走的是
+        ``frame_interval`` 一格的连续斜坡，每一帧的指令领先实测位置不超过
+        :attr:`MotionConfig.max_lead_mm`，指令力矩因此有界在 ``kp × 领先上限``
+        附近（默认 4 mm、kp=100 时约 6.6 N·m，远低于 DM4310 的 ±10 N·m 帧量程）。
+
+        这个上限不是装饰。kp=100 下误差过约 0.1 rad 就把帧量程顶到饱和，而饱和
+        的那一帧会冲过目标 —— 2026-10-12 真机上 ``goto(40.0, duration=0.5)``
+        冲过目标 42.7 mm、越过标定闭合零点 2.75 mm，就是这么来的。
+
+        到位判据是 :attr:`MotionConfig.reach_tol`：``ok = reached and not
+        stalled``。半路被挡住、整段一帧都没发出去、或者根本没走到，都是
+        ``ok=False``。
+
+        与 ``open`` / ``close`` 还有一处不同：**没到位就撤力**。压紧段那点领先是
+        意图，普通定位半路停住的领先不是 —— 最后一帧的指令停在「实测位置 + 领先
+        上限」上，留在总线上驱动器会按约 6.6 N·m 一直压着。所以 ``ok=False`` 时
+        补一段 ``kp=kd=tau=0`` 的释放帧，并把 ``released`` 置上。
+
+        Args:
+            target_rad: 目标位置 rad（调用方负责先 clamp 进标定行程）。
+            speed_mm_s: 斜坡速度 mm/s，必须为正。与 ``duration_s`` 二选一。
+            duration_s: 整段斜坡的时长 s，速度由实测距离反推。
+            kp: 这一段的刚度，``None`` = :attr:`GripperConfig.kp`。
+            kd: 这一段的阻尼，``None`` = :attr:`GripperConfig.kd`。
+            progress: 进度回调。
+
+        Raises:
+            CommandError: 目标不是有限数、没标定、速度不合法，或者速度与时长
+                同时给了。
+            NotInitializedError: 未连接或未使能。
+        """
+        g = self._g
+        g._check_enabled()
+        gcfg = g.config
+        _check_calibrated(gcfg)
+
+        if not math.isfinite(target_rad):
+            raise CommandError(
+                f"目标位置不是有限数：target_rad={target_rad!r}。拒绝下发："
+                "NaN 一进斜坡算术就会变成帧数。")
+        if duration_s is None and not (math.isfinite(speed_mm_s)
+                                       and speed_mm_s > 0.0):
+            raise CommandError(
+                f"斜坡速度必须是正的有限数：speed_mm_s={speed_mm_s!r}；或者给 "
+                "duration_s 说明这段路走多久。速度为 0 时斜坡只剩一帧，而那一帧"
+                "就是阶跃 —— 正是这条路要消掉的东西。")
+
+        # ``toward`` 只用来给这次移动取名（上报的 ``limit_rad`` 与日志）：目标是
+        # 行程内一点，按它离哪一端的标定限位更近取名。反装时两端的数值顺序是反
+        # 的，所以比距离，不比大小。
+        toward = ("close"
+                  if abs(target_rad - gcfg.pos_closed_rad)
+                  <= abs(target_rad - gcfg.pos_open_rad) else "open")
+
+        res = self._move_to_limit(toward, speed_mm_s, target_rad=target_rad,
+                                  duration_s=duration_s, kp=kp, kd=kd,
+                                  progress=progress)
+        if not res.ok and not res.protected:
+            # 没到位就没到位：不能让「压着误差」的那一帧留在总线上。
+            self._release(res.state.position_rad)
+            res.released = True
+        return res
 
     def zero(self) -> CalibrationData:
         """完整标定：探闭合 + 张开两个限位，算出行程与换算系数，并存盘。
@@ -847,11 +933,14 @@ class GripperActions:
     def _move_to_limit(
         self,
         toward: str,
-        speed_mm_s: float,
+        speed_mm_s: float = 0.0,
         *,
         press: bool = False,
         target_rad: Optional[float] = None,
+        duration_s: Optional[float] = None,
         force_n: Optional[float] = None,
+        kp: Optional[float] = None,
+        kd: Optional[float] = None,
         progress: Optional[Callable[[MoveProgress], None]] = None,
     ) -> MoveResult:
         """走到一端的限位：整段是一条 frame_interval 一格的连续斜坡（MIT 帧 +
@@ -870,10 +959,18 @@ class GripperActions:
         点）。给了它就走**普通定位**语义（``press`` 视为 False），``limit`` 取该
         方向的标定限位用于上报。
 
+        ``duration_s``：整段斜坡**走多久**，速度由实测距离除以它反推 —— 距离
+        要读了状态才知道，所以它必须在同一个 ``before`` 读数上算，不能在调用方
+        先算一遍。``speed_mm_s`` 与它二选一（两个都给就拒绝，不是忽略一个）。
+
         ``force_n``：这一段**带着多大的力走**。``None`` = 不带（普通移动，压出
         多少由领先上限和速度决定）。给了它，它的力矩预算就分给这一帧的三项（速
         度、阻尼、领先，见 :func:`force_approach_terms`），所以撞上工件时压出的
         力矩不超过这个设定值 —— ``grasp`` 的闭合段给的就是它这次的夹持力。
+
+        ``kp`` / ``kd``：这一段的增益，``None`` = 用 :attr:`GripperConfig.kp` /
+        ``.kd``。``open`` / ``close`` / ``grasp`` 不给（就是配置值），定位那几条
+        透传调用方的。
 
         返回 :class:`MoveResult`。
         """
@@ -886,6 +983,20 @@ class GripperActions:
             raise CommandError(
                 f"移动速度不是有限数：speed_mm_s={speed_mm_s!r}。拒绝下发："
                 "斜坡的帧数与速度前馈都由它算出来。")
+        if duration_s is not None:
+            if speed_mm_s > 0.0:
+                raise CommandError(
+                    f"speed_mm_s={speed_mm_s!r} 与 duration_s={duration_s!r} "
+                    "只能给一个：前者说「走多快」，后者说「这段路走多久」。")
+            if not math.isfinite(duration_s) or duration_s <= 0.0:
+                raise CommandError(
+                    f"duration_s 必须是正的有限数：{duration_s!r}。速度由实测"
+                    "距离除以它算出来 —— 0 或负数没有对应的斜坡。")
+            if force_n is not None:
+                raise CommandError(
+                    "duration_s 与 force_n 不能同时给：带设定力的接近段，速度"
+                    "预算由设定力分配（见 force_approach_terms），先定时长会把"
+                    "那条预算反过来推翻。")
 
         if target_rad is not None:
             press = False
@@ -903,17 +1014,23 @@ class GripperActions:
         dist_rad = target - before.position_rad
         dist_mm = abs(dist_rad) * gcfg.rad_to_mm
         sign = 1.0 if dist_rad >= 0 else -1.0
+        if duration_s is not None:
+            # 「这段路走多久」：距离读了状态才知道，所以速度在这里才反推得出。
+            # dist_mm == 0 时速度为 0 —— 斜坡退化成一帧 + 保压，正好是「已经在
+            # 那儿了」，不必为它写特例。
+            speed_mm_s = dist_mm / duration_s
         speed_rad_s = speed_mm_s / gcfg.rad_to_mm
 
         interval = cfg.frame_interval
         # 不带力的移动用配置里那条行进段上限；带了力，上限和这一帧的阻尼、速
         # 度一起由设定值的预算定（见 force_approach_terms）。
-        kd_frame = gcfg.kd
+        kp_frame = gcfg.kp if kp is None else kp
+        kd_frame = gcfg.kd if kd is None else kd
         lead_ceiling_rad = cfg.max_lead_mm / gcfg.rad_to_mm
         if force_n is not None:
             speed_rad_s, kd_frame, lead_ceiling_rad = force_approach_terms(
-                kp=gcfg.kp,
-                kd=gcfg.kd,
+                kp=kp_frame,
+                kd=kd_frame,
                 speed_rad_s=speed_rad_s,
                 frame_interval=interval,
                 budget_nm=force_n * UnitConversion.N_TO_NM * cfg.press_safety,
@@ -933,6 +1050,13 @@ class GripperActions:
         win_s = win * sample_every * interval
         win_expect_rad = speed_rad_s * win_s
         win_thresh_rad = max(cfg.stall_delta, cfg.stall_ratio * win_expect_rad)
+        # 「这一趟本来就没事可做」不判堵转。目标落在到位容差里时，夹爪原地不动
+        # 就是到位，读成堵转会把一次成功的定位报成失败 —— 而它会真的发生：排程
+        # 的帧数由 duration 定、不随距离缩短，间距趋近 0 时排程速度也趋近 0，
+        # 整段斜坡都是「不动」。`home()` 紧跟在 `close()` 之后（两个都瞄着闭合
+        # 端，只剩一点点齿隙）就是这个形状。压紧路径不受影响：那里目标在限位
+        # 外侧，「到了还不动」正是要判的堵转。
+        judge_stall = press or dist_mm > cfg.reach_tol * gcfg.rad_to_mm
 
         # 两档领先上限：行进段用 max_lead_mm 破静摩擦，贴近限位后收窄到
         # stop_lead_mm，压紧力矩 ≈ kp × stop_lead_mm。下限都是一帧的位移，
@@ -986,7 +1110,7 @@ class GripperActions:
             cmd = pos + sign * lead_cap_rad if lead > lead_cap_rad else q_sched
             # _emit 会把位置夹进标定行程，返回值才是真正下发的指令：领先项
             # 会让 cmd 跑到限位外侧，尤其 press=True 时（目标本身就在外侧）。
-            last_cmd = self._emit(cmd, dq, 0.0, kd=kd_frame)
+            last_cmd = self._emit(cmd, dq, 0.0, kp=kp_frame, kd=kd_frame)
             if last_cmd != cmd and not clamped_once:
                 clamped_once = True
                 log.debug("%s 指令封顶标定行程：%.5f → %.5f rad（标定 [%.5f, %.5f]）",
@@ -1020,7 +1144,8 @@ class GripperActions:
             # 夹爪到了那里就该顶着不动 —— 那里的「不动」正是我们要的堵转。而且
             # 越位量（5% 行程）往往短于一个采样窗口，只在斜坡段判会永远判不到，
             # 动作得白跑完保压段。
-            if (win_delta is not None and (press or i <= ramp_steps)
+            if (judge_stall and win_delta is not None
+                    and (press or i <= ramp_steps)
                     and win_delta < win_thresh_rad):
                 stalled = True
                 log.info("堵转：最近 %d 次采样(%.2f s)净位移仅 %.5f rad "

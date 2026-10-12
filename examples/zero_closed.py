@@ -42,7 +42,9 @@ already measured stays valid.  The command requires ``--yes``.
 engine.  ``open`` stops at the configured work stroke if the calibration
 carries one, otherwise presses onto the open stop; ``close`` presses onto the
 closed stop.  Both carry the ≈7 N travel-leg stall guard, which releases the jaw
-(kp=0) if it is blocked mid-travel — ``goto`` has no such guard.
+(kp=0) if it is blocked mid-travel — the same engine the SDK's ``LiteGrip.goto``
+runs.  This script's own ``goto`` subcommand does not: it streams raw MIT frames
+straight at ``LiteGripCAN``, with no lead cap and no guard.
 
 Every ``LiteGripCAN`` subcommand but ``disable`` runs the SDK's ``initialize()``
 first, which disables → switches to MIT → enables and leaves the motor *limp*
@@ -126,8 +128,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="confirm the irreversible flash write")
 
     # open/close go through the high-level LiteGrip, so the action engine's
-    # travel-leg stall guard (≈7 N) is in play — unlike `goto`, which streams
-    # raw MIT frames with no lead cap and no guard.
+    # travel-leg stall guard (≈7 N) is in play.  The `goto` subcommand above
+    # streams raw MIT frames instead, with no lead cap and no guard.
     for name, blurb in (("open", "open fully (work stroke, if configured)"),
                         ("close", "close onto the closed-side hard stop")):
         p = sub.add_parser(name, parents=[common], help=blurb)
@@ -208,8 +210,9 @@ def _do_zero(can: LiteGripCAN) -> int:
 
 
 def _do_move(args: argparse.Namespace) -> int:
-    """open/close through the high-level LiteGrip — so the action engine's
-    travel-leg stall guard (≈7 N) runs, which `goto` deliberately does not."""
+    """open/close through the high-level LiteGrip, so the action engine's ramped
+    move and its ≈7 N travel-leg stall guard run.  ``LiteGrip.goto`` runs the
+    same engine; this script's ``goto`` subcommand does not."""
     g = LiteGrip(channel=args.channel, can_id=args.can_id, mst_id=args.mst_id,
                  canfd_mode=args.canfd or None, motor_type=MotorType[args.motor])
     if not g.load_calibration():
