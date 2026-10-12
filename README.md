@@ -71,9 +71,16 @@ with LiteGrip("can0", mount="reverse") as gripper:
 
 If they open instead, the unit is normal after all — drop the argument.
 
-`list_templates()` returns every name the SDK accepts, for a UI to offer. `gripper.mount` reads
-back `"normal"`, `"reverse"`, or `None` until calibrated; a name outside `list_templates()`
-raises `CommandError` listing the valid ones.
+`list_templates()` is a module-level function, not a method on the gripper, so import it by name:
+
+```python
+from litegrip import list_templates
+
+list_templates()        # ['normal', 'reverse'] — every name the SDK accepts, for a UI to offer
+```
+
+`gripper.mount` reads back `"normal"`, `"reverse"`, or `None` until calibrated; a name outside
+`list_templates()` raises `CommandError` listing the valid ones.
 
 Running a move under a template is safe even though the geometry is not yours yet: `open` and
 `close` never send a command outside the calibrated travel, so a wrong direction cannot drive
