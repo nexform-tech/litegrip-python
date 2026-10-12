@@ -28,10 +28,18 @@ force matters.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 
-from litegrip import LiteGrip, LiteGripError, Trajectory, trajectory_dir
+# Like the other examples: import the SDK straight out of the checkout, so the
+# script works without `pip install -e .`.  Inserted first, so the checkout wins
+# over an installed copy — running it exercises the code next to it.
+_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+from litegrip import LiteGrip, LiteGripError, Trajectory, trajectory_dir  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
