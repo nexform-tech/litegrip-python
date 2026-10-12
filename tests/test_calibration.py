@@ -47,18 +47,15 @@ def _write_json(data, directory):
 
 
 @contextlib.contextmanager
-def _patched_calib_env(home, legacy=None):
-    """把 ``HOME`` 与 ``DEFAULT_CALIB`` 都指到临时目录，屏蔽真机标定。
+def _patched_calib_env(home):
+    """把 ``HOME`` 指到临时目录，屏蔽真机标定，并清掉 ``LITEGRIP_CALIB``。
 
-    ``LITEGRIP_CALIB`` 优先于 ``HOME``，所以一律清掉；``DEFAULT_CALIB`` 是
-    导入期算好的常量，必须 patch 模块属性而不是环境变量。``patch.dict`` 会
-    整份快照环境，退出时把清掉的那把键也一并还原。
+    两者是这台机器上仅有的两个隐式来源，清掉之后无参加载只剩出厂文件。
+    ``patch.dict`` 会整份快照环境，退出时把清掉的那把键也一并还原。
     """
-    target = legacy if legacy is not None else os.path.join(home, "missing.json")
     with mock.patch.dict(os.environ, {"HOME": home}, clear=False):
         os.environ.pop("LITEGRIP_CALIB", None)
-        with mock.patch.object(gripper_mod, "DEFAULT_CALIB", target):
-            yield
+        yield
 
 
 class TestDirectionTemplates(unittest.TestCase):
@@ -424,37 +421,99 @@ class TestPerChannelPaths(unittest.TestCase):
             self.assertTrue(written.endswith("can1_calibration.json"))
             self.assertTrue(os.path.exists(written))
 
-    def test_auto_load_prefers_the_channel_file_over_the_legacy_one(self):
-        legacy = self._seed("legacy.json", {
-            "channel": "can1", "calibrated": True,
-            "zero_position_rad": 0.114, "max_position_rad": -1.491,
-            "rad_to_mm": 74.8})
-        with _patched_calib_env(self.dir, legacy=legacy):
-            self._seed(os.path.join(".litegrip", "can1_calibration.json"), {
-                "channel": "can1", "calibrated": True,
-                "zero_position_rad": -1.491, "max_position_rad": 0.114,
-                "rad_to_mm": 74.8})
-            g = LiteGrip("can1")
-            self.assertTrue(g.load_calibration())
-            self.assertAlmostEqual(g.config.close_sign, -1.0)
+    def test_a_can0_unit_with_no_local_file_gets_the_factory(self):
+        """#44 的核心承诺：干净机器上的无参加载 = 出厂标定。"""
+        with _patched_calib_env(self.dir):
+            g = LiteGrip("can0")
+            warnings = _capture_warnings(lambda: g.load_calibration())
+            self.assertTrue(g.config.calibrated)
+            self._assert_factory_geometry(g)
+            # 机器上一个本机文件都没有，就不该有「没用上」的告警。
+            self.assertFalse([m for m in warnings if "not read" in m], warnings)
 
-    def test_auto_load_skips_another_channels_file(self):
-        can0_file = self._seed("legacy.json", {
+    def test_auto_load_reads_the_factory_not_the_local_file(self):
+        """本机文件不再隐式生效 —— 出厂文件才是标准值；显式点名仍拿得到它。"""
+        local = self._seed(os.path.join(".litegrip", "can0_calibration.json"), {
             "channel": "can0", "calibrated": True,
             "zero_position_rad": 0.114, "max_position_rad": -1.491,
             "rad_to_mm": 74.8})
-        with _patched_calib_env(self.dir, legacy=can0_file):
+        with _patched_calib_env(self.dir):
+            g = LiteGrip("can0")
+            self.assertTrue(g.load_calibration())
+            self.assertNotAlmostEqual(g.config.pos_closed_rad, 0.114)
+            self._assert_factory_geometry(g)
+            # 同一个文件显式点名就生效：它只是不再隐式，不是不可达。
+            self.assertTrue(g.load_calibration(path=local))
+            self.assertAlmostEqual(g.config.pos_closed_rad, 0.114)
+            self.assertAlmostEqual(g.config.rad_to_mm, 74.8)
+
+    def test_auto_load_skips_another_channels_file(self):
+        self._seed(os.path.join(".litegrip", "can0_calibration.json"), {
+            "channel": "can0", "calibrated": True,
+            "zero_position_rad": 0.114, "max_position_rad": -1.491,
+            "rad_to_mm": 74.8})
+        with _patched_calib_env(self.dir):
             self.assertFalse(LiteGrip("can1").load_calibration())
 
     def test_isolated_home_finds_nothing_and_says_so(self):
-        # ~/.litegrip/litegrip_calibration.json 在真机上真实存在，这条确保
-        # 测试不会悄悄读到它。
+        # 空 HOME 只是背景。真正让 can1 取不到的是出厂文件声明了
+        # ``channel: can0`` —— 宁可大声失败，也不静默采纳别的通道的方向。
         with _patched_calib_env(self.dir):
             g = LiteGrip("can1")
             warnings = _capture_warnings(lambda: g.load_calibration())
             self.assertTrue(any("No calibration found" in m for m in warnings),
                             warnings)
             self.assertFalse(g.config.calibrated)
+
+    def test_env_var_still_beats_the_factory(self):
+        """显式指定是唯一的隐式来源例外 —— 环境变量必须压过出厂文件。"""
+        local = self._seed(os.path.join(".litegrip", "can0_calibration.json"), {
+            "channel": "can0", "calibrated": True,
+            "zero_position_rad": 0.114, "max_position_rad": -1.491,
+            "rad_to_mm": 74.8})
+        with _patched_calib_env(self.dir):
+            with mock.patch.dict(os.environ, {"LITEGRIP_CALIB": local}):
+                g = LiteGrip("can0")
+                warnings = _capture_warnings(lambda: g.load_calibration())
+                self.assertTrue(g.config.calibrated)
+                self.assertAlmostEqual(g.config.pos_closed_rad, 0.114)
+                self.assertAlmostEqual(g.config.rad_to_mm, 74.8)
+                # 环境变量指的就是它，没有「被跳过」这回事。
+                self.assertFalse([m for m in warnings if "not read" in m],
+                                 warnings)
+
+    def test_machine_file_is_named_when_passed_over(self):
+        """沉默的回退才是 bug：被跳过的本机文件必须在日志里点名。"""
+        path = self._seed(os.path.join(".litegrip", "can0_calibration.json"), {
+            "channel": "can0", "calibrated": True,
+            "zero_position_rad": 0.114, "max_position_rad": -1.491,
+            "rad_to_mm": 74.8})
+        with _patched_calib_env(self.dir):
+            g = LiteGrip("can0")
+            warnings = _capture_warnings(lambda: g.load_calibration())
+            named = [m for m in warnings if path in m]
+            self.assertTrue(named, warnings)
+            # 告警必须给出逃生口，光说「没用上」等于让用户自己猜。
+            self.assertIn("path=", named[0])
+            self.assertIn("LITEGRIP_CALIB", named[0])
+
+    def test_save_warns_that_it_will_not_be_read_back(self):
+        with _patched_calib_env(self.dir):
+            g = LiteGrip("can1")
+            g.load_template("reverse")
+            written = g.save_calibration()
+            # 先落盘，再加载：加载时的「被跳过」告警不能替这条保存告警顶包。
+            records = _capture_warnings(lambda: g.save_calibration())
+            self.assertTrue([m for m in records if written in m], records)
+
+    def _assert_factory_geometry(self, g):
+        with open(_FACTORY_CALIB) as f:
+            factory = json.load(f)
+        self.assertAlmostEqual(g.config.pos_closed_rad,
+                               factory["zero_position_rad"])
+        self.assertAlmostEqual(g.config.pos_open_rad,
+                               factory["max_position_rad"])
+        self.assertAlmostEqual(g.config.rad_to_mm, factory["rad_to_mm"])
 
     def test_explicit_mismatch_still_warns_and_loads(self):
         """显式指定文件是调用方的主动覆盖，语义仍是「警告但加载」。"""
