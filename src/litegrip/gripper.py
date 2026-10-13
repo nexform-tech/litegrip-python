@@ -44,9 +44,7 @@ from .actions import (
     MoveResult,
     WriteZeroResult,
     _check_calibrated,
-    _toward,
     clamp_to_travel,
-    closing_travel_excursion_rad,
 )
 from .teleop import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX, DEFAULT_GRIP_ID,
                      DEFAULT_GRIP_PORT, DEFAULT_LEAD_CAP_MM,
@@ -127,7 +125,6 @@ from .constants import (
 from .exceptions import (
     CommandError,
     ConnectError,
-    CommError,
     HardwareError,
     NotInitializedError,
 )
@@ -1537,7 +1534,7 @@ class LiteGrip:
         if tau_feedforward != 0.0:
             raise CommandError(
                 f"goto_rad 不再接受 tau_feedforward={tau_feedforward!r}：斜坡"
-                "不带前馈力矩。要出力请用 set_force() 或 grasp()。")
+                "不带前馈力矩。要出力请用 grasp()。")
         if not math.isfinite(duration) or duration <= 0.0:
             raise CommandError(
                 f"duration 必须是正的有限数：{duration!r}。整段斜坡的时长就是"
@@ -1600,168 +1597,6 @@ class LiteGrip:
         return self._actions.ramp_to(
             clamp_to_travel(self._config, target_rad),
             speed_mm_s, duration_s=duration_s, kp=kp, kd=kd)
-
-    def set_force(self, force_n: float, duration: float = 0.3) -> bool:
-        """Apply a gripping force at the current position.
-
-        The streamed frames carry the feed-forward torque alone
-        (``kp = kd = 0``), so the force does not depend on where the jaws are:
-        if the object yields under load, the jaws follow it and the grip force
-        stays at the setpoint.  A position or velocity gain would subtract from
-        the feed-forward as soon as the jaws moved — with the default
-        ``rad_to_mm``, a jaw creeping at 3 mm/s lost about 15 N of a 20 N
-        setting.
-
-        The torque is ramped to the setpoint at a fixed rate
-        (:attr:`MotionConfig.force_ramp_n_s`, newtons per second), starting
-        from the torque already in flight.  Stepping to the setpoint in one
-        frame is an impulse through the mechanism, and the fingers bounce off
-        what they just touched; the ramp makes the force climb evenly where a
-        gain-based or duration-based ramp would lead with a step.  The climb
-        takes ``force_n / force_ramp_n_s`` seconds.
-
-        ``duration`` is the hold time **after** the climb, not a budget that
-        includes it: the call ramps to the setpoint, holds there for
-        ``duration`` seconds, then returns.  Its wall clock is therefore
-        ``climb + duration`` — a ``set_force(20.0)`` from a released grip at
-        the default ``duration=0.3`` blocks for about ``1.0 s + 0.3 s = 1.3 s``
-        where it used to be just ``0.3 s``.  The force always lands on the
-        setpoint, so a short ``duration`` still gets the full force; it only
-        shortens the hold.  ``duration=0`` means "ramp to the setpoint and
-        return" — the climb still completes.
-
-        A held force has no position command to clamp — the frames carry no
-        error term — so this path carries its own guard, the same one
-        ``grasp``'s hold phase uses: once the measured position has run
-        ``MotionConfig.hold_runaway_rad`` past the closed-side calibrated
-        limit, the torque is dropped and the call returns ``False``.  Only the
-        closing side is watched, because that is the side the feed-forward
-        pushes and the side where a missing stop means the jaws walk away.  A
-        normal grip never trips it: against an object the jaws stop on the
-        object, and against nothing they stop on the mechanical stop, which
-        sits at the calibrated limit.  The guard is off while the config is
-        uncalibrated, since this method has never required a calibration and
-        the placeholder limits describe no real travel.
-
-        Args:
-            force_n: Target force in newtons.
-            duration: Hold time in seconds after the ramp, ``0`` to just ramp.
-
-        Returns:
-            ``False`` when the guard tripped or a frame could not be sent;
-            ``True`` when the climb and the hold both ran to completion.
-
-        Raises:
-            CommandError: ``force_n`` or ``duration`` is not a finite number,
-                or the torque the force works out to exceeds what the frame can
-                carry (the bus layer refuses it on the first frame).  It is not
-                clamped: a request for 200 N is not a request for 100 N.
-        """
-        self._check_connected()
-        self._check_enabled()
-        for name, value in (("force_n", force_n), ("duration", duration)):
-            if not math.isfinite(value):
-                raise CommandError(
-                    f"{name} 不是有限数：{value!r}。拒绝下发：目标力矩随之非"
-                    "有限，而下面的爬升循环写成 ``while probe != target_nm``"
-                    " —— NaN 与任何值都不相等，它会一帧都发不出去地永远转下去。")
-        if self._can is None:
-            return False
-
-        # Squeezing may mean increasing or decreasing rad depending on the
-        # mount; close_sign carries that.
-        target_nm = self._config.close_sign * force_n * UnitConversion.N_TO_NM
-        current_pos = self._can.get_position()
-
-        motion = self.motion_config
-        step_nm = (motion.force_ramp_n_s * motion.frame_interval
-                   * UnitConversion.N_TO_NM)
-        in_flight = self._can.get_torque()
-        # Entering force mode: continue from the torque in flight so the
-        # transition is continuous.  Torque already past the setpoint starts at
-        # the setpoint — that step goes down, so it is not an impulse.
-        tau_cmd = in_flight if abs(in_flight) < abs(target_nm) else target_nm
-
-        # 爬升要几帧：从飞行力矩逐帧朝设定值走，走到就是几帧。已经在设定值
-        # （或已越过）时是 0 帧 —— 不加多余的一帧。
-        #
-        # 循环写成 ``!=`` 是有意的（每帧一步正好落在设定值上），但它只在「每步都
-        # 真的朝设定值靠近」时才会结束。两种输入会让它空转：目标力矩非有限
-        # （NaN 与任何值都不相等，比较全为假 —— 2026-10-10 审计里那条一帧都发不
-        # 出去、永不返回的路径，现在由上面 force_n / duration 的检查堵死），以及
-        # 步长小到被浮点吃掉（``value ± step == value``，一步都不挪）。所以每步
-        # 都验一次「到设定值的距离真的变小了」，不成立就抛错，不空转。
-        climb_frames = 0
-        probe = tau_cmd
-        if step_nm > 0.0:
-            while probe != target_nm:
-                dist_nm = abs(target_nm - probe)
-                probe = _toward(probe, target_nm, step_nm)
-                climb_frames += 1
-                # 非有限值时 ``<`` 为假，这里同样命中 —— 写法不能改成 ``>=``。
-                if not (abs(target_nm - probe) < dist_nm):
-                    raise CommandError(
-                        f"力矩爬升没有朝设定值前进：停在 {probe!r}（设定值 "
-                        f"{target_nm!r}，每帧 {step_nm!r}），不再空转。")
-        # duration 是爬到设定值以后**继续保力**的时间，不含爬升本身。
-        hold_frames = max(0, int(round(duration / motion.frame_interval)))
-
-        # Position guard, the same predicate ``grasp``'s hold phase uses.  The
-        # frames carry ``kp = kd = 0``: there is no position error to clamp, so
-        # the only lever is dropping the torque.  Only the closing side is
-        # checked — the feed-forward pushes that way, and running past the open
-        # limit is pulled back by the same torque.
-        #
-        # Off while the config is uncalibrated, as ``set_force`` has never
-        # required a calibration: the placeholder limits describe no real
-        # travel, and a window built from them is worse than none.
-        guarded = self._config.calibrated
-        guard_rad = motion.hold_runaway_rad
-
-        try:
-            for i in range(climb_frames + hold_frames):
-                # Checked before the frame goes out, so the first one is
-                # covered too: a call that starts outside the guard sends no
-                # torque at all.
-                if guarded:
-                    pos = self._can.get_position()
-                    out_rad = closing_travel_excursion_rad(self._config, pos)
-                    if out_rad > guard_rad:
-                        log.warning(
-                            "力控中止：实测位置 %+.5f rad 越出闭合侧标定限位 "
-                            "%+.5f rad 共 %.5f rad（> %.5f）—— 判定闭合侧没有"
-                            "东西拦着它，撤力。设定力 %.1f N 到此为止。",
-                            pos, self._config.pos_closed_rad, out_rad,
-                            guard_rad, force_n)
-                        # Trip means let go: the jaws must be pushable by hand
-                        # again rather than still pressed.  Shared with
-                        # ``grasp``'s hold phase so the two cannot drift.  A
-                        # frame that does not go out is reported the way this
-                        # method reports every other send failure, not as an
-                        # exception.
-                        try:
-                            self._actions._release(self._can.get_position())
-                        except CommandError:
-                            pass
-                        return False
-                if i < climb_frames:
-                    tau_cmd = _toward(tau_cmd, target_nm, step_nm)
-                else:
-                    tau_cmd = target_nm
-                if not self.send_mit_frame(current_pos, 0.0, 0.0, tau=tau_cmd):
-                    return False
-                # Drain incoming frames between sends, the way
-                # ``control_mit_stream`` did (control_mit, poll, sleep): without
-                # the poll nothing reads the drive's status frames for the
-                # whole call.
-                self.poll(timeout_s=0.0)
-                motion.sleep_fn(motion.frame_interval)
-            return True
-        except CommandError:
-            # 带原因的拒绝原样上传；包成「力控失败」会让它看起来像通信问题。
-            raise
-        except Exception as e:
-            raise CommError(f"力控失败: {e}")
 
     # ═══════════════════════════════════════════════════════════════════
     # Moves specified by speed (the same ramp as the goto family)

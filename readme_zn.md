@@ -134,7 +134,6 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 | `close(speed_mm_s=None, *, progress=None)` → `MoveResult` | 一样，方向朝闭合侧。`work_stroke_mm` 是张开侧的数字，不改变 `close()` 的落点。 |
 | `home()` → `MoveResult` | 爬坡回到标定的闭合位置。 |
 | `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | 闭到工件上（中间没东西就闭到闭合侧标定限位），再爬到 `force_n` N 并保持。闭合段就把 `force_n` 当力矩预算，所以顶到工件时压得不会比设定值更狠。保力只在爪子**停下来**之后接手：`stalled=True`（爪子间夹着东西）或 `reached=True`（空爪闭到底）。`hold_s=0` 表示保持到故障、失控监视触发或 Ctrl+C。`force_n=None` 用 `MotionConfig.force_n`（20 N）。 |
-| `set_force(force_n, duration=0.3)` → `bool` | 在爪子**当前**位置保持 `force_n`，持续 `duration` 秒。 |
 | `goto(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | 爬坡走到毫米目标。 |
 | `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | 一样的，单位 rad。`dq_target` 与 `tau_feedforward` 必须是 0：速度前馈由斜坡按自己的排程给出，所以这两个值一律拒绝并抛 `CommandError`，不是静默忽略。 |
 | `move_to(target_rad, kp=None, kd=None, tau_feedforward=0.0, duration=1.0)` → `MoveResult` | 和 `goto_rad` 一样，只是 `duration` 的默认值更长。 |
@@ -157,9 +156,14 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 
 ### 夹持与力控
 
-`grasp(force_n, hold_s)` 先闭再保；`set_force(force_n, duration)` 在爪子**当前**位置保持。
-两者发的帧都是 `kp = kd = 0`，所以驱动器输出**就是**前馈力矩 `force_n × 0.1 Nm`。
-正因如此，这个力与工件无关：软工件让位时爪子跟着走，夹持力仍停在设定值上。
+`grasp(force_n, hold_s)` 是**唯一**一条出力的路：先闭，再保。保力帧都是 `kp = kd = 0`，
+所以驱动器输出**就是**前馈力矩 `force_n × 0.1 Nm`。正因如此，这个力与工件无关：软工件让位时
+爪子跟着走，夹持力仍停在设定值上。
+
+**力只有压在东西上才有意义。** 没有「在当前位置直接出力」的调用，这是有意的。那样的调用
+没法知道爪子之间有没有东西，而保力帧又没给驱动器任何位置或速度误差可依托 —— 前面空着时，
+力矩就是唯一的作用力，爪子会一路加速。`grasp()` 从构造上避开了它：闭合段走的是位置斜坡，
+先到工件（或闭到闭合侧限位）停下来，保力才接手。
 
 - **这个力是近似的。** `1 N = 0.1 Nm` 在 SDK 里就标着「近似」，真实夹持力还取决于你指爪的
   几何。把 `force_n` 当成一个**可重复**的档位，不要当成标定过的测量值。
@@ -170,9 +174,9 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
   吃掉的力。
 
 **失控监视。** 保力帧不带位置误差，所以任何位置限位都管不到它 —— 唯一可用的手段是撤掉力矩。
-一旦实测位置越过闭合侧标定限位 `hold_runaway_rad`（`0.05 rad`，约 3 mm），`grasp()` 和
-`set_force` 就连发零力矩释放帧并返回 —— `GraspResult.travel_guard` 置位，或 `set_force`
-返回 `False`。只判闭合侧，因为前馈力矩就是朝那边压的。这是**失控检测，不是精度上限**：
+一旦实测位置越过闭合侧标定限位 `hold_runaway_rad`（`0.05 rad`，约 3 mm），`grasp()` 就连发
+零力矩释放帧并返回，`GraspResult.travel_guard` 置位。只判闭合侧，因为前馈力矩就是朝那边
+压的。这是**失控检测，不是精度上限**：
 只有当**确实夹着东西**的爪子被释放时，才去调大 `hold_runaway_rad`。未标定时监视不启用。
 
 需要比默认更大的力？`MotionConfig.force_n` 是 `20.0` N（`2.0 Nm`），在 DM4310 的 `3 Nm`
@@ -468,7 +472,7 @@ logger 挂个 handler 就能看到，注意即使不挂 handler，告警也会�
 | `enable()` 抛 `HardwareError` | 电机始终没报 `err == 1`。先查供电，再 `clear_fault()`。 |
 | 爪子朝反方向动 | 这台机器是反装，不是正装。构造时传 `mount="reverse"`。 |
 | `close()` 返回 `ok=False` | 爪子停的位置离限位超过了 `stop_tol`。这个缺口来自 `zero()` 探测时压得比 `close()` 更狠，所以调 `stop_lead_mm` 基本看不出变化 —— 先核对标定描述的是不是真实行程，如果这台确实停在限位上，再调大 `stop_tol`。 |
-| `travel_guard` 置位，或 `set_force` 返回 `False` | 失控监视触发了：爪子走到了闭合侧限位之外。核对标定描述的是不是真实行程，以及限位还在不在。 |
+| `travel_guard` 置位 | 失控监视触发了：保力期间爪子走到了闭合侧限位之外。核对标定描述的是不是真实行程，以及限位还在不在。 |
 | `can1` 上的机器 `load_calibration()` 返回 `False` | 不带参数的加载读的是出厂文件，而它声明的是 `channel: can0`，所以这台没有隐式来源。给它一个模板，或者用 `path=` / `LITEGRIP_CALIB` 点名它自己那份文件。 |
 | 保住的力比设定值低 | 你改过保力增益，或者有东西把爪子推得比前馈还快。`hold_kp` / `hold_kd` 已弃用，会被忽略。 |
 | `import litegrip` 拿到的代码比你在读的源码树旧 | 装过的副本不会跟着 `git pull` 自己更新。先看 `litegrip.__file__`，或者在代码仓里 `pip install -e .`。 |
@@ -486,9 +490,8 @@ logger 挂个 handler 就能看到，注意即使不挂 handler，告警也会�
 - **`write_zero()` 不可逆。** 它把编码器偏移写进电机的 flash。
 - **持续压紧会让线圈发热。** `open` 和 `close` 每次都会在限位上压过整段稳定期，连着跑就查一下
   线圈温度。
-- **非有限值一律拒绝，绝不夹取。** `goto`、`goto_rad`、`move_at_speed*`、`grasp` 和
-  `set_force` 遇到 NaN 或 ±inf 参数就抛 `CommandError`，而 CAN 边界在它变成字节之前就会拒收
-  帧里的这类字段。
+- **非有限值一律拒绝，绝不夹取。** `goto`、`goto_rad`、`move_at_speed*` 和 `grasp` 遇到
+  NaN 或 ±inf 参数就抛 `CommandError`，而 CAN 边界在它变成字节之前就会拒收帧里的这类字段。
 - **`disconnect()` 默认会失能电机**，所以进程崩掉不会留下一个还吃着力矩的电机。只有当别的
   东西在接着控制夹爪时，才设 `disable_on_disconnect=False`。
 
