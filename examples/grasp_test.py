@@ -5,15 +5,21 @@ Read this when you want to know whether ``grasp()`` still does what it says on a
 real gripper — after a change to the motion engine, a recalibration, or wiring a
 new unit up.  Every other action ends on a mechanical stop, so "did it move" is
 enough to judge it.  ``grasp()`` ends on an *object*, which makes it the one
-action that can be right in one case and wrong in the other: it has to reach its
-empty target when the jaws are clear, and it has to stop early and hold when they
+action that can be right in one case and wrong in the other: it has to reach the
+closed stop when the jaws are clear, and it has to stop early and hold when they
 are not.  The script runs both cases and judges them separately.
 
 1. **Clear jaws** — expect ``reached=True stalled=False``: it closed all the way
-   to the empty target (``MotionConfig.margin`` inside the closed stop, 5% of the
-   travel) with nothing in the way.
+   to the closed-side calibrated stop with nothing in the way.
 2. **An object between the jaws** — expect ``stalled=True reached=False``: it met
-   the object well before that target.  You insert the object when prompted.
+   the object well before the stop.  You insert the object when prompted.
+
+Both are also the two ways the closing leg is allowed to end.  ``grasp()`` hands
+the jaws over to the force hold only on ``reached or stalled``, because the hold
+frames carry no position term and no velocity term — a jaw handed over while it
+is still travelling has nothing left to bound it.  A third ending,
+``ok=False reached=False stalled=False``, is reported as its own failure below;
+it means the closing leg was starved and nothing was gripped.
 
 **Each case opens the jaws first.**  An empty grasp is only testing something if
 the jaws start away from the empty target — starting them a millimetre from it
@@ -294,15 +300,12 @@ def _mean(values) -> float:
 def _stall_ramp_mm(result, trace: Trace, cfg, motion) -> tuple[float, float] | None:
     """``(ramp_mm, window_mm)`` for a close whose stall detector could not arm.
 
-    ``None`` when the ramp is long enough to arm it.  ``grasp()`` closes with
-    ``press=False``, so the engine's position window only runs while
-    ``i <= ramp_steps`` — and only once it holds ``stall_cycles`` samples.  A
-    ramp shorter than that window cannot report ``stalled=True`` whatever the
-    jaws meet, which makes ``stalled=False`` no evidence at all.  The engine's
-    own comment says as much for the press case; this is the same arithmetic on
-    the non-press one.  A full-stroke close is ~80 mm and always clears it, so
-    this only bites when the jaws start near the target — which is exactly why
-    every case opens first.
+    ``None`` when the close has enough travel to arm it.  The engine's position
+    window starts only once it holds ``stall_cycles`` samples, so a close that
+    covers less than that window cannot report ``stalled=True`` whatever the
+    jaws meet — which makes ``stalled=False`` no evidence at all.  A
+    full-stroke close is ~80 mm and always clears it, so this only bites when
+    the jaws start near the stop — which is exactly why every case opens first.
     """
     if trace.start_rad is None or motion.grasp_speed_mm_s <= 0.0:
         return None
@@ -332,16 +335,29 @@ def _hold_problem(result) -> str | None:
 
 
 def _judge_empty(result, trace: Trace, cfg, _motion) -> list[str]:
-    """Clear jaws: it should reach the empty target and not report a stall."""
+    """Clear jaws: it should reach the closed stop and not report a stall."""
     problems = []
     if not result.reached:
-        problems.append(
-            f"did not reach the empty target (stopped "
-            f"{abs(result.state.position_rad - result.target_rad) * cfg.rad_to_mm:.2f} "
-            f"mm short) — nothing was in the way, so the closing move ran out of "
-            f"ramp and settle before a kp={cfg.kp:g} position loop could finish "
-            f"the last millimetres (try --kp 20)")
-    if result.stalled:
+        short_mm = (abs(result.state.position_rad - result.target_rad)
+                    * cfg.rad_to_mm)
+        if not result.stalled:
+            # The closing leg ends on arrival or on a stall, so neither of them
+            # is what happened here: it ran out of frames while still in free
+            # travel, and grasp() refused to hand a moving jaw to the hold.
+            problems.append(
+                f"did not reach the closed stop and did not stall (stopped "
+                f"{short_mm:.2f} mm short) — nothing was in the way, so the "
+                f"closing leg ran out of frames while still travelling.  That is "
+                f"the one ending grasp() refuses to hold from, so no grip was "
+                f"applied at all.  Suspect a stale state read or friction the "
+                f"force budget cannot overcome (try --force 20)")
+        else:
+            problems.append(
+                f"did not reach the closed stop (stopped {short_mm:.2f} mm short) "
+                f"but reported stalled=True — either something is between the "
+                f"jaws after all, or the calibration no longer describes the "
+                f"travel")
+    elif result.stalled:
         problems.append("reported stalled=True with nothing between the jaws — it "
                         "met an obstruction, or the closing move stalled on "
                         "friction")
@@ -522,24 +538,23 @@ def _run(args) -> int:
         source = _source_note(args)
         travel_mm = (abs(g.config.pos_open_rad - g.config.pos_closed_rad)
                      * g.config.rad_to_mm)
-        target, limit, margin_rad, _ = limit_target(g.config, "close", motion.margin)
-        empty_mm = to_mm(g.config, target)
+        _target, limit, _margin_rad, _ = limit_target(g.config, "close", motion.margin)
         print(f"calibration from {source}")
         print(f"  closed={g.config.pos_closed_rad:+.6f} rad  "
               f"open={g.config.pos_open_rad:+.6f} rad  mount={g.config.mount}")
         print(f"  travel={travel_mm:.1f} mm  rad_to_mm={g.config.rad_to_mm}  "
               f"kp={g.config.kp:g}  kd={g.config.kd:g}")
-        print(f"  closed stop at {to_mm(g.config, limit):+.1f} mm; "
-              f"margin={motion.margin:g} -> the empty grasp targets "
-              f"{empty_mm:.1f} mm, reach_tol "
+        print(f"  closed stop at {to_mm(g.config, limit):+.1f} mm — that is what "
+              f"the empty grasp targets, to within reach_tol "
               f"{motion.reach_tol * g.config.rad_to_mm:.2f} mm")
-        # The empty move gets the ramp plus settle_s to finish, and the command
-        # never leads the jaws by more than max_lead_mm.  A position loop too
-        # soft to close the last millimetres inside that window stops short of
-        # the target with nothing in the way — which is what `reached=False`
-        # with `stalled=False` on a clear jaw means.
-        print(f"  the close gets ramp + settle={motion.settle_s:g}s, command "
-              f"leading by at most {motion.max_lead_mm:g} mm")
+        # The closing leg runs until it arrives or stalls, so there is no window
+        # to run out of; what it can run out of is lead.  With a force setpoint
+        # the budget caps how far the command may lead a *stale* reading, and a
+        # jaw that cannot keep up with the schedule spends frames doing it —
+        # which is the case `reached=False, stalled=False` reports.
+        print(f"  the close ends on arrival or on a stall, command leading by at "
+              f"most {motion.max_lead_mm:g} mm "
+              f"(<= {motion.press_safety:g} x force with a setpoint)")
         print(f"  grasp speed={motion.grasp_speed_mm_s:g} mm/s  "
               f"precondition open at {open_speed:g} mm/s  "
               f"hold for {args.hold_s:g}s")

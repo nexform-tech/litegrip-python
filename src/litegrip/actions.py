@@ -27,8 +27,9 @@ ROS 2 桥接、RPC 服务、产品代码都能直接调 :attr:`LiteGrip.actions`
 :attr:`MotionConfig.press_overshoot`），好让运动靠堵转结束在限位上；但**下发的
 指令**由 :func:`clamp_to_travel` 封顶在标定限位，夹爪不可能被驱动到标定行程
 之外。「目标越位、指令不越位」是一次移动的两面：目标决定什么时候判堵转，指令
-决定夹爪能走到哪。``grasp()`` 的闭合段仍停在限位内侧
-（:attr:`MotionConfig.margin`）—— 夹取要停在工件上，不能压向空载限位。
+决定夹爪能走到哪。``grasp()`` 的闭合段瞄的也是**限位本身**（走得慢、带着设定力
+的预算）：空载时夹爪在限位上停下，夹到工件时在工件上停下，两种都是停着的状态，
+正是保力段可以接手的前提（见 :meth:`GripperActions.grasp`）。
 
 **带设定力的接近段另有一条预算**（``grasp`` 的闭合段，见
 :func:`force_approach_terms`）：上面那条 ``kp × 领先上限`` 对默认的 4 mm 上限、
@@ -97,7 +98,7 @@ class MotionConfig:
     # ── 运动 ───────────────────────────────────────────────────────────
     speed_mm_s: float = 50.0            # open/close 速度
     grasp_speed_mm_s: float = 50.0      # grasp 闭合段速度
-    margin: float = 0.05                # 距标定限位留下的行程余量比例（仅 grasp）
+    margin: float = 0.05                # limit_target 在限位内侧留的余量比例
     frame_interval: float = 0.005       # 200 Hz 斜坡帧间隔 s
     sample_interval: float = 0.05       # 20 Hz 堵转采样间隔 s
     settle_s: float = 0.3               # 斜坡后原地保目标时长 s（不判堵转）
@@ -679,11 +680,21 @@ class GripperActions:
         *,
         progress: Optional[Callable[[MoveProgress], None]] = None,
     ) -> GraspResult:
-        """夹取：先闭合到堵转（= 夹住工件），再持续输出 ``force_n`` 大小的力。
+        """夹取：先闭合到工件上（或空载到限位），再持续输出 ``force_n`` 大小的力。
 
         闭合段**带着设定力走**：它的力矩预算就是这一次夹取的力（见
         :func:`force_approach_terms`），撞上工件时压出的力矩不超过它 —— 空载时
         它才一路走到底。
+
+        **交接只在「到位或顶上东西」时发生**（``reached or stalled``）。这两条
+        在真机上是同一件事的两面：夹爪都停着。这不是保守，是唯一的正确条件 ——
+        保力段是纯力矩源，帧里没有位置项也没有速度项，把它接到一个**还在自由
+        行程里**的夹爪上，位置环一撤它就只有加速这一条路（2026-10-13 实测：
+        0.82 rad/s → 5.12 rad/s，312 mm/s，且到 ``hold_s`` 用完仍在加速）。
+        所以闭合段的终止条件也是位置而不是帧数：``ramp_steps`` 跑完只说明排程
+        跑完了，不等于夹爪到了 —— 带设定力时领先被压到零点几毫米，它追不追得上
+        排程由摩擦和读数延迟定。两条都没成立时**如实报 ``ok=False``** 并撤力
+        返回（``reached`` / ``stalled`` 都是 ``False``，``cycles=0``），不放跑。
 
         保力段是纯力矩源，没有位置指令可夹，所以它有自己的一条护栏
         （:attr:`MotionConfig.hold_runaway_rad`）：越出闭合侧标定限位太多就撤力
@@ -697,7 +708,8 @@ class GripperActions:
 
         Returns:
             :class:`GraspResult`。夹住工件时 ``stalled=True`` 且
-            ``reached=False``（压不到空载目标位置是正常的）。
+            ``reached=False``（压不到空载目标位置是正常的）。闭合段结束时夹爪
+            既没到位也没堵转时 ``ok=False``、``cycles=0`` —— 见上。
 
         Raises:
             CommandError: ``force_n`` / ``hold_s`` 不是有限数。两条都不是
@@ -713,8 +725,43 @@ class GripperActions:
                 raise CommandError(
                     f"grasp 的 {name} 不是有限数：{value!r}。拒绝下发。")
 
+        # 顺序与 ramp_to 一致：先「使能了吗」再「标定了吗」，两条都是拒绝而不
+        # 是夹紧。``target_rad`` 那条支路不走 limit_target，标定检查得自己来；
+        # 少了它，未标定时的拒绝会静默消失。
+        self._g._check_enabled()
+        gcfg = self._g.config
+        _check_calibrated(gcfg)
+
+        # 闭合段瞄的是**闭合侧标定限位本身**，不是 limit_target 在限位内侧留的
+        # 那 5% 行程。留白那几毫米是自由行程：夹爪到了点上、前面什么都没有，保
+        # 力段随后只能用纯力矩把它推过去 —— 那是真机上「末端飞快一下」的一半来
+        # 源。瞄限位时夹爪是顶在东西上或停在限位上的，交接从静止开始。
+        # ``target_rad`` 会强制 press=False，ok 与 reached 的判据都不动。
         move = self._move_to_limit(
-            "close", cfg.grasp_speed_mm_s, force_n=force, progress=progress)
+            "close", cfg.grasp_speed_mm_s,
+            target_rad=gcfg.pos_closed_rad,
+            force_n=force, progress=progress)
+        if not (move.reached or move.stalled):
+            # 既没到位也没顶上东西 —— 夹爪还在自由行程里，而位置环是此刻唯一
+            # 拦着它的东西（kp × 领先 + kd × 速度误差）。保力段的帧里这两项全
+            # 没有，交过去就是把设定力矩直接接到一个还在走的夹爪上：真机实测速
+            # 度从被速度环限住的 0.82 rad/s 跳到 5.12 rad/s，且到 hold_s 用完
+            # 还在加速。宁可如实报失败，也不交。
+            self._release(move.state.position_rad)
+            log.warning("夹取未交接：闭合段结束时夹爪既未到位也未堵转（停在 "
+                        "%+.5f rad，目标 %+.5f rad）—— 它还在自由行程里，而保力"
+                        "段没有位置项也没有速度项，交过去会一路加速。撤力返回。",
+                        move.state.position_rad, move.target_rad)
+            return GraspResult(
+                ok=False,
+                reached=move.reached,
+                stalled=move.stalled,
+                state=move.state,
+                target_rad=move.target_rad,
+                force_n=force,
+                cycles=0,
+                travel_guard=False,
+            )
         hold = self._hold_force(force, hold_s, progress=progress)
         return GraspResult(
             ok=hold.ok,
@@ -947,7 +994,9 @@ class GripperActions:
         速度前馈），边走边按位置判堵转。
 
         ``press=False``：目标是「限位内侧留 :attr:`MotionConfig.margin`」，
-        到位即成功（``grasp`` 的闭合段用这个）。
+        到位即成功。**现在没有调用方走这一条** —— ``open`` / ``close`` 走
+        ``press=True``，``grasp`` 和 ``ramp_to`` 一族给 ``target_rad``，所以
+        ``margin`` 目前只在直接调用本方法时起作用。
         ``press=True``：目标是「越过限位 :attr:`MotionConfig.press_overshoot`」，
         靠堵转停在限位上；距限位 :attr:`MotionConfig.press_zone_mm` 之内领先
         上限切到 :attr:`MotionConfig.stop_lead_mm`，接近段的力矩有界。
@@ -967,6 +1016,12 @@ class GripperActions:
         多少由领先上限和速度决定）。给了它，它的力矩预算就分给这一帧的三项（速
         度、阻尼、领先，见 :func:`force_approach_terms`），所以撞上工件时压出的
         力矩不超过这个设定值 —— ``grasp`` 的闭合段给的就是它这次的夹持力。
+
+        带设定力时段的**终止条件也换了一条**：判据是「到位或顶上」，``ramp_steps``
+        只是排程、不是它的终止条件。领先被预算压小之后夹爪追不上排程是常态，按帧
+        数收尾会在它还差几十毫米时把它交给下一段（真机实测差 21 mm），而那一段
+        如果是纯力矩的保力段，接下来就是一路加速。所以这一段的帧数只作兜底，上界
+        取「按仍然算进展的最慢速度走完全程要几帧」。
 
         ``kp`` / ``kd``：这一段的增益，``None`` = 用 :attr:`GripperConfig.kp` /
         ``.kd``。``open`` / ``close`` / ``grasp`` 不给（就是配置值），定位那几条
@@ -1050,6 +1105,18 @@ class GripperActions:
         win_s = win * sample_every * interval
         win_expect_rad = speed_rad_s * win_s
         win_thresh_rad = max(cfg.stall_delta, cfg.stall_ratio * win_expect_rad)
+        # 帧数上界。不带力的移动按排程走，排程跑完就是它的终止条件之一；带设定
+        # 力的接近段不行 —— 领先被预算压小（见 force_approach_terms），夹爪追不
+        # 追得上排程由摩擦和读数延迟定，``ramp_steps`` 到了它可能还差几十毫米。
+        # 所以这一段的帧数只是兜底，上界取「按仍然算进展的最慢速度走完全程要几
+        # 帧」：比这更慢时堵转判据必然已经在 win_s 内触发，这个上界到不了。
+        ceiling = total_steps
+        if force_n is not None:
+            floor_rad_s = win_thresh_rad / win_s if win_s > 0.0 else 0.0
+            if 0.0 < floor_rad_s < speed_rad_s:
+                ceiling = max(total_steps,
+                              int(math.ceil(abs(dist_rad) / floor_rad_s
+                                            / interval)) + settle_steps)
         # 「这一趟本来就没事可做」不判堵转。目标落在到位容差里时，夹爪原地不动
         # 就是到位，读成堵转会把一次成功的定位报成失败 —— 而它会真的发生：排程
         # 的帧数由 duration 定、不随距离缩短，间距趋近 0 时排程速度也趋近 0，
@@ -1068,7 +1135,7 @@ class GripperActions:
 
         log.info("%s %.4f → %.4f rad（%.1f mm/s，%.1f mm，%d+%d 帧，"
                  "堵转阈值 %.5f rad，领先上限 %.5f/%.5f rad，"
-                 "标定行程 [%.4f, %.4f] 封顶%s%s）",
+                 "标定行程 [%.4f, %.4f] 封顶%s%s%s）",
                  "闭合" if toward == "close" else "张开",
                  before.position_rad, target, speed_mm_s, dist_mm,
                  ramp_steps, settle_steps, win_thresh_rad,
@@ -1079,7 +1146,9 @@ class GripperActions:
                  "" if force_n is None else
                  "，力预算 %.3f Nm（kd %.2f）" % (
                      force_n * UnitConversion.N_TO_NM * cfg.press_safety,
-                     kd_frame))
+                     kd_frame),
+                 "" if ceiling == total_steps else
+                 "，帧数上界 %d（兜底，见上）" % ceiling)
 
         hist = [before.position_rad]
         stalled = False
@@ -1089,15 +1158,34 @@ class GripperActions:
         st = before
         last_cmd = before.position_rad
         last_i = 0
+        arrived_at = None                        # 首次进入顶住段的帧号（见下）
         clamped_once = False                     # 本次移动只记一条封顶 debug 日志
 
-        for i in range(1, total_steps + 1):
+        for i in range(1, ceiling + 1):
             st = g.get_state(wait=False)
             pos = st.position_rad
-            if i <= ramp_steps:
-                q_sched = before.position_rad + dist_rad * (i / ramp_steps)
+            # 排程相位。不带力时按计时切 —— ``ramp_steps`` 就是排程跑完的那一
+            # 帧。带设定力时不行：领先被预算压小，夹爪落在排程后面是常态，而
+            # ``ramp_steps`` 到了不等于它到了，按计时切会在它还在自由行程时就
+            # 判它进了保压段（不再判堵转、撤掉速度前馈）。所以这一段由**位置**
+            # 说：没到目标就还在行进段，到了才进保压。ramp_steps 之后 q_sched
+            # 停在 target，下面两种写法一致。
+            arrived = abs(pos - target) < cfg.reach_tol
+            in_ramp = i <= ramp_steps or (force_n is not None and not arrived)
+            if in_ramp:
+                q_sched = before.position_rad + dist_rad * min(1.0, i / ramp_steps)
                 dq = sign * speed_rad_s
             else:
+                # 到位后的顶住段（``q_sched = target``、``dq = 0``）：把还在动
+                # 的夹爪收住。带设定力时这段同时是**交接前的静止窗口** —— 顶够
+                # ``settle_steps`` 帧之后位置环的任务就完了，保力段从静止接手
+                # （真机事故就是没等这一段，把 0.82 rad/s 的夹爪直接交给了纯
+                # 力矩源）。不带力时下面这个 break 到不了：循环上界就是
+                # ramp_steps + settle_steps。
+                if arrived_at is None:
+                    arrived_at = i
+                if i - arrived_at >= settle_steps:
+                    break
                 q_sched = target                   # 保压：原地顶住目标
                 dq = 0.0
             # 压紧段判据按 q_sched 算：斜坡上贴近限位、保压段越过限位，
@@ -1119,7 +1207,7 @@ class GripperActions:
                           max(gcfg.pos_closed_rad, gcfg.pos_open_rad))
             last_i = i
 
-            if i % sample_every and i != total_steps:
+            if i % sample_every and i != ceiling:
                 continue
             # 本采样的实测速度（rad/s）：用于堵转力矩保护的「有没有跟上」佐证。
             rate_rad_s = abs(pos - prev_sample_pos) / cfg.sample_interval
@@ -1131,7 +1219,7 @@ class GripperActions:
                 progress(MoveProgress(
                     phase="move",
                     i=i,
-                    total_steps=total_steps,
+                    total_steps=ceiling,
                     cmd_rad=last_cmd,
                     pos_rad=pos,
                     delta_rad=hist[-1] - hist[-2],
@@ -1145,7 +1233,7 @@ class GripperActions:
             # 越位量（5% 行程）往往短于一个采样窗口，只在斜坡段判会永远判不到，
             # 动作得白跑完保压段。
             if (judge_stall and win_delta is not None
-                    and (press or i <= ramp_steps)
+                    and (press or in_ramp)
                     and win_delta < win_thresh_rad):
                 stalled = True
                 log.info("堵转：最近 %d 次采样(%.2f s)净位移仅 %.5f rad "

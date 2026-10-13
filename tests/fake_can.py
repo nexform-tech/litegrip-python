@@ -79,8 +79,18 @@ class FakeMotor:
                  limit_lo: Optional[float] = None,
                  limit_hi: Optional[float] = None,
                  yield_rad_s: float = 0.0, yield_tau_nm: float = 0.0,
-                 creep_rad_s_per_nm: float = 0.0):
-        self.pos = pos
+                 creep_rad_s_per_nm: float = 0.0,
+                 report_lag_ticks: int = 0):
+        # 读数延迟（帧）。真机上 ``get_state(wait=False)`` 拿的是缓存读数，可能
+        # 落后几帧；而力控接近段的指令是 ``min(排程, 读数 + 领先上限)``，领先只
+        # 有零点几毫米时，``速度 × 延迟`` 就把它吃光了 —— 夹爪于是推不动排程。
+        # 默认 0：不延迟，别的用例逐位不变。
+        self.report_lag_ticks = max(0, int(report_lag_ticks))
+        # 环形缓冲：最近 ``lag + 1`` 个物理位置，末位是当前值。``pos`` 是带
+        # setter 的属性，写它就会推进来 —— 测试里直接改 ``motor.pos`` 也走这条
+        # 路，否则上报值会停在上一次 ``step`` 的快照上。
+        self._hist: List[float] = [pos] * (self.report_lag_ticks + 1)
+        self._pos = pos
         self.vel = 0.0
         self.tau = 0.0
         self.err = err
@@ -105,13 +115,29 @@ class FakeMotor:
         # 0xFE 把当下读数记成 0，所以置零时设成当时的 pos。
         self.zero_offset = 0.0
 
+    @property
+    def pos(self) -> float:
+        """物理位置（真值，不是上报值）。"""
+        return self._pos
+
+    @pos.setter
+    def pos(self, value: float) -> None:
+        self._pos = value
+        self._hist.append(value)
+        while len(self._hist) > self.report_lag_ticks + 1:
+            self._hist.pop(0)
+
     def set_zero(self) -> None:
         """把当前读数记成 0（模拟 0xFE）—— 不改物理位置，只改上报偏置。"""
         self.zero_offset = self.pos
 
     def reported_pos(self) -> float:
-        """上报位置（可量化 —— 模拟闭合侧约 0.0103 rad 的粘滑死区）。"""
-        p = self.pos - self.zero_offset
+        """上报位置（可量化、可滞后 —— 模拟真机的读数路径）。
+
+        ``sticky_rad`` 模拟闭合侧约 0.0103 rad 的粘滑死区；``report_lag_ticks``
+        模拟缓存读数落后若干帧。两者都为 0 时就是当下的物理位置，逐位不变。
+        """
+        p = self._hist[0] - self.zero_offset
         if self.sticky_rad > 0:
             return round(p / self.sticky_rad) * self.sticky_rad
         return p
@@ -166,13 +192,15 @@ class FakeLiteGripCAN:
                  limit_lo: Optional[float] = None,
                  limit_hi: Optional[float] = None,
                  yield_rad_s: float = 0.0, yield_tau_nm: float = 0.0,
-                 creep_rad_s_per_nm: float = 0.0):
+                 creep_rad_s_per_nm: float = 0.0,
+                 report_lag_ticks: int = 0):
         self.motor = FakeMotor(pos=pos, block_rad=block_rad,
                                sticky_rad=sticky_rad, err=err,
                                limit_lo=limit_lo, limit_hi=limit_hi,
                                yield_rad_s=yield_rad_s,
                                yield_tau_nm=yield_tau_nm,
-                               creep_rad_s_per_nm=creep_rad_s_per_nm)
+                               creep_rad_s_per_nm=creep_rad_s_per_nm,
+                               report_lag_ticks=report_lag_ticks)
         self.frames: List[Frame] = []
         self.initialize_results = list(initialize_results or [])
         self.initialize_calls = 0
@@ -292,6 +320,7 @@ def make_gripper(
     yield_rad_s: float = 0.0,
     yield_tau_nm: float = 0.0,
     creep_rad_s_per_nm: float = 0.0,
+    report_lag_ticks: int = 0,
 ):
     """造一个「已连接、已使能、已标定」的 LiteGrip，底层换成 :class:`FakeLiteGripCAN`。
 
@@ -311,6 +340,10 @@ def make_gripper(
     ``creep_rad_s_per_nm`` 让夹爪在**纯前馈力矩**下被推着走 —— 保力帧（``kp=0``）
     在默认模型里一点不动，而真机上闭合侧没有限位时恒定力矩会把夹爪一路推走。
     配合 ``stops=False`` 复现那条失控路径，用来验证力控段的位置护栏。
+
+    ``report_lag_ticks`` 让上报位置落后若干帧 —— 真机上 ``get_state(wait=False)``
+    拿的是缓存读数。力控接近段的指令是 ``min(排程, 读数 + 领先上限)``，领先只有
+    零点几毫米时延迟就把它吃光了，夹爪因此推不动排程。默认 0，不影响别的用例。
 
     ``start_rad`` 默认停在张开侧（两种装法各自的那一端）。
 
@@ -336,7 +369,8 @@ def make_gripper(
                            limit_hi=LIMIT_HI_RAD if stops else None,
                            yield_rad_s=yield_rad_s,
                            yield_tau_nm=yield_tau_nm,
-                           creep_rad_s_per_nm=creep_rad_s_per_nm)
+                           creep_rad_s_per_nm=creep_rad_s_per_nm,
+                           report_lag_ticks=report_lag_ticks)
     g._can = fake
     g._connected = True
     g._enabled = True
