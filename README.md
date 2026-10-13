@@ -139,7 +139,7 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 | `open(speed_mm_s=None, *, progress=None)` → `MoveResult` | Ramps toward the calibrated open-side stop. With `GripperConfig.work_stroke_mm` set it stops at that opening instead — the shipped calibration sets `80.0` against the unit's 85 mm of travel, so a plain `open()` ends 5 mm short of the open end. |
 | `close(speed_mm_s=None, *, progress=None)` → `MoveResult` | The same, toward the closed side. `work_stroke_mm` is an open-side number and does not change where a close ends. |
 | `home()` → `MoveResult` | Ramps to the calibrated closed position. |
-| `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | Closes until it stalls (i.e. grips), then ramps to and holds `force_n` N. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. `hold_s=0` holds until a fault, the runaway watch, or Ctrl+C. `force_n=None` uses `MotionConfig.force_n` (20 N). |
+| `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | Closes onto the object — or onto the closed-side calibrated stop if there is nothing there — then ramps to and holds `force_n` N. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. The hold takes over only once the jaw is stopped: it is `stalled=True` (something is between the jaws) or `reached=True` (the jaws closed empty). `hold_s=0` holds until a fault, the runaway watch, or Ctrl+C. `force_n=None` uses `MotionConfig.force_n` (20 N). |
 | `set_force(force_n, duration=0.3)` → `bool` | Holds `force_n` where the jaws already are, for `duration` seconds. |
 | `goto(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | Ramp to a position in millimetres. |
 | `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | The same in radians. `dq_target` and `tau_feedforward` must be 0: the ramp derives the velocity feed-forward from its own schedule, so both are refused with `CommandError` rather than ignored. |
@@ -256,7 +256,17 @@ What it *means*, and what to check, is per action:
   of the empty-jaw target is the point of gripping.
 - **`grasp()` on an empty gripper** can return `reached=True` while the jaw sits about
   `0.010 rad` short of `target_rad` — the close-side stick-slip dead band, which is why
-  `reach_tol` defaults to `0.02`.
+  `reach_tol` defaults to `0.02`. `target_rad` is the closed-side calibrated stop itself.
+
+A fourth combination is a failure, and new in this version:
+
+- **`grasp()` with `ok=False, reached=False, stalled=False`** means the closing leg ran out of
+  frames without reaching the stop and without stalling — the jaw is still in free travel. The
+  hold is *not* entered: its frames carry no position and no velocity term, so handing a moving
+  jaw over to them leaves the feed-forward torque as the only thing acting on it, and the jaw
+  accelerates until the runaway watch releases it. The call releases in place instead and reports
+  `cycles=0`. Nothing was gripped. If you see this, the closing leg is being starved — a stale
+  state read, or friction the mechanism's own budget cannot overcome.
 
 Stalling far from the limit gives `ok=False`: something blocked the travel. The diagnostic fields
 — `final_cmd_rad`, `steps`, `state` — are what you log when it is false.
@@ -310,7 +320,7 @@ with LiteGrip("can0") as gripper:
 | `force_ramp_n_s` | `20.0` | rate the held force climbs to its setpoint, N/s |
 | `hold_interval` | `0.2` | force-hold slice length, seconds |
 | `hold_runaway_rad` | `0.05` | past the closed stop by this much, the force hold drops the torque and stops |
-| `margin` | `0.05` | fraction of travel kept in reserve from the stop, used by `grasp` only |
+| `margin` | `0.05` | fraction of travel kept in reserve from the stop by the `limit_target` helper; no shipped call reaches it |
 | `max_lead_mm` | `4.0` | cap on how far the command may lead the measured position, on moves that carry no force setpoint |
 | `stop_lead_mm` | `0.7` | the same cap on the approach to a stop, so the pressing torque stays bounded |
 | `press_safety` | `0.9` | fraction of the setpoint a force-carrying approach may spend |

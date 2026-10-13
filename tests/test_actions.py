@@ -5,11 +5,11 @@ from __future__ import annotations
 import unittest
 
 import _sdkpath  # noqa: F401
-from litegrip import (CommandError, GraspResult, GripperConfig, LiteGrip,
-                      MotionConfig, UnitConversion, clamp_to_travel,
+from litegrip import (CommandError, GraspResult, GripperConfig, GripperState,
+                      LiteGrip, MotionConfig, UnitConversion, clamp_to_travel,
                       closing_travel_excursion_rad, force_approach_terms,
                       limit_target, press_target, work_limit_target)
-from litegrip.actions import GripperActions
+from litegrip.actions import GripperActions, MoveResult
 
 from fake_can import (DT, POS_CLOSED_RAD, POS_OPEN_RAD, RAD_TO_MM,
                       FakeLiteGripCAN, make_gripper, planned_steps, tick_clock)
@@ -885,6 +885,105 @@ class TestGrasp(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertEqual(res.cycles, 1)            # 第一片之后就被叫停
         self.assertEqual(res.state.error_code, 0x9)
+
+
+class TestGraspHandsOverOnlyOnContact(unittest.TestCase):
+    """11b / 11c：闭合段只在**到位**或**顶上东西**时才交给保力段。
+
+    真机事故（2026-10-13，``grasp(10.0, hold_s=1.0)`` 空载）：闭合段在 303 帧的
+    预算里只走到 25.4 mm，离目标还差 21 mm，``reached=False``、``stalled=False``
+    —— 而 ``grasp()`` **无条件**把夹爪交给了 ``_hold_force``。保力帧里既没有位置
+    项也没有速度项，夹爪速度当场从被速度环限住的 0.82 rad/s 跳到 5.12 rad/s，
+    到 ``hold_s`` 用完仍在加速。这就是「靠近末端时飞快地移动一下」。
+
+    闭合段为什么走不到：带设定力时 :func:`force_approach_terms` 把领先上限压到
+    0.25 mm，而指令是 ``min(排程, 读数 + 领先上限)`` —— 落后量一超过领先上限，
+    指令就被钉在**过期的**读数旁边，排程再也推不动夹爪。假件以前没有读数延迟，
+    0.25 mm 的领先足够它跟上排程，所以这条路径在测试里永远是绿的。下面用
+    ``report_lag_ticks`` 把这一维补上：3 帧 × 0.82 rad/s × 5 ms ≈ 0.012 rad，
+    正好是那个领先上限的三倍。
+    """
+
+    #: 读数延迟帧数。0 时假件与改动前逐位一致（见 :class:`FakeMotor`）。
+    LAG_TICKS = 3
+
+    def _grasp(self, **kw):
+        motion = MotionConfig(sleep_fn=lambda _: None,
+                              monotonic_fn=tick_clock(0.1))
+        g, fake = make_gripper(stops=True, report_lag_ticks=self.LAG_TICKS,
+                               motion=motion, **kw)
+        return g, fake, g.grasp(force_n=5.0, hold_s=0.2)
+
+    @staticmethod
+    def _close_frames(fake):
+        """闭合段的帧 —— 保力帧只发前馈，用 ``tau_ff`` 把两段切开。"""
+        return [f for f in fake.frames if f.tau_ff == 0.0 and f.kp != 0.0]
+
+    def test_a_stale_reading_no_longer_strands_the_close_leg(self):
+        """读数落后三帧时空载夹取照样到限位，闭合段跑得比排程还长。"""
+        g, fake, res = self._grasp()
+        _t, ramp_steps, _s, _tot = planned_steps(
+            g, g.motion_config.grasp_speed_mm_s)
+
+        self.assertTrue(res.reached, res)
+        self.assertFalse(res.stalled, res)
+        self.assertTrue(res.ok, res)
+        self.assertAlmostEqual(fake.motor.pos, res.target_rad,
+                               delta=g.motion_config.reach_tol)
+        # 领先被读数延迟吃掉一半，夹爪追不上排程 —— 所以闭合段的帧数**超过**排程
+        # 帧数。旧代码的预算正是 ``ramp_steps + settle_steps``，到点即收尾，夹爪
+        # 停在半路（实测差 30 mm）而 reached / stalled 都是 False。
+        self.assertGreater(len(self._close_frames(fake)), ramp_steps)
+
+    def test_the_close_leg_is_at_rest_when_the_hold_takes_over(self):
+        """交接发生在静止上：闭合段收尾时夹爪已经停在限位上、不再走。
+
+        旧行为是交接那一刻夹爪还在 0.82 rad/s 上飞。保力帧没有速度项，接过去
+        就是一路加速 —— 真机上量到 5.12 rad/s。
+        """
+        g, fake, res = self._grasp()
+        close = self._close_frames(fake)
+        speed_rad_s = g.motion_config.grasp_speed_mm_s / g.config.rad_to_mm
+
+        self.assertTrue(res.reached, res)
+        self.assertGreater(len(close), 3)
+        for prev, cur in zip(close[-3:], close[-2:]):
+            v = abs(cur.pos_after - prev.pos_after) / DT
+            self.assertLess(v, 0.05 * speed_rad_s,
+                            "交接前夹爪还在 %.4f rad/s 上飞（指令 %.4f）"
+                            % (v, speed_rad_s))
+        self.assertAlmostEqual(close[-1].pos_after, res.target_rad,
+                               delta=g.motion_config.reach_tol)
+
+    def test_neither_reached_nor_stalled_is_not_handed_over(self):
+        """闸门本身：闭合段既没到位也没堵转 —— 不交接，一帧保力帧都不发。
+
+        把 ``_move_to_limit`` 换成一个固定结果来触发这条路径（真机上它对应
+        「夹爪顶着一路缓让的软工件慢慢爬，爬到帧数用完」那一类）。
+        """
+        motion = MotionConfig(sleep_fn=lambda _: None,
+                              monotonic_fn=tick_clock(0.1))
+        g, fake = make_gripper(stops=True, motion=motion)
+        stranded = POS_OPEN_RAD + 0.2
+        g.actions._move_to_limit = lambda *a, **kw: MoveResult(
+            ok=False, reached=False, stalled=False,
+            state=GripperState(position_rad=stranded),
+            target_rad=POS_CLOSED_RAD, limit_rad=POS_CLOSED_RAD,
+            final_cmd_rad=stranded, steps=303)
+
+        res = g.grasp(force_n=5.0, hold_s=0.2)
+
+        self.assertFalse(res.ok, res)
+        self.assertFalse(res.reached, res)
+        self.assertFalse(res.stalled, res)
+        self.assertEqual(res.cycles, 0)
+        self.assertEqual(res.force_n, 5.0)          # 设定值照实报出来
+        # 「没交接」的硬判据：一帧前馈都没有。撤力帧是 ``kp=kd=tau=0``，所以
+        # 不能用 kp 判 —— 只有 ``tau_ff`` 能把保力帧和它们分开。
+        self.assertTrue(fake.frames, "一帧都没发")
+        self.assertTrue(all(f.tau_ff == 0.0 for f in fake.frames),
+                        "交接了：发出了前馈力矩帧")
+        self.assertTrue(any(f.kp == 0.0 for f in fake.frames), "没有撤力帧")
 
 
 class TestForceHoldIsTorqueOnly(unittest.TestCase):

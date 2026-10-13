@@ -133,7 +133,7 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 | `open(speed_mm_s=None, *, progress=None)` → `MoveResult` | 爬坡走向标定的张开侧限位。若 `GripperConfig.work_stroke_mm` 有值，则停在那段行程处 —— 出厂标定设的是 `80.0`，对着这台机器 85 mm 的行程，所以裸调 `open()` 会在距张开端 5 mm 处停下。 |
 | `close(speed_mm_s=None, *, progress=None)` → `MoveResult` | 一样，方向朝闭合侧。`work_stroke_mm` 是张开侧的数字，不改变 `close()` 的落点。 |
 | `home()` → `MoveResult` | 爬坡回到标定的闭合位置。 |
-| `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | 闭到堵转（即夹住），再爬到 `force_n` N 并保持。闭合段就把 `force_n` 当力矩预算，所以顶到工件时压得不会比设定值更狠。`hold_s=0` 表示保持到故障、失控监视触发或 Ctrl+C。`force_n=None` 用 `MotionConfig.force_n`（20 N）。 |
+| `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | 闭到工件上（中间没东西就闭到闭合侧标定限位），再爬到 `force_n` N 并保持。闭合段就把 `force_n` 当力矩预算，所以顶到工件时压得不会比设定值更狠。保力只在爪子**停下来**之后接手：`stalled=True`（爪子间夹着东西）或 `reached=True`（空爪闭到底）。`hold_s=0` 表示保持到故障、失控监视触发或 Ctrl+C。`force_n=None` 用 `MotionConfig.force_n`（20 N）。 |
 | `set_force(force_n, duration=0.3)` → `bool` | 在爪子**当前**位置保持 `force_n`，持续 `duration` 秒。 |
 | `goto(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | 爬坡走到毫米目标。 |
 | `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | 一样的，单位 rad。`dq_target` 与 `tau_feedforward` 必须是 0：速度前馈由斜坡按自己的排程给出，所以这两个值一律拒绝并抛 `CommandError`，不是静默忽略。 |
@@ -238,7 +238,16 @@ with LiteGrip("can0") as gripper:
 - **夹着东西的 `grasp()`** 返回 `stalled=True, reached=False`，`ok=True`。没走到空爪时的目标
   位置，正是夹住的定义。
 - **空爪 `grasp()`** 可能返回 `reached=True`，而爪子离 `target_rad` 还差约 `0.010 rad` ——
-  这是闭合侧的粘滑死区，也是 `reach_tol` 默认为 `0.02` 的原因。
+  这是闭合侧的粘滑死区，也是 `reach_tol` 默认为 `0.02` 的原因。`target_rad` 就是闭合侧
+  标定限位本身。
+
+第四种组合是失败，也是这一版新增的：
+
+- **`grasp()` 返回 `ok=False, reached=False, stalled=False`**，意思是闭合段帧数用完了，既没
+  走到限位也没堵转 —— 爪子还在自由行程里。这一路**不会**进保力段：保力帧既没有位置项也没有
+  速度项，把一个还在走的爪子交给它们，压在它身上的就只剩前馈力矩，它会一路加速直到失控监视
+  撤力。此时调用改为原地撤力，报 `cycles=0`。什么也没夹住。见到它就说明闭合段被饿着了 ——
+  读数过期，或者机构自身预算吃不掉的摩擦。
 
 在离限位很远的地方堵转，才会给 `ok=False`：有东西挡住了行程。为假时该记的，就是那几个诊断
 字段 —— `final_cmd_rad`、`steps`、`state`。
@@ -290,7 +299,7 @@ with LiteGrip("can0") as gripper:
 | `force_ramp_n_s` | `20.0` | 保力爬到设定值的速率，N/s |
 | `hold_interval` | `0.2` | 保力段每片的长度，秒 |
 | `hold_runaway_rad` | `0.05` | 越过闭合限位这么多，保力段就撤力矩并停止 |
-| `margin` | `0.05` | 离限位保留的行程比例，只被 `grasp` 使用 |
+| `margin` | `0.05` | 离限位保留的行程比例，由 `limit_target` 这个辅助函数使用；目前没有调用方走到它 |
 | `max_lead_mm` | `4.0` | 不带力设定值的运动里，指令允许领先实测位置的上限 |
 | `stop_lead_mm` | `0.7` | 接近限位时的同一上限，用来压住压紧力矩 |
 | `press_safety` | `0.9` | 带力的接近段最多能花掉设定值的多少 |
