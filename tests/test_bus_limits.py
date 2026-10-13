@@ -3,7 +3,7 @@
 用真 ``LiteGripCAN``，只把 controller / motor 换成假的 —— 引擎那批测试底下装的
 是 ``FakeLiteGripCAN``，它**绕过**这一层，所以「非有限值、超量程力矩」这一类判定
 必须在这里单独验。这一层是所有下发的必经之路：引擎的每一帧、``goto_rad`` 的整段
-流、``set_force`` 的爬升，最后都落在 ``control_mit`` / ``control_mit_stream``。
+流、teleop 的连续帧，最后都落在 ``control_mit`` / ``control_mit_stream``。
 
 判据是两条：每个字段必须是有限数；力矩不得超出本型号的帧量程。位置、速度、增益的
 **超量程**仍由编码器钳位（那是既定语义，见 ``test_protocol.py``），边界不动它们 ——

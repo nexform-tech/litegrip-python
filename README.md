@@ -140,7 +140,6 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 | `close(speed_mm_s=None, *, progress=None)` → `MoveResult` | The same, toward the closed side. `work_stroke_mm` is an open-side number and does not change where a close ends. |
 | `home()` → `MoveResult` | Ramps to the calibrated closed position. |
 | `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | Closes onto the object — or onto the closed-side calibrated stop if there is nothing there — then ramps to and holds `force_n` N. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. The hold takes over only once the jaw is stopped: it is `stalled=True` (something is between the jaws) or `reached=True` (the jaws closed empty). `hold_s=0` holds until a fault, the runaway watch, or Ctrl+C. `force_n=None` uses `MotionConfig.force_n` (20 N). |
-| `set_force(force_n, duration=0.3)` → `bool` | Holds `force_n` where the jaws already are, for `duration` seconds. |
 | `goto(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | Ramp to a position in millimetres. |
 | `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | The same in radians. `dq_target` and `tau_feedforward` must be 0: the ramp derives the velocity feed-forward from its own schedule, so both are refused with `CommandError` rather than ignored. |
 | `move_to(target_rad, kp=None, kd=None, tau_feedforward=0.0, duration=1.0)` → `MoveResult` | The same as `goto_rad`, with a longer default `duration`. |
@@ -165,10 +164,17 @@ it. A NaN or ±inf position is refused with `CommandError`, never clamped.
 
 ### Gripping and force
 
-`grasp(force_n, hold_s)` closes, then holds; `set_force(force_n, duration)` holds wherever the
-jaws already are. Both stream frames with `kp = kd = 0`, so the drive's output *is* the
-feed-forward torque `force_n × 0.1 Nm`. That is what makes the force independent of the workpiece:
-as a soft object yields, the jaws follow it and the grip stays at the setpoint.
+`grasp(force_n, hold_s)` is the only way to press with a force. It closes first and holds second,
+and the hold frames carry `kp = kd = 0`, so the drive's output *is* the feed-forward torque
+`force_n × 0.1 Nm`. That is what makes the force independent of the workpiece: as a soft object
+yields, the jaws follow it and the grip stays at the setpoint.
+
+**A force is only meaningful against something.** There is no call that applies a force at the
+current position, and that is deliberate. Such a call cannot tell whether anything is between the
+jaws, and the hold frames give the drive no position or velocity error to work against — with
+nothing there, the torque is the only acting force and the jaws accelerate. `grasp()` avoids it
+by construction: the closing leg runs on the position ramp, so it arrives at the object (or at
+the closed-side stop) and stops there before the hold takes over.
 
 - **The force is approximate.** `1 N = 0.1 Nm` is marked approximate in the SDK, and the real
   clamping force also depends on your finger geometry. Treat `force_n` as a repeatable setting,
@@ -182,9 +188,9 @@ as a soft object yields, the jaws follow it and the grip stays at the setpoint.
 
 **The runaway watch.** The hold frames carry no position error, so no position limit can act on
 them; the only lever is removing the torque. Once the measured position is `hold_runaway_rad`
-(`0.05 rad`, about 3 mm) past the closed-side calibrated stop, `grasp()` and `set_force` stream
-zero-torque release frames and return — `GraspResult.travel_guard` set, or `False` from
-`set_force`. Only the closing side is checked, because that is the side the feed-forward pushes.
+(`0.05 rad`, about 3 mm) past the closed-side calibrated stop, `grasp()` streams zero-torque
+release frames and returns with `GraspResult.travel_guard` set. Only the closing side is checked,
+because that is the side the feed-forward pushes.
 This is a runaway detector, not an accuracy bound: raise `hold_runaway_rad` only if a jaw that is
 genuinely holding something is being released. The watch is off until the config is calibrated.
 
@@ -502,7 +508,7 @@ the config as their first argument rather than being called on the gripper.
 | `HardwareError` from `enable()` | The motor never reported `err == 1`. Check power, then `clear_fault()`. |
 | The jaws move the wrong way | The unit is reverse-mounted, not normal. Construct with `mount="reverse"`. |
 | `close()` returns `ok=False` | The jaw parked further than `stop_tol` from the limit. The gap comes from `zero()` probing harder than `close()` presses, so raising `stop_lead_mm` barely moves it — check that the calibration describes the real travel, and raise `stop_tol` if the unit is genuinely parked on the stop. |
-| `travel_guard` is set, or `set_force` returns `False` | The runaway watch tripped: the jaw walked past the closed-side stop. Check the calibration describes the real travel, and that nothing has removed the stop. |
+| `travel_guard` is set | The runaway watch tripped: the jaw walked past the closed-side stop while a force was held. Check the calibration describes the real travel, and that nothing has removed the stop. |
 | A `can1` unit's `load_calibration()` returns `False` | A no-argument load reads the factory file, which declares `channel: can0`, so this unit has no implicit source. Give it a template, or name its own file with `path=` or `LITEGRIP_CALIB`. |
 | The held force sags below the setpoint | You changed the hold gains, or something is back-driving the jaws faster than the feed-forward. `hold_kp` / `hold_kd` are deprecated and ignored. |
 | `import litegrip` loads older code than the checkout you are reading | An installed copy does not update itself across `git pull`. Check `litegrip.__file__`, or `pip install -e .` in the checkout. |
@@ -524,9 +530,9 @@ the config as their first argument rather than being called on the gripper.
 - **`write_zero()` is irreversible.** It writes an encoder offset into the motor's flash.
 - **Sustained pressing heats the coil.** `open` and `close` hold against the limit for the settle
   phase every time, so check the coil temperature if they run back to back.
-- **A non-finite value is refused, never clamped.** `goto`, `goto_rad`, `move_at_speed*`, `grasp`
-  and `set_force` raise `CommandError` for a NaN or ±inf argument, and the CAN boundary refuses
-  any such field of a frame before it can become bytes.
+- **A non-finite value is refused, never clamped.** `goto`, `goto_rad`, `move_at_speed*` and
+  `grasp` raise `CommandError` for a NaN or ±inf argument, and the CAN boundary refuses any such
+  field of a frame before it can become bytes.
 - **`disconnect()` disables the motor by default**, so a process that dies does not leave the motor
   holding torque. Set `disable_on_disconnect=False` only when something else keeps the gripper
   under control.

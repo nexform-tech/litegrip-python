@@ -482,7 +482,7 @@ class TestGotoRefusesWhatTheRampCannotHonour(unittest.TestCase):
         self.assertIn("tau_feedforward", str(ctx.exception))
         self.assertEqual(fake.frames, [])
         # 要出力走这条路，不是往定位帧里塞力矩
-        self.assertIn("set_force", str(ctx.exception))
+        self.assertIn("grasp", str(ctx.exception))
 
 
 class TestMoveAtSpeedUsesTheSameRamp(unittest.TestCase):
@@ -1038,21 +1038,6 @@ class TestForceHoldIsTorqueOnly(unittest.TestCase):
             self.assertEqual(f.kp, 0.0)
             self.assertEqual(f.kd, 0.0)
 
-    def test_set_force_carries_no_gains(self):
-        g, fake = self._yielding_gripper()
-        fake.motor.pos = self.OBJECT_RAD            # 已经夹在工件上
-        # 时长给够，让爬升能落到设定值（力矩从 0 起步要 20 N ÷ 20 N/s = 1.0 s）
-        g.set_force(20.0, duration=1.0)
-
-        self.assertTrue(fake.frames)
-        for f in fake.frames:
-            self.assertEqual(f.kp, 0.0)
-            self.assertEqual(f.kd, 0.0)
-        # 从飞行力矩（这里恒为 0）按固定速率爬，末帧正好落在 2.0 Nm
-        self.assertAlmostEqual(fake.frames[0].tau_nm, 0.01, places=9)
-        self.assertAlmostEqual(fake.frames[-1].tau_nm, 2.0, places=6)
-        self.assertGreater(fake.motor.pos, self.OBJECT_RAD)     # 工件确实让位了
-
 
 class TestHeldForceRampsToSetpoint(unittest.TestCase):
     """保力力矩按固定速率（force_ramp_n_s，N/s）从飞行力矩爬到设定值。
@@ -1313,159 +1298,6 @@ class TestHoldTravelGuard(unittest.TestCase):
 
         self.assertTrue(hold.ok, hold)
         self.assertFalse(hold.guarded, hold)
-
-
-class TestSetForceRampsToo(unittest.TestCase):
-    """``set_force`` 是另一条下发恒定前馈力矩的保力路径，同样按时率爬。
-
-    ``duration`` 是**爬到设定值之后**继续保力的时间，不含爬升本身，所以调用的
-    墙钟是 ``climb + duration``；已经在设定值上时爬升为 0 帧，调用就是 ``duration``。
-    """
-
-    def test_the_climb_starts_from_the_torque_in_flight_and_lands(self):
-        g, fake = make_gripper()
-        g.motion_config = MotionConfig(sleep_fn=lambda _: None,
-                                       monotonic_fn=tick_clock(0.1))
-        fake.motor.tau = 1.0                         # 交接时飞行力矩 1.0 Nm
-        g.set_force(20.0, duration=1.0)
-
-        step = 20.0 * DT * 0.1                       # 0.01 Nm/帧
-        taus = [f.tau_ff for f in fake.frames]
-        self.assertAlmostEqual(taus[0], 1.0 + step, places=9)
-        # 从 1.0 爬到 2.0 要 100 帧；之后一直停在 2.0
-        self.assertAlmostEqual(taus[99], 2.0, places=9)
-        for tau in taus[99:]:
-            self.assertAlmostEqual(tau, 2.0, places=9)
-        for f in fake.frames:
-            self.assertEqual(f.kp, 0.0)
-            self.assertEqual(f.kd, 0.0)
-
-    def test_the_call_ramps_then_holds_for_duration(self):
-        # duration 保的是**爬升之后**的时间：先把 1.0 Nm 爬 100 帧到设定值，
-        # 再到 20 N 上保 0.3 s（60 帧）。墙钟因此是 climb + duration。
-        g, fake = make_gripper()
-        g.motion_config = MotionConfig(sleep_fn=lambda _: None,
-                                       monotonic_fn=tick_clock(0.1))
-        fake.motor.tau = 1.0                         # 交接时飞行力矩 1.0 Nm
-        g.set_force(20.0, duration=0.3)
-
-        taus = [f.tau_ff for f in fake.frames]
-        climb = 100                                  # 1.0 Nm ÷ 0.01 Nm/帧
-        hold = int(round(0.3 / DT))                  # 60 帧
-        self.assertEqual(len(taus), climb + hold)
-        # 爬升最后一帧正好落到设定值（2.0 Nm），其后每一帧都停在上面 ——
-        # 设定值上的帧数 = 1 帧落点 + duration 的保力帧
-        first_at = taus.index(2.0)
-        self.assertEqual(first_at, climb - 1)
-        self.assertTrue(all(t == 2.0 for t in taus[first_at:]))
-        self.assertEqual(len(taus[first_at:]), hold + 1)
-
-    def test_a_call_already_at_the_setpoint_is_just_the_hold(self):
-        # 飞行力矩已在设定值上（或已越过）：没有可爬的，爬升 0 帧，调用就是
-        # duration —— 不能为爬升多补一帧。
-        for in_flight in (2.0, 3.0):
-            with self.subTest(in_flight=in_flight):
-                g, fake = make_gripper()
-                g.motion_config = MotionConfig(
-                    sleep_fn=lambda _: None, monotonic_fn=tick_clock(0.1))
-                fake.motor.tau = in_flight
-                g.set_force(20.0, duration=0.3)
-
-                taus = [f.tau_ff for f in fake.frames]
-                self.assertEqual(len(taus), int(round(0.3 / DT)))    # 60 帧
-                for tau in taus:
-                    self.assertAlmostEqual(tau, 2.0, places=9)
-
-    def test_duration_zero_still_completes_the_climb(self):
-        # duration=0 表示「爬到设定值就返回」：爬升照样要爬完，只是不保力。
-        g, fake = make_gripper()
-        g.motion_config = MotionConfig(sleep_fn=lambda _: None,
-                                       monotonic_fn=tick_clock(0.1))
-        fake.motor.tau = 1.0
-        g.set_force(20.0, duration=0.0)
-
-        taus = [f.tau_ff for f in fake.frames]
-        self.assertEqual(len(taus), 100)             # 全是爬升帧，没有保力帧
-        self.assertAlmostEqual(taus[0], 1.01, places=9)
-        self.assertAlmostEqual(taus[-1], 2.0, places=9)
-
-    def test_it_polls_once_per_emitted_frame(self):
-        # 换掉 control_mit_stream 时不能把每帧的 poll 也丢了 —— 那是整段调用里唯一
-        # 收状态帧的地方（control_mit → poll → sleep）。假总线只数 poll 次数。
-        g, fake = make_gripper()
-        g.motion_config = MotionConfig(sleep_fn=lambda _: None,
-                                       monotonic_fn=tick_clock(0.1))
-        g.set_force(20.0, duration=0.2)              # 200 帧爬升 + 40 帧保力
-
-        self.assertEqual(len(fake.frames), 240)
-        self.assertEqual(fake.poll_calls, len(fake.frames))
-
-
-class TestSetForceTravelGuard(unittest.TestCase):
-    """``set_force`` 走的是自己的帧循环（不共用保力段），但护栏是同一条。
-
-    它和 ``grasp`` 的保力段一样是纯力矩源，也同样有一条失控路径。判据是
-    :func:`closing_travel_excursion_rad`，触发动作也一样：撤力、返回 ``False``。
-    """
-
-    FORCE_N = 20.0
-    CREEP = 0.05
-
-    def _motion(self, **kw):
-        return MotionConfig(sleep_fn=lambda _: None,
-                            monotonic_fn=tick_clock(0.1), **kw)
-
-    def test_set_force_stops_when_the_jaw_runs_out_of_the_travel(self):
-        g, fake = make_gripper(stops=False, creep_rad_s_per_nm=self.CREEP)
-        g.motion_config = self._motion()
-        # 起点在限位内侧一点：爬升段走掉 0.05 rad，剩下的在保力段走完 —— 触发点
-        # 落在保力段正中间，不骑在任一段的边界上
-        fake.motor.pos = POS_CLOSED_RAD - 0.02
-
-        ok = g.set_force(self.FORCE_N, duration=5.0)
-
-        self.assertFalse(ok, "越位走出去之后还报成功")
-        out_rad = closing_travel_excursion_rad(g.config, fake.motor.pos)
-        self.assertGreater(out_rad, 0.0)
-        # 每帧判一次，所以粒度是一帧的蠕变量，不是一片
-        frame_travel_rad = (self.CREEP * self.FORCE_N
-                            * UnitConversion.N_TO_NM * DT)
-        self.assertLessEqual(out_rad, g.motion_config.hold_runaway_rad
-                             + frame_travel_rad + 1e-9)
-        # 触发即失力：尾巴上只有 kp=kd=tau=0 的释放帧
-        taus = [f.tau_ff for f in fake.frames]
-        zero_at = [i for i, t in enumerate(taus) if t == 0.0]
-        self.assertTrue(zero_at, "触发之后一帧释放帧都没有")
-        release = fake.frames[zero_at[0]:]
-        self.assertEqual(len(release),
-                         int(round(g.motion_config.stop_release_s
-                                   / g.motion_config.frame_interval)))
-        for f in release:
-            self.assertEqual(f.tau_ff, 0.0)
-            self.assertEqual(f.kp, 0.0)
-            self.assertEqual(f.kd, 0.0)
-
-    def test_set_force_leaves_an_uncalibrated_config_alone(self):
-        """没标定时护栏不介入 —— ``set_force`` 本来就不要求标定。
-
-        占位限位描述的不是任何真实行程，拿它当窗口比没有更糟。行为与改动前一致：
-        照常把力发完，返回 ``True``。
-        """
-        g, fake = make_gripper(stops=False, creep_rad_s_per_nm=self.CREEP)
-        g.motion_config = self._motion()
-        g.config.calibrated = False
-        fake.motor.pos = POS_CLOSED_RAD + 1.0
-        # 这条用例要证明的是「已经越位了，但护栏没介入」
-        self.assertGreater(
-            closing_travel_excursion_rad(g.config, fake.motor.pos),
-            g.motion_config.hold_runaway_rad)
-
-        ok = g.set_force(self.FORCE_N, duration=0.2)
-
-        self.assertTrue(ok, "未标定时护栏不该介入")
-        self.assertAlmostEqual(fake.frames[-1].tau_ff,
-                               self.FORCE_N * UnitConversion.N_TO_NM,
-                               places=9)
 
 
 class TestEnable(unittest.TestCase):
@@ -1820,13 +1652,11 @@ class TestForceApproachPressBudget(unittest.TestCase):
 class TestNonFiniteInputIsRefused(unittest.TestCase):
     """非有限值不许变成运动：拒绝带原因，而且**一帧都不发**。
 
-    这里钉住的是 2026-10-10 审计里实测到的旧行为，三条都在假台上复现过：
+    这里钉住的是 2026-10-10 审计里实测到的旧行为，两条都在假台上复现过：
 
     - ``goto(nan)``：限位 clamp 的 ``min`` / ``max`` 与 NaN 的比较全为假，NaN 静默
       变成一个**真实位置**（闭合侧端点），于是夹爪朝那个止点压过去；
-    - ``grasp(nan)``：NaN 一路传到帧上，编码器把它抬到量程上端，线上是 +10 Nm；
-    - ``set_force(nan)``：爬升循环 ``while probe != target_nm`` 一帧都发不出去地
-      永不返回（25 s 里 0 帧）。
+    - ``grasp(nan)``：NaN 一路传到帧上，编码器把它抬到量程上端，线上是 +10 Nm。
 
     一帧都不发这一条是重点：NaN 不是「大」或「小」的边界，它没有意义，所以拒绝
     必须发生在机构动之前 —— 夹爪先动一下再报错是不行的。
@@ -1890,40 +1720,6 @@ class TestNonFiniteInputIsRefused(unittest.TestCase):
         with self.assertRaises(CommandError):
             g.grasp(hold_s=0.0)
         self.assertEqual(fake.frames, [])
-
-    def test_set_force_rejects_non_finite_force_and_duration(self):
-        for field, bad in (("force_n", float("nan")), ("force_n", float("inf")),
-                           ("duration", float("nan")),
-                           ("duration", float("-inf"))):
-            g, fake = make_gripper(stops=True)
-            kwargs = dict(force_n=20.0, duration=0.0)
-            kwargs[field] = bad
-            with self.assertRaises(CommandError):
-                g.set_force(**kwargs)
-            self.assertEqual(fake.frames, [], f"{field}={bad!r} 竟然发帧了")
-
-    def test_the_force_climb_never_spins_when_a_step_is_absorbed(self):
-        """步长小到被浮点吃掉（``value ± step == value``）时也不许空转。
-
-        旧写法 ``while probe != target_nm`` 这时一步都不挪、永不返回。现在每次爬升
-        都验「到设定值的距离真的变小了」，不成立就抛错。
-        """
-        g, fake = make_gripper(
-            stops=True,
-            motion=MotionConfig(force_ramp_n_s=1e-15, sleep_fn=lambda _: None))
-        with self.assertRaises(CommandError) as ctx:
-            g.set_force(20.0, duration=0.0)
-        self.assertIn("没有朝设定值前进", str(ctx.exception))
-        self.assertEqual(fake.frames, [])
-
-    def test_a_normal_climb_still_lands_on_the_setpoint(self):
-        """上面那道闸门不许改到正常爬升：照旧一帧一步，正好落在设定值上。"""
-        g, fake = make_gripper(stops=True)
-        self.assertTrue(g.set_force(20.0, duration=0.0))
-        taus = [f.tau_ff for f in fake.frames]
-        self.assertTrue(taus, "一帧都没发")
-        self.assertEqual(taus[-1], 2.0)
-        self.assertAlmostEqual(taus[0], 0.01, places=9)   # 一帧一步
 
 
 class TestUncalibratedConfigRefusesMotion(unittest.TestCase):
