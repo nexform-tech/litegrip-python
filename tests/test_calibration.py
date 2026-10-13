@@ -90,15 +90,19 @@ class TestShippedCalibrationFiles(unittest.TestCase):
 
     三份文件各自独立，曾同时停在 ``0.0 / -1.651026 / 52.69``（另一台夹爪的
     读数），而出厂值（litegrip-cpp 的 ``calibration/factory_calibration.json``）
-    是 ``0.052071 / -1.357481 / 61.01229326764816``。这里把出厂几何钉住，并
+    是 ``0.029564 / -1.141184 / 73.45731105242119``。这里把出厂几何钉住，并
     检查三份文件**互相一致**：只改一半（换了 ``rad_to_mm`` 忘了
     ``travel_range_rad``）会让 ``open()`` 的行程算错，而单看一份文件看不出来。
+
+    出厂几何换过一代：上一代是 ``0.052071 / -1.357481 / 61.01229326764816``，
+    同一段 86 mm 跨度记成 ``1.409552`` rad。两代都自洽（跨度都是 86 mm），所以
+    单看一份文件分不出哪份是错的 —— 这正是必须把绝对值钉死、不能只查自洽的原因。
     """
 
     # litegrip-cpp/calibration/factory_calibration.json
-    FACTORY_CLOSED_RAD = 0.052071        # zero_position_rad
-    FACTORY_OPEN_RAD = -1.357481         # max_position_rad
-    FACTORY_RAD_TO_MM = 61.01229326764816
+    FACTORY_CLOSED_RAD = 0.029564        # zero_position_rad
+    FACTORY_OPEN_RAD = -1.141184         # max_position_rad
+    FACTORY_RAD_TO_MM = 73.45731105242119
     FACTORY_TRAVEL_MM = 86.0
 
     def _load(self, path):
@@ -199,11 +203,23 @@ class TestPersistence(unittest.TestCase):
             self.assertTrue(json.load(f)["calibrated"])
 
     def test_old_file_without_the_flag_counts_as_calibrated(self):
-        """工厂文件是 flag 之前的格式，缺键不能当未标定。"""
-        with open(_FACTORY_CALIB) as f:
+        """老文件是 flag 之前的格式，缺键不能当未标定。
+
+        这个 fixture 自己写 ``calibrated`` 之前的字段，不再借出厂文件当例子
+        —— 出厂文件现在带 ``calibrated: true``，一旦它再改格式，这条测试就会
+        因为格式无关的原因红掉（而它在测的是**缺键**的语义，不是出厂文件的内容）。
+        """
+        path = self._path()
+        _write_json({"channel": "can0",
+                     "zero_position_rad": 0.052071,
+                     "max_position_rad": -1.357481,
+                     "travel_range_rad": 1.409552,
+                     "rad_to_mm": 61.01229326764816,
+                     "work_stroke_mm": 80.0}, self.dir)
+        with open(path) as f:
             self.assertNotIn("calibrated", json.load(f))
         g = LiteGrip("can0")
-        self.assertTrue(g.load_calibration(_FACTORY_CALIB))
+        self.assertTrue(g.load_calibration(path))
         self.assertTrue(g.config.calibrated)
 
     def test_channel_mismatch_warns(self):
@@ -273,11 +289,11 @@ class TestDerivedScale(unittest.TestCase):
     """
 
     def test_the_reference_scale_is_the_hand_recorded_one(self):
-        """(85 + 1) / 1.409552 必须等于出厂文件里手记的那一个。"""
+        """(85 + 1) / 1.170748 必须等于出厂文件里手记的那一个。"""
         self.assertAlmostEqual(
             (GripperGeometry.JAW_TRAVEL_MM + GripperGeometry.STOP_INSET_MM)
-            / 1.409552,
-            61.01229326764816,
+            / 1.170748,
+            73.45731105242119,
             places=9)
 
     def test_re_running_the_probe_on_a_shipped_unit_reproduces_its_scale(self):
@@ -295,11 +311,20 @@ class TestDerivedScale(unittest.TestCase):
             places=9)
 
     def test_deriving_from_the_jaw_travel_alone_would_be_short(self):
-        """反例：只除 85 mm 得到的比例矮了一截 —— 钉住分子里有压入量。"""
-        travel_rad = 1.409552
+        """反例：只除 85 mm 得到的比例矮了一截 —— 钉住分子里有压入量。
+
+        缺口正好是 ``压入量 / 行程``，不是一个粗差上限：出厂几何换过一代
+        （``1.409552`` → ``1.170748`` rad），缺口从 ``0.71`` 涨到 ``0.85``
+        mm/rad，写死的上限会随每次重新标定失效，等式不会。
+        """
+        with open(_FACTORY_CALIB) as f:
+            travel_rad = json.load(f)["travel_range_rad"]
         short = GripperGeometry.JAW_TRAVEL_MM / travel_rad
-        self.assertLess(short, 61.01229326764816)
-        self.assertLess(61.01229326764816 - short, 0.8)   # 粗差，不是笔误量级
+        self.assertLess(short, 73.45731105242119)
+        self.assertAlmostEqual(
+            73.45731105242119 - short,
+            GripperGeometry.STOP_INSET_MM / travel_rad,
+            places=9)
 
     def test_a_coincident_travel_refuses_instead_of_inventing_a_scale(self):
         """两端止点重合时抛错，绝不再写一个凭空的 105.26 比例。"""
