@@ -9,6 +9,15 @@
 # dependency is needed. It imports the SDK straight from src/ (see
 # tests/_sdkpath.py), so both src/ and tests/ must be tracked.
 #
+# The suite runs twice, on the runner's own python3 (3.10) and on 3.14. One
+# interpreter is one set of blind spots: 3.14 tightened fcntl.ioctl() and broke
+# connect() against every real gripper (#63) while this suite stayed green.
+#
+# The second interpreter is a step in the same job, not a matrix. `main` requires
+# a status check named exactly `test`, and a matrix names its checks
+# `test (3.10)` / `test (3.14)`, which would leave that requirement waiting for a
+# check that never reports, blocking every merge.
+#
 # AGENTS.md is deliberately not linted: it is canonical content synced from
 # repo-template and must not be edited here.
 name: CI
@@ -54,3 +63,13 @@ jobs:
 
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -t tests -v
+
+      - name: Setup Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Run unit tests on 3.14
+        run: |
+          python3 -VV
+          python3 -m unittest discover -s tests -t tests -v
