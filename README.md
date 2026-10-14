@@ -114,7 +114,8 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 | `connect()` → `bool` | Opens the CAN session. The `with` block does this for you. |
 | `disconnect()` → `None` | Closes it, disabling the motor unless `disable_on_disconnect=False`. |
 | `poll(timeout_s=0.0)` → `bool` | Reads one frame; `True` if one arrived. |
-| `get_state(wait=True)` → `GripperState` | Position, velocity, torque, temperature, error bits. `wait=True` blocks for a fresh frame. |
+| `get_state(wait=True)` → `GripperState` | Position, velocity, torque, temperature, error bits, plus how fresh they are. `wait=True` waits up to 50 ms for the frame that updates them — it does not guarantee one. |
+| `refresh_status()` → `bool` | Asks the motor for a status frame (0xCC) without moving the jaws. Use it before `get_state()` when the gripper has been idle. |
 | `get_position()` / `get_position_rad()` → `float` | Measured opening, in mm / rad. |
 | `get_force()` → `float` | `get_torque()` × 10, in N. |
 | `get_torque()` → `float` | Measured torque, Nm. |
@@ -123,6 +124,35 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 | `get_info()` → `GripperInfo` | Static device metadata. |
 | `is_moving()` / `is_grasped()` → `bool` | Motion and grip predicates. |
 | `wait_for_ready(timeout=5.0)` → `bool` | Blocks until the motor accepts commands. |
+
+The readings `get_state()` returns are a cache, and only a status frame updates it. A DM motor
+answers the control frames it receives, so a gripper that is being driven reports on its own; one
+holding a pose, or disabled, sends nothing, and then `wait=True` waits out its 50 ms and hands back
+the previous frame. The snapshot says which happened:
+
+```python
+state = gripper.get_state()
+if not state.fresh:
+    gripper.refresh_status()          # 0xCC: ask for a frame; the jaws do not move
+    state = gripper.get_state()
+
+if state.is_stale():                  # older than 0.5 s, or never had a frame
+    raise RuntimeError(f"no status frame for {state.data_age_s} s")
+print(state.position_mm, state.force_n, state.timestamp)
+```
+
+- `fresh` — a frame answered *this* read. False means the numbers are the previous frame's, however
+  old that is.
+- `data_age_s` — seconds since the frame behind the snapshot arrived, or `None` when none ever has.
+- `timestamp` — when that frame arrived, not when you asked. `0.0` means there is no frame at all and
+  every reading is a constructor default. **Do not** time a loop with it; it is for a human reading a
+  log, and the age arithmetic is what `data_age_s` is for.
+- `is_stale(stale_after_s=STALE_AFTER_S)` — age past the threshold (`STALE_AFTER_S` is 0.5 s). It is
+  about the snapshot, not the read: a snapshot 20 ms old can still be `fresh=False`.
+
+`fresh` and `is_stale()` answer different questions, and neither substitutes for the other — the wait
+window is 50 ms while the staleness threshold is 0.5 s, so a read no frame answered can still look
+young. Ask both when the difference matters.
 
 ### Enable and faults
 

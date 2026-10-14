@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import List, Optional
 
 import _sdkpath  # noqa: F401  (把 src/ 插进 sys.path)
@@ -222,6 +223,20 @@ class FakeLiteGripCAN:
         self.send_error: Optional[Exception] = None
         #: ``LiteGripCAN.last_send_error`` 的对应物：上一次下发失败的原因。
         self.last_send_error: Optional[Exception] = None
+        #: 总线上还有没有状态帧 —— False = 空闲：没被驱动，电机不主动开口，
+        #: poll / update_state 都回 False，读数就是上一次缓存的那份。
+        self.delivers = True
+        #: ``refresh_status()`` 的 0xCC 发出去了没有（False = 写失败）。
+        self.refresh_ok = True
+        #: ``refresh_status()`` 被调了几次。
+        self.refresh_calls = 0
+        #: 要到的那一帧还没被读走 —— 下一次 poll / update_state 会读到它。
+        self.refresh_pending = False
+        #: 最近一帧的两个时间戳。真层也是两条钟：``last_update`` 是 monotonic
+        #: （量 age 用），``last_frame_time`` 是 wall clock（人读的 timestamp
+        #: 用）。None = 还没有过帧，和真层 ``MotorState`` 的 0.0 一个意思。
+        self.last_update: Optional[float] = None
+        self.last_frame_time: Optional[float] = None
 
     # ── 运动 ───────────────────────────────────────────────────────────
     def control_mit(self, q_target, kp, kd, dq_target=0.0,
@@ -256,10 +271,30 @@ class FakeLiteGripCAN:
 
     # ── 状态 ───────────────────────────────────────────────────────────
     def poll(self, timeout_s: float = 0.0) -> bool:
-        return True
+        return self._frame_available()
 
     def update_state(self, timeout_s: float = 0.05) -> bool:
-        return True
+        return self._frame_available()
+
+    def _frame_available(self) -> bool:
+        """读到一帧了吗 —— 被驱动时总有，空闲时只有 ``refresh_status()`` 要到过。
+
+        读到就把那对时间戳更新成「刚刚」；没读到就原样留着，于是读数仍然是
+        上一帧的，age 会如实涨上去。
+        """
+        if self.delivers or self.refresh_pending:
+            self.refresh_pending = False
+            self.last_update = time.monotonic()
+            self.last_frame_time = time.time()
+            return True
+        return False
+
+    def refresh_status(self) -> bool:
+        """0xCC：电机收到就回一帧。空闲总线上这是唯一让它开口的办法。"""
+        self.refresh_calls += 1
+        if self.refresh_ok:
+            self.refresh_pending = True
+        return self.refresh_ok
 
     def get_position(self) -> float:
         return self.motor.reported_pos()
