@@ -108,7 +108,8 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 | `connect()` → `bool` | 打开 CAN 会话。`with` 块已经替你做了。 |
 | `disconnect()` → `None` | 关闭会话；除非 `disable_on_disconnect=False`，否则会失能电机。 |
 | `poll(timeout_s=0.0)` → `bool` | 读一帧；读到返回 `True`。 |
-| `get_state(wait=True)` → `GripperState` | 位置、速度、力矩、温度、错误位。`wait=True` 阻塞等一帧新数据。 |
+| `get_state(wait=True)` → `GripperState` | 位置、速度、力矩、温度、错误位，以及这些读数有多新。`wait=True` 最多等 50 ms 等那一帧，但不等于是等到了。 |
+| `refresh_status()` → `bool` | 主动要一帧状态（0xCC），夹爪不动。夹爪空闲过一阵就先调它再 `get_state()`。 |
 | `get_position()` / `get_position_rad()` → `float` | 实测开口，单位 mm / rad。 |
 | `get_force()` → `float` | `get_torque()` × 10，单位 N。 |
 | `get_torque()` → `float` | 实测力矩，Nm。 |
@@ -117,6 +118,31 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 | `get_info()` → `GripperInfo` | 静态设备信息。 |
 | `is_moving()` / `is_grasped()` → `bool` | 运动与夹持判据。 |
 | `wait_for_ready(timeout=5.0)` → `bool` | 阻塞到电机可以接受指令为止。 |
+
+`get_state()` 返回的读数是缓存，只有状态帧能更新它。DM 电机是「收到控制帧就回一帧状态」，所以
+正在被驱动的夹爪会自己报数；而保持姿势的、失能的夹爪什么都不发，这时 `wait=True` 等满 50 ms
+之后把上一帧交回来。快照会说明是哪一种情况：
+
+```python
+state = gripper.get_state()
+if not state.fresh:
+    gripper.refresh_status()          # 0xCC：要一帧，夹爪不动
+    state = gripper.get_state()
+
+if state.is_stale():                  # 超过 0.5 s，或者从来就没有过帧
+    raise RuntimeError(f"no status frame for {state.data_age_s} s")
+print(state.position_mm, state.force_n, state.timestamp)
+```
+
+- `fresh` —— 这一次读有没有帧答过。False 表示这些数字是上一帧的，不管它多旧。
+- `data_age_s` —— 快照背后那一帧到现在多少秒；从来就没有过帧时是 `None`。
+- `timestamp` —— 那一帧到达的时刻，不是你调用的时刻。`0.0` 表示根本没有帧，读数全是构造默
+  认值。**别**拿它给循环计时 —— 它是给人看日志的，算 age 用 `data_age_s`。
+- `is_stale(stale_after_s=STALE_AFTER_S)` —— 年龄超过阈值（`STALE_AFTER_S` 是 0.5 s）。
+  它说的是快照，不是这次读：一个 20 ms 前的快照也可以是 `fresh=False`。
+
+`fresh` 和 `is_stale()` 回答的是两个问题，谁也替代不了谁 —— 等帧窗口是 50 ms，而陈旧阈值是
+0.5 s，所以一次没人答过的读也可以看着很「新」。两个都问。
 
 ### 使能与故障
 
