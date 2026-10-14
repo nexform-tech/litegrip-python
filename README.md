@@ -194,6 +194,15 @@ because that is the side the feed-forward pushes.
 This is a runaway detector, not an accuracy bound: raise `hold_runaway_rad` only if a jaw that is
 genuinely holding something is being released. The watch is off until the config is calibrated.
 
+**An empty `grasp()` is the case that reaches it.** The closing leg presses onto the closed-side
+stop and the hold keeps pushing there, so a stop that is not where the calibration says — or one
+that has been knocked out — lets the hold walk the jaws past it. The trip leaves them sitting
+outside the calibrated travel, and the release frames leave the drive *enabled* but carrying no
+torque: it holds nothing, but it is not off either. Get the jaws back inside the travel before
+commanding anything else — `disable()` the motor, push them clear of the stop by hand, then
+`enable()` and carry on. Do not just call `grasp()` again: the closing leg re-approaches the same
+stop and the hold presses it again.
+
 Need more force than the default? `MotionConfig.force_n` is `20.0` N (`2.0 Nm`), inside the
 DM4310's `3 Nm` rating. Its peak is `7 Nm` and the protocol ceiling is `10 Nm`.
 
@@ -508,7 +517,7 @@ the config as their first argument rather than being called on the gripper.
 | `HardwareError` from `enable()` | The motor never reported `err == 1`. Check power, then `clear_fault()`. |
 | The jaws move the wrong way | The unit is reverse-mounted, not normal. Construct with `mount="reverse"`. |
 | `close()` returns `ok=False` | The jaw parked further than `stop_tol` from the limit. The gap comes from `zero()` probing harder than `close()` presses, so raising `stop_lead_mm` barely moves it — check that the calibration describes the real travel, and raise `stop_tol` if the unit is genuinely parked on the stop. |
-| `travel_guard` is set | The runaway watch tripped: the jaw walked past the closed-side stop while a force was held. Check the calibration describes the real travel, and that nothing has removed the stop. |
+| `travel_guard` is set | The runaway watch tripped: the jaw walked past the closed-side stop while a force was held — an empty `grasp()` does this when the stop is not where the calibration says. Check the calibration describes the real travel, and that nothing has removed the stop. The jaws are now outside the calibrated travel: `disable()`, push them back clear of the stop by hand, then `enable()`, before commanding anything else. |
 | A `can1` unit's `load_calibration()` returns `False` | A no-argument load reads the factory file, which declares `channel: can0`, so this unit has no implicit source. Give it a template, or name its own file with `path=` or `LITEGRIP_CALIB`. |
 | The held force sags below the setpoint | You changed the hold gains, or something is back-driving the jaws faster than the feed-forward. `hold_kp` / `hold_kd` are deprecated and ignored. |
 | `import litegrip` loads older code than the checkout you are reading | An installed copy does not update itself across `git pull`. Check `litegrip.__file__`, or `pip install -e .` in the checkout. |
