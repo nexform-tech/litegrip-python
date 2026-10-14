@@ -104,6 +104,7 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 | `actions` | `GripperActions` — the engine the high-level methods forward to |
 | `mount` | `"normal"`, `"reverse"`, or `None` until calibrated (derived from the limits) |
 | `is_connected`, `is_enabled` | Session state |
+| `last_send_error` | Why the last `send_mit_frame` did not send, or `None`. The exception the send reported — an `OSError` from the transport, or the `NotInitializedError` naming the step that was skipped. |
 | `session` | The CAN session, for advanced use |
 
 ### Connection and state
@@ -488,6 +489,12 @@ Errors are typed and never swallowed. `describe_error(code)` turns the motor's o
 text. The SDK logs through the standard `logging` module — the calibration it loaded, the
 direction it derived, every guard that fired; attach a handler to the `litegrip` logger to see
 them, and note that warnings reach stderr even with no handler configured.
+
+A frame that fails to go out follows the table rather than one fixed message. The send reports
+`False` and keeps the reason in `gripper.last_send_error`: a transport failure raises `CommError`
+carrying that reason, and a gripper that is not connected or not enabled raises
+`NotInitializedError` naming the missing step. When nothing recorded a reason — a coarse
+`send_mit_frame` stub, say — the message says so instead of guessing.
 
 ### Advanced
 

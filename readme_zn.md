@@ -98,6 +98,7 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 | `actions` | `GripperActions` —— 高层方法转发到的引擎 |
 | `mount` | `"normal"`、`"reverse"`，未标定时是 `None`（由限位数值推出） |
 | `is_connected`、`is_enabled` | 会话状态 |
+| `last_send_error` | 上一次 `send_mit_frame` 为什么没发出去，没失败就是 `None`。下层报的那条异常 —— 传输层的 `OSError`，或者指出缺哪一步的 `NotInitializedError`。 |
 | `session` | CAN 会话，进阶用 |
 
 ### 连接与状态
@@ -449,6 +450,11 @@ python3 examples/trajectory.py --play pick --repeat 3
 异常是分类型的，而且从不被吞掉。`describe_error(code)` 把电机自己的错误码变成文字。SDK 通过
 标准 `logging` 模块记录日志 —— 加载了哪份标定、推出了什么方向、哪条护栏触发了；给 `litegrip`
 logger 挂个 handler 就能看到，注意即使不挂 handler，告警也会到 stderr。
+
+一帧发不出去时，报的异常按上面那张表来，而不是一句写死的话。下发本身还是回 `False`，原因记在
+`gripper.last_send_error` 里：传输层失败抛 `CommError`，并把原因原样带在消息里；没连接或没使能
+抛 `NotInitializedError`，指出缺的是哪一步。下层没记原因时（比如一个只回 `False` 的替身），消息
+就说「原因未记录」，不替它猜。
 
 ### 进阶接口
 

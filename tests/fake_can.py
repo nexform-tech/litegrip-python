@@ -216,26 +216,43 @@ class FakeLiteGripCAN:
         #: 0xFE 是否真的改写偏置（False = 电机忽略了它，比如仍在使能态：
         #: set_zero() 照报 True，但读数不变）。
         self.set_zero_applies = True
+        #: 下一次下发要报的失败原因 —— 非 None 时 ``control_mit`` 一帧都不发，
+        #: 直接回 False，并把它记进 ``last_send_error``。真 CAN 层就是这样把
+        #: 「没连上」和「总线写失败」分开报的。
+        self.send_error: Optional[Exception] = None
+        #: ``LiteGripCAN.last_send_error`` 的对应物：上一次下发失败的原因。
+        self.last_send_error: Optional[Exception] = None
 
     # ── 运动 ───────────────────────────────────────────────────────────
     def control_mit(self, q_target, kp, kd, dq_target=0.0,
                     tau_feedforward=0.0) -> bool:
+        if self.send_error is not None:
+            self.last_send_error = self.send_error
+            return False
         self.motor.step(q_target, kp, dq_target, tau_feedforward, DT)
         self.frames.append(Frame(
             q=q_target, kp=kp, kd=kd, dq=dq_target, tau_ff=tau_feedforward,
             pos_after=self.motor.pos, tau_nm=self.motor.tau))
         self.holding = tau_feedforward != 0.0
+        self.last_send_error = None
         return True
 
     def control_mit_stream(self, q_target, kp, kd, duration_s=0.5,
                            interval_s=0.005, dq_target=0.0,
                            tau_feedforward=0.0) -> bool:
-        """把 ``control_mit`` 连发一“段平台”，和真 CAN 层同名同形。"""
+        """把 ``control_mit`` 连发一“段平台”，和真 CAN 层同名同形。
+
+        ``send_error`` 置上时逐帧失败，于是和真层一样回 False —— 真层在整段
+        一帧都没发出去时抛 ``CommError``，这里只回 False：替身不模拟那条
+        「一帧都没出去」的阈值。
+        """
         if interval_s <= 0:
             return True
+        ok = True
         for _ in range(max(1, int(duration_s / interval_s))):
-            self.control_mit(q_target, kp, kd, dq_target, tau_feedforward)
-        return True
+            ok = self.control_mit(
+                q_target, kp, kd, dq_target, tau_feedforward) and ok
+        return ok
 
     # ── 状态 ───────────────────────────────────────────────────────────
     def poll(self, timeout_s: float = 0.0) -> bool:
