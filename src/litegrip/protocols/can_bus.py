@@ -54,6 +54,8 @@ class LiteGripCAN:
         self._motor: Optional[MotorState] = None
         self._connected = False
         self._initialized = False
+        # 上一次 MIT 下发为什么没出去 —— 见 last_send_error。
+        self._last_send_error: Optional[Exception] = None
 
     # ═══════════════════════════════════════════════════════════════════
     # Connection
@@ -366,26 +368,30 @@ class LiteGripCAN:
 
         Returns:
             True if the frame was sent, False when there is no connection or the
-                send failed.  A failed send leaves a warning naming the reason —
-                ``False`` alone cannot tell "not enabled" from "the buffer was
-                full for 100 ms", and those need different fixes.
+                send failed.  ``False`` alone cannot tell "not enabled" from
+                "the buffer was full for 100 ms", and those need different
+                fixes, so the reason is kept for :attr:`last_send_error` and
+                logged rather than raised.
 
         Raises:
             CommandError: a field is NaN/infinite, or the torque exceeds the
                 frame's range.  Those are caller bugs rather than transport
-                conditions, so they keep a diagnosable reason instead of being
-                folded into the ``False`` return.
+                conditions, so they are raised instead of being folded into the
+                ``False`` return.
         """
         self._check_motion_command(q_target, kp, kd, dq_target,
                                    tau_feedforward)
         if self._controller is None or self._motor is None:
+            self._last_send_error = NotInitializedError("未连接或未注册")
             return False
         try:
             self._controller.control_mit(
                 self._motor, kp=kp, kd=kd,
                 q=q_target, dq=dq_target, tau=tau_feedforward)
+            self._last_send_error = None
             return True
         except Exception as e:
+            self._last_send_error = e
             log.warning("MIT 帧下发失败（%s）：%r", self._channel, e)
             return False
 
@@ -449,6 +455,7 @@ class LiteGripCAN:
         if interval_s < 0.0:
             raise CommandError(f"interval_s 不能为负：{interval_s!r}。")
         if self._controller is None or self._motor is None:
+            self._last_send_error = NotInitializedError("未连接或未注册")
             return False
 
         ctrl = self._controller
@@ -471,6 +478,9 @@ class LiteGripCAN:
             time.sleep(interval_s)
 
         failed = attempts - sent
+        # 与 control_mit 同一口径：整段没发出去是失败，部分丢帧也是失败，
+        # 两种情况都把原因留给 last_send_error；全部发出去就清空。
+        self._last_send_error = last_error if failed else None
         if failed:
             log.warning("%s：%d 帧里 %d 帧没发出去（最后一次：%r）",
                         self._channel, attempts, failed, last_error)
@@ -484,6 +494,18 @@ class LiteGripCAN:
     # ═══════════════════════════════════════════════════════════════════
     # Status
     # ═══════════════════════════════════════════════════════════════════
+
+    @property
+    def last_send_error(self) -> Optional[Exception]:
+        """Why the last :meth:`control_mit` / :meth:`control_mit_stream` did not
+        send, or ``None`` if it sent.
+
+        The ``False`` return carries no reason, and the warning that does is
+        only as visible as the caller's logging setup.  This keeps the exception
+        itself — type and all — so a layer above can report *why*, and can tell
+        "not registered" from "the write failed" without guessing.
+        """
+        return self._last_send_error
 
     def update_state(self, timeout_s: float = 0.05) -> bool:
         """Poll until at least one new status frame arrives."""

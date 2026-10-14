@@ -319,6 +319,7 @@ class LiteGrip:
         self._can: Optional[LiteGripCAN] = None
         self._enabled = False
         self._connected = False
+        self._last_send_error: Optional[Exception] = None
         self._status_flags = GripperStatus.NONE
         self._actions = GripperActions(self, motion_config)
 
@@ -604,13 +605,34 @@ class LiteGrip:
             tau: Feed-forward torque in Nm.
 
         Returns:
-            True if the frame was sent.
+            True if the frame was sent.  A ``False`` return leaves the reason in
+            :attr:`last_send_error`.
         """
-        if self._can is None or not self._enabled:
+        if self._can is None:
+            self._last_send_error = self._not_connected_error()
+            return False
+        if not self._enabled:
+            self._last_send_error = self._not_enabled_error()
             return False
         with self._io_lock:
-            return self._can.control_mit(
+            sent = self._can.control_mit(
                 q_target=q, kp=kp, kd=kd, dq_target=dq, tau_feedforward=tau)
+            # 鸭子类型的替身可能没有这一项；真 CAN 层永远有。取不到就是
+            # 「原因没记录」，上层据此照实报，而不是编一个。
+            self._last_send_error = (
+                None if sent else getattr(self._can, "last_send_error", None))
+            return sent
+
+    @property
+    def last_send_error(self) -> Optional[Exception]:
+        """Why the last :meth:`send_mit_frame` did not send, or ``None``.
+
+        The exception the send itself reported — a ``CommError``-family cause
+        from the transport, or the ``NotInitializedError`` naming the step that
+        was skipped.  The engine reads it to raise the right type instead of one
+        fixed message that guesses.
+        """
+        return self._last_send_error
 
     def poll(self, timeout_s: float = 0.0) -> bool:
         """Poll for one CAN frame and update cached motor state.
@@ -2552,13 +2574,20 @@ class LiteGrip:
     # Internal
     # ═══════════════════════════════════════════════════════════════════
 
+    def _not_connected_error(self) -> NotInitializedError:
+        return NotInitializedError(
+            "未连接 — 请先调用 connect() 或使用 with 上下文")
+
+    def _not_enabled_error(self) -> NotInitializedError:
+        return NotInitializedError("未使能 — 请先调用 enable()")
+
     def _check_connected(self) -> None:
         if not self._connected:
-            raise NotInitializedError("未连接 — 请先调用 connect() 或使用 with 上下文")
+            raise self._not_connected_error()
 
     def _check_enabled(self) -> None:
         if not self._enabled:
-            raise NotInitializedError("未使能 — 请先调用 enable()")
+            raise self._not_enabled_error()
 
     def _claim_session(self, owner: str, error: type) -> None:
         """Take the single long-running session slot, or raise *error*.

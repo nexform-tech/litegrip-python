@@ -607,6 +607,25 @@ class SlaveGuardTest(unittest.TestCase):
         finally:
             mgr.stop()
 
+    def test_the_first_failure_names_the_reason(self):
+        """循环不能因为丢一帧就中止 —— 那条日志就是操作者唯一的报告。"""
+        g, fake, transport, mgr = SlaveLoopTest()._slave(
+            align=False, watchdog_s=5.0)
+        fake.send_error = OSError(100, "Network is down")
+        with self.assertLogs("litegrip.teleop", level="WARNING") as caught:
+            mgr.start()
+            try:
+                self.assertTrue(
+                    _wait_until(lambda: mgr.status()["send_failed"] > 0))
+            finally:
+                mgr.stop()
+
+        text = "\n".join(caught.output)
+        self.assertIn("Network is down", text,
+                      "真正的原因没进日志 —— 只说了「没使能或写失败」两种可能，"
+                      "诊断还得自己去翻总线")
+        self.assertNotIn("not enabled or the CAN write failed", text)
+
     def test_reports_the_gripper_fault_code(self):
         g, _ = make_gripper(start_rad=POS_CLOSED_RAD, err=0)
         transport = _PreSubTransport()
