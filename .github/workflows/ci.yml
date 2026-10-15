@@ -64,6 +64,19 @@ jobs:
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -t tests -v
 
+      # The release workflow only builds after a merge to the default branch, by
+      # which point the tag and the GitHub release already exist — a build that
+      # fails there burns a version number. Build here instead, on the same
+      # interpreter the tests above ran under, so a broken pyproject.toml is
+      # stopped at the pull request.
+      #
+      # The version is deliberately not rewritten: what this checks is that the
+      # tree as committed builds. Choosing the number belongs to the tag.
+      - name: Build the package
+        run: |
+          python3 -m pip install --upgrade build
+          python3 -m build
+
       - name: Setup Python 3.14
         uses: actions/setup-python@v5
         with:
