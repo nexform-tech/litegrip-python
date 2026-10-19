@@ -1,6 +1,6 @@
 # litegrip-python
 
-[English](README.md) | [简体中文](readme_zn.md)
+[English](README.md) | [简体中文](README.zh-CN.md)
 
 **LiteGrip 轻量机械爪系列**的 Python SDK，也是它主要的公开接口。本文是一份接口参考：
 每个接口是什么，以及怎么用。
