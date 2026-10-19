@@ -1,6 +1,6 @@
 # litegrip-python
 
-[English](README.md) | [简体中文](readme_zn.md)
+[English](README.md) | [简体中文](README.zh-CN.md)
 
 Python SDK for the **LiteGrip lightweight robotic gripper series**, and the primary public
 interface to it. This is the reference: what each interface is, and how to use it.

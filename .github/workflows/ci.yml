@@ -48,13 +48,13 @@ jobs:
           node-version: 22
 
       - name: Lint Markdown
-        run: npx --yes markdownlint-cli2@0.23.3 "README.md" "readme_zn.md"
+        run: npx --yes markdownlint-cli2@0.23.3 "README.md" "README.zh-CN.md"
 
       - name: Validate repository standards
         run: |
           set -euo pipefail
           test -s README.md
-          test -s readme_zn.md
+          test -s README.zh-CN.md
           test -s AGENTS.md
           test -s LICENSE
           python3 -c "import json; json.load(open('.releaserc.json'))"
