@@ -444,7 +444,7 @@ class LiteGripTeleopApiTest(unittest.TestCase):
         from litegrip import gripper as gripper_mod
         with unittest.mock.patch.object(
                 gripper_mod, "_zenoh_transport",
-                side_effect=ImportError("pip install litegrip[zenoh]")):
+                side_effect=ImportError("pip install litegrip-python[zenoh]")):
             with self.assertRaises(ImportError):
                 g.teleop_start("master")
 

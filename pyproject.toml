@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "litegrip"
+name = "litegrip-python"
 # PLACEHOLDER — do not edit, do not read.
 # The repository never commits a version back (see AGENTS.md §3): semantic-release
 # computes the next version from the commit prefixes on merge and rewrites this

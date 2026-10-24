@@ -16,11 +16,11 @@
 | 主机 | Linux + SocketCAN —— 这是唯一支持的平台 |
 | Python | 3.8 及以上 |
 | 依赖 | 无，只用标准库 |
-| 可选 | `litegrip[zenoh]` —— 点对点遥操链路 |
+| 可选 | `litegrip-python[zenoh]` —— 点对点遥操链路 |
 
 ## 1. 安装
 
-尚未发布到 PyPI。从代码仓安装：
+从代码仓安装：
 
 ```bash
 git clone https://github.com/nexform-tech/litegrip-python.git
@@ -383,7 +383,7 @@ with LiteGrip("can0") as slave:
 链路是**点对点 zenoh**，属于可选依赖：
 
 ```bash
-pip install 'litegrip[zenoh]'
+pip install 'litegrip-python[zenoh]'
 ```
 
 两端都用 `mode="peer"` 并关掉全部发现机制，所以两端只能靠显式端点互相找到。`link="udp"` 是

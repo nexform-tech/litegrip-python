@@ -71,7 +71,7 @@ Safety notes
   calling :meth:`~litegrip.LiteGrip.teleop_start`.
 * :class:`UdpTeleopTransport` is plain, unauthenticated UDP.  Use it only on a
   trusted network.  For real deployments use the point-to-point zenoh link in
-  :mod:`litegrip.zenoh_link` (``pip install litegrip[zenoh]``), which is what the
+  :mod:`litegrip.zenoh_link` (``pip install litegrip-python[zenoh]``), which is what the
   field-validated litearm teleoperation runs on.
 """
 
