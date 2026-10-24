@@ -14,13 +14,17 @@
 | --- | --- |
 | 电机 | 达妙 DM4310，CAN ID `0x08`，MIT 模式，经典 CAN 1 Mbit/s |
 | 主机 | Linux + SocketCAN —— 这是唯一支持的平台 |
-| Python | 3.8 及以上 |
+| Python | 3.10 及以上 |
 | 依赖 | 无，只用标准库 |
 | 可选 | `litegrip-python[zenoh]` —— 点对点遥操链路 |
 
 ## 1. 安装
 
-从代码仓安装：
+```bash
+pip install litegrip-python
+```
+
+或从代码仓安装：
 
 ```bash
 git clone https://github.com/nexform-tech/litegrip-python.git
