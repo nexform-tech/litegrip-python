@@ -15,13 +15,17 @@ below is the real one, with its default.
 | --- | --- |
 | Motor | Damiao DM4310, CAN ID `0x08`, MIT mode, classic CAN at 1 Mbit/s |
 | Host | Linux with SocketCAN — this is the only supported platform |
-| Python | 3.8 or newer |
+| Python | 3.10 or newer |
 | Dependencies | none: standard library only |
 | Optional | `litegrip-python[zenoh]` — the point-to-point teleoperation link |
 
 ## 1. Install
 
-Install it from a checkout:
+```bash
+pip install litegrip-python
+```
+
+Or install from a checkout:
 
 ```bash
 git clone https://github.com/nexform-tech/litegrip-python.git

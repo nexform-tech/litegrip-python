@@ -232,7 +232,7 @@ class TestPersistence(unittest.TestCase):
         self.assertTrue(any("channel" in m for m in warnings), warnings)
 
     def test_matching_channel_is_silent(self):
-        # assertNoLogs 要 3.10+，而本包声明 3.8 起，所以手动接一个 handler。
+        # 手动接一个 handler，既捕获 WARNING，也能断言它没有输出。
         path = _write_json({"channel": "can0", "zero_position_rad": 0.1,
                             "max_position_rad": -1.5, "rad_to_mm": 74.8},
                            self.dir)
