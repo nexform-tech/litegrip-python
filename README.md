@@ -1,6 +1,6 @@
 # litegrip-python
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](https://github.com/nexform-tech/litegrip-python/blob/main/README.md) | [简体中文](https://github.com/nexform-tech/litegrip-python/blob/main/README.zh-CN.md)
 
 Python SDK for the **LiteGrip lightweight robotic gripper series**, and the primary public
 interface to it. This is the reference: what each interface is, and how to use it.
@@ -605,4 +605,4 @@ python3 -m unittest discover -s tests -t tests -v
 
 ## License
 
-Copyright © 2026 NEXFORM ROBOTICS. Licensed under the [Apache License 2.0](LICENSE).
+Copyright © 2026 NEXFORM ROBOTICS. Licensed under the [Apache License 2.0](https://github.com/nexform-tech/litegrip-python/blob/main/LICENSE).
