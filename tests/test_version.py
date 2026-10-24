@@ -7,7 +7,9 @@ semantic-release 只在发布工作区里改写清单，所以 git tag 是唯一
 
 import _sdkpath  # noqa: F401  (把 src/ 插进 sys.path)
 import importlib.metadata as _md
+import re
 import unittest
+from pathlib import Path
 
 import litegrip
 
@@ -22,6 +24,20 @@ class TestVersionResolution(unittest.TestCase):
     def test_prefers_the_installed_distribution(self):
         _md.version = lambda name: "9.9.9"
         self.assertEqual(litegrip._detect_version(), "9.9.9")
+
+    def test_the_distribution_name_matches_the_manifest(self):
+        """清单名、运行时查询的发行版名必须一致 —— PyPI 也按清单名建项目。"""
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        declared = re.search(
+            r'^name\s*=\s*"([^"]+)"',
+            pyproject.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        ).group(1)
+        seen = []
+        _md.version = lambda name: seen.append(name) or "9.9.9"
+        self.assertEqual(litegrip._detect_version(), "9.9.9")
+        self.assertEqual(seen, [declared])
+        self.assertEqual(declared, "litegrip-python")
 
     def test_marks_a_source_tree_checkout(self):
         """查不到发行版元数据时给出可辨认的标记，而不是某个假版本号。"""

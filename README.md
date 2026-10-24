@@ -17,11 +17,11 @@ below is the real one, with its default.
 | Host | Linux with SocketCAN — this is the only supported platform |
 | Python | 3.8 or newer |
 | Dependencies | none: standard library only |
-| Optional | `litegrip[zenoh]` — the point-to-point teleoperation link |
+| Optional | `litegrip-python[zenoh]` — the point-to-point teleoperation link |
 
 ## 1. Install
 
-The package is not on PyPI yet. Install it from a checkout:
+Install it from a checkout:
 
 ```bash
 git clone https://github.com/nexform-tech/litegrip-python.git
@@ -414,7 +414,7 @@ with LiteGrip("can0") as slave:
 The link is a point-to-point **zenoh** session, an optional dependency:
 
 ```bash
-pip install 'litegrip[zenoh]'
+pip install 'litegrip-python[zenoh]'
 ```
 
 Both ends use `mode="peer"` with all discovery off, so the only way they find each other is an

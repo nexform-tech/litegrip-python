@@ -65,7 +65,7 @@ def _zenoh_transport(role: str, key: str, port: int, host: Optional[str],
     except ImportError as e:
         raise ImportError(
             "the zenoh teleoperation link needs the optional zenoh dependency — "
-            "install it with `pip install litegrip[zenoh]`") from e
+            "install it with `pip install litegrip-python[zenoh]`") from e
     return ZenohTeleopTransport(role, key, port=port, host=host,
                                 ready_key=ready_key)
 
@@ -2141,7 +2141,7 @@ class LiteGrip:
                 by this class.
             link: ``"zenoh"`` (default) builds the point-to-point zenoh link
                 used by the field teleoperation — see
-                :mod:`litegrip.zenoh_link`, needs ``pip install litegrip[zenoh]``.
+                :mod:`litegrip.zenoh_link`, needs ``pip install litegrip-python[zenoh]``.
                 ``"udp"`` builds the plain-UDP transport, for a trusted LAN.
             host: The peer's address.  Required for a ``slave``; the master only
                 listens, so it needs no host.

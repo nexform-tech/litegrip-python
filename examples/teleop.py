@@ -11,7 +11,7 @@ meant to be started once per machine — one process per gripper:
     python3 examples/teleop.py --mode slave --channel can0 --host 192.168.1.20
 
 Both ends must share ``--grip-id``. The default link is the point-to-point zenoh
-transport used by the field teleoperation (``pip install litegrip[zenoh]``): the
+transport used by the field teleoperation (``pip install litegrip-python[zenoh]``): the
 leader listens on ``--port``, the follower connects to ``--host``. ``--link udp``
 selects plain UDP instead, which carries no authentication or encryption — keep
 either on a trusted network. Press Ctrl+C on either end to stop; the gripper
