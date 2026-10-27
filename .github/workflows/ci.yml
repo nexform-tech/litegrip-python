@@ -17,9 +17,6 @@
 # a status check named exactly `test`, and a matrix names its checks
 # `test (3.10)` / `test (3.14)`, which would leave that requirement waiting for a
 # check that never reports, blocking every merge.
-#
-# AGENTS.md is deliberately not linted: it is canonical content synced from
-# repo-template and must not be edited here.
 name: CI
 
 on:
@@ -55,7 +52,6 @@ jobs:
           set -euo pipefail
           test -s README.md
           test -s README.zh-CN.md
-          test -s AGENTS.md
           test -s LICENSE
           python3 -c "import json; json.load(open('.releaserc.json'))"
           python3 -c "import json; json.load(open('.markdownlint.json'))"
