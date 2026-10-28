@@ -68,7 +68,7 @@ with LiteGrip("can0") as gripper:            # 进入时 connect()，退出时 d
 往下看之前，先知道两件事：
 
 - **出厂标定就是默认值。** 不带参数的 `load_calibration()` 读的是 SDK 里随包发布的那份标定，
-  它描述的就是出厂的机器（正装）。只有你手上另有一份标定时，才需要指定 —— 见[标定](#标定)。
+  它描述的就是出厂的机器。只有你手上另有一份标定时，才需要指定 —— 见[标定](#标定)。
 - **没加载标定之前，什么都不会动。** 未标定的配置上，每个运动方法都抛 `CommandError`，
   因为占位限位描述的行程不是任何真实行程。
 
@@ -87,8 +87,7 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 
 - `channel` —— CAN 接口名。每台 LiteGrip 都共用 CAN ID `0x08`，所以一台机器上装两台时，
   接口名是唯一能区分它们的键。
-- `mount` —— `"normal"` 或 `"reverse"`，装载对应模板的限位。出厂的都是正装，出厂标定描述的
-  也是正装，所以**不要传**，除非有台机器是反装的（你对它调 `close()`，爪子反而张开）。
+- `mount` —— **已弃用**，保留只为兼容旧调用。出厂的夹爪只有一种装法，出厂标定已经描述了它；不要传这个参数，用不带参数的 `load_calibration()`。
 - `mst_id` —— 主站 ID；`None` 自动探测。
 - `config` / `motion_config` —— 构造时就整份替换这两个 dataclass，而不是构造完再改字段。
 - `disable_on_disconnect` —— `disconnect()` 是否失能电机（崩溃安全）。只有当**别的东西**在
@@ -100,7 +99,7 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 | `config` | `GripperConfig` —— 限位、比例、增益 |
 | `motion_config` | `MotionConfig` —— 全部可调项；可整份替换，也可逐字段改 |
 | `actions` | `GripperActions` —— 高层方法转发到的引擎 |
-| `mount` | `"normal"`、`"reverse"`，未标定时是 `None`（由限位数值推出） |
+| `mount` | **已弃用**，保留只为兼容；出厂机器恒为 `"normal"`，未标定时是 `None` |
 | `is_connected`、`is_enabled` | 会话状态 |
 | `last_send_error` | 上一次 `send_mit_frame` 为什么没发出去，没失败就是 `None`。下层报的那条异常 —— 传输层的 `OSError`，或者指出缺哪一步的 `NotInitializedError`。 |
 | `session` | CAN 会话，进阶用 |
@@ -227,7 +226,7 @@ SDK 里随包发布的出厂标定就是标准值，不带参数的加载只读�
 from litegrip import LiteGrip
 
 with LiteGrip("can0") as gripper:
-    gripper.load_calibration()      # 随包发布的那份，描述一台正装的机器
+    gripper.load_calibration()      # 随包发布的那份，就是出厂机器的标定
     gripper.enable()
 ```
 
@@ -235,8 +234,8 @@ with LiteGrip("can0") as gripper:
 | --- | --- |
 | `load_calibration()` → `bool` | 随包发布的出厂标定；设了 `LITEGRIP_CALIB` 时再加上它（环境变量优先）。 |
 | `load_calibration(path="/abs/file.json")` → `bool` | 读那个文件。只有当它给不出可用标定时才回落到出厂文件，通道对不上会告警。 |
-| `load_calibration(template="normal")` / `load_template(name)` → `bool` | 那个模板的限位，不管在哪个通道上。严格：名字不认识就抛 `CommandError`。 |
-| `list_templates()` → `List[str]` | `['normal', 'reverse']` —— SDK 接受的全部名字，给 UI 做下拉框用。这是模块级函数，要按名字导入。 |
+| `load_calibration(template="normal")` / `load_template(name)` → `bool` | **已弃用**，保留只为兼容旧调用；新代码用不带参数的 `load_calibration()` 或 `path=`。 |
+| `list_templates()` → `List[str]` | **已弃用**，保留只为兼容；仍返回 `['normal', 'reverse']`。 |
 | `default_calib_path(channel="can0")` → `str` | 存标定的落点：`~/.litegrip/<channel>_calibration.json`，设了 `$LITEGRIP_CALIB` 时是它。 |
 | `save_calibration(path=None)` → `str` | 把当前配置写到这个路径。 |
 | `zero()` → `CalibrationData` | 探两端机械限位，推出比例，存盘。 |
@@ -257,8 +256,51 @@ with LiteGrip("can0") as gripper:
   托住它。指爪不是 85 mm 时改 `GripperConfig.max_stroke_mm`（`85.0`，出厂硬件）：这是唯一一项
   没有写进任何标定文件的单机尺寸，而且只在你重新探测时才有意义。
 - 出厂文件声明的是 `channel: can0`，所以 `can1` 上的机器没有隐式来源，它会直接失败 ——
-  `load_calibration()` 返回 `False` —— 而不是悄悄沿用 `can0` 的方向。给它一个模板，或者
-  按上面的说法把它自己那份 `zero()` 点名回来。
+  `load_calibration()` 返回 `False` —— 而不是悄悄沿用 `can0` 的标定。按下一节的做法把它自己
+  那份 `zero()` 点名回来。
+
+### 使用自己标定出来的文件
+
+`zero()`、`calibrate_guided()`、`calibrate_manual()` 量出的标定会写到 `~/.litegrip/<channel>_calibration.json`。不带参数的 `load_calibration()` **不会读它**；下次要用，必须显式点名。
+
+最直接的方式，是把 `save_calibration()` 的落点再传回 `load_calibration()`：
+
+```python
+from litegrip import LiteGrip, default_calib_path
+
+path = default_calib_path("can0")        # ~/.litegrip/can0_calibration.json
+with LiteGrip("can0") as gripper:
+    if not gripper.load_calibration(path=path):
+        raise RuntimeError(f"读不出标定文件：{path}")
+    gripper.enable()
+    gripper.open()
+```
+
+多台夹爪、或者不想在每个脚本里写路径时，用环境变量一次覆盖所有通道：
+
+```bash
+export LITEGRIP_CALIB="$HOME/.litegrip/can0_calibration.json"
+```
+
+```python
+gripper.load_calibration()   # 先读 LITEGRIP_CALIB，读不到才回落到出厂文件
+```
+
+加载时有三条规则：
+
+- **`path=` 能读任意路径的 JSON。** 它不是只认 `<channel>_calibration.json`；那个名字只是 `save_calibration()` 的默认落点。不带参数的加载不读这个目录，也不猜文件名，所以不要把标定文件改名后指望它被自动接上。
+- **`LITEGRIP_CALIB` 里的 `channel` 必须与本实例一致。** 不一致时，不带参数的加载会跳过它并回落到出厂文件；`can1` 上的机器因此不会静默套用 `can0` 的标定。`path=` 不做这个跳过，只在通道不一致时告警。
+- **`path=` 读不到时会回落到出厂标定，而且仍可能返回 `True`。** 不要只看返回值：日志里的 `Calibration loaded from <路径>` 写明实际读了哪份，或者核对下面的数值。
+
+加载后核对一遍，再让夹爪运动：
+
+```python
+cfg = gripper.config
+print(cfg.calibrated)                                               # 必须是 True
+print(abs(cfg.pos_open_rad - cfg.pos_closed_rad) * cfg.rad_to_mm)   # 行程，mm
+```
+
+`calibrated=False` 时每个运动方法都抛 `CommandError`，所以这项检查同时也是运动前的闸门。
 
 ### 怎么读返回值
 
@@ -512,10 +554,9 @@ logger 挂个 handler 就能看到，注意即使不挂 handler，告警也会�
 | `CommandError` 里提到标定 | 这个通道还没加载标定。调 `load_calibration()`。 |
 | `ConnectError`，或者始终没有状态帧 | `can0` 没起来，或者波特率不是 1 Mbit/s。见第 2 节。 |
 | `enable()` 抛 `HardwareError` | 电机始终没报 `err == 1`。先查供电，再 `clear_fault()`。 |
-| 爪子朝反方向动 | 这台机器是反装，不是正装。构造时传 `mount="reverse"`。 |
 | `close()` 返回 `ok=False` | 爪子停的位置离限位超过了 `stop_tol`。这个缺口来自 `zero()` 探测时压得比 `close()` 更狠，所以调 `stop_lead_mm` 基本看不出变化 —— 先核对标定描述的是不是真实行程，如果这台确实停在限位上，再调大 `stop_tol`。 |
 | `travel_guard` 置位 | 失控监视触发了：保力期间爪子走到了闭合侧限位之外 —— 限位不在标定位置上时，空载 `grasp()` 就是这么顶出去的。核对标定描述的是不是真实行程，以及限位还在不在。此时爪子停在标定行程之外：先 `disable()`，用手把它挪回限位内侧，再 `enable()`，然后才能下发别的指令。 |
-| `can1` 上的机器 `load_calibration()` 返回 `False` | 不带参数的加载读的是出厂文件，而它声明的是 `channel: can0`，所以这台没有隐式来源。给它一个模板，或者用 `path=` / `LITEGRIP_CALIB` 点名它自己那份文件。 |
+| `can1` 上的机器 `load_calibration()` 返回 `False` | 不带参数的加载读的是出厂文件，而它声明的是 `channel: can0`，所以这台没有隐式来源。用 `path=` / `LITEGRIP_CALIB` 点名它自己那份文件，见[使用自己标定出来的文件](#使用自己标定出来的文件)。 |
 | 保住的力比设定值低 | 你改过保力增益，或者有东西把爪子推得比前馈还快。`hold_kp` / `hold_kd` 已弃用，会被忽略。 |
 | `import litegrip` 拿到的代码比你在读的源码树旧 | 装过的副本不会跟着 `git pull` 自己更新。先看 `litegrip.__file__`，或者在代码仓里 `pip install -e .`。 |
 

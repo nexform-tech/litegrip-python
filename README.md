@@ -71,8 +71,8 @@ with LiteGrip("can0") as gripper:            # connect() on entry, disconnect() 
 Two things to know before going further:
 
 - **The factory calibration is the default.** A no-argument `load_calibration()` reads the
-  calibration file shipped inside the SDK, which describes the shipped units (normal mount). You
-  name a different file only when you have one — see [Calibration](#calibration).
+  calibration file shipped inside the SDK, which describes the shipped units. You name a
+  different file only when you have one — see [Calibration](#calibration).
 - **Nothing moves before a calibration is loaded.** Every motion method raises `CommandError` on
   an uncalibrated config, because the placeholder limits describe no real travel.
 
@@ -91,9 +91,9 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 
 - `channel` — CAN interface name. Every LiteGrip shares CAN ID `0x08`, so the channel is the only
   identity key when two sit on one machine.
-- `mount` — `"normal"` or `"reverse"`, loading that template's limits. The shipped units are
-  normal mount, which is what the factory calibration describes, so leave it unset unless a unit
-  is reverse-mounted (its jaws open when you `close()`).
+- `mount` — **deprecated**, kept only for backward compatibility. Shipped grippers have one
+  mounting, and the factory calibration already describes it; leave it unset and use a
+  no-argument `load_calibration()`.
 - `mst_id` — master ID; `None` auto-detects it.
 - `config` / `motion_config` — replace the two dataclasses up front instead of editing them after
   construction.
@@ -106,7 +106,7 @@ LiteGrip(channel="can0", can_id=0x08, mst_id=None, canfd_mode=None,
 | `config` | `GripperConfig` — limits, scale, gains |
 | `motion_config` | `MotionConfig` — every tunable; settable as a whole or field by field |
 | `actions` | `GripperActions` — the engine the high-level methods forward to |
-| `mount` | `"normal"`, `"reverse"`, or `None` until calibrated (derived from the limits) |
+| `mount` | **Deprecated**, kept for compatibility; always `"normal"` on a calibrated shipped unit, `None` until calibrated |
 | `is_connected`, `is_enabled` | Session state |
 | `last_send_error` | Why the last `send_mit_frame` did not send, or `None`. The exception the send reported — an `OSError` from the transport, or the `NotInitializedError` naming the step that was skipped. |
 | `session` | The CAN session, for advanced use |
@@ -250,7 +250,7 @@ it and nothing else:
 from litegrip import LiteGrip
 
 with LiteGrip("can0") as gripper:
-    gripper.load_calibration()      # the shipped file, describing a normal-mount unit
+    gripper.load_calibration()      # the shipped file, describing the shipped unit
     gripper.enable()
 ```
 
@@ -258,8 +258,8 @@ with LiteGrip("can0") as gripper:
 | --- | --- |
 | `load_calibration()` → `bool` | The shipped factory calibration, plus `LITEGRIP_CALIB` when that is set (the env var wins). |
 | `load_calibration(path="/abs/file.json")` → `bool` | That file. Falls back to the factory file only if the path cannot deliver a usable calibration, and warns on a channel mismatch. |
-| `load_calibration(template="normal")` / `load_template(name)` → `bool` | The limits of that template, whatever channel it is on. Strict: an unknown name raises `CommandError`. |
-| `list_templates()` → `List[str]` | `['normal', 'reverse']` — every name the SDK accepts, for a UI to offer. A module-level function, imported by name. |
+| `load_calibration(template="normal")` / `load_template(name)` → `bool` | **Deprecated**, kept only for backward compatibility; new code uses a no-argument `load_calibration()` or `path=`. |
+| `list_templates()` → `List[str]` | **Deprecated**, kept for compatibility; still returns `['normal', 'reverse']`. |
 | `default_calib_path(channel="can0")` → `str` | Where a calibration is saved: `~/.litegrip/<channel>_calibration.json`, or `$LITEGRIP_CALIB` when set. |
 | `save_calibration(path=None)` → `str` | Writes the current config to that path. |
 | `zero()` → `CalibrationData` | Probes both mechanical stops, derives the scale, saves the result. |
@@ -283,7 +283,60 @@ What follows from that:
   the one per-unit measurement no calibration file carries, and it matters only when you re-probe.
 - The factory file declares `channel: can0`, so a `can1` unit has no implicit source and fails
   loudly — `load_calibration()` returns `False` — rather than silently adopting `can0`'s
-  direction. Give it a template, or a `zero()` of its own named back as above.
+  calibration. Name its own `zero()` back as shown in the next section.
+
+### Using your own calibration file
+
+`zero()`, `calibrate_guided()`, and `calibrate_manual()` write their result to
+`~/.litegrip/<channel>_calibration.json`. A no-argument `load_calibration()` **does not read
+it**; the next run must name it explicitly.
+
+The most direct way is to pass the save location back to `load_calibration()`:
+
+```python
+from litegrip import LiteGrip, default_calib_path
+
+path = default_calib_path("can0")        # ~/.litegrip/can0_calibration.json
+with LiteGrip("can0") as gripper:
+    if not gripper.load_calibration(path=path):
+        raise RuntimeError(f"cannot load calibration: {path}")
+    gripper.enable()
+    gripper.open()
+```
+
+For several grippers, or to avoid repeating the path in every script, point an environment
+variable at it; this covers every channel at once:
+
+```bash
+export LITEGRIP_CALIB="$HOME/.litegrip/can0_calibration.json"
+```
+
+```python
+gripper.load_calibration()   # reads LITEGRIP_CALIB first, then the factory file
+```
+
+Three rules decide whether the file is read:
+
+- **`path=` accepts any JSON path.** It is not limited to `<channel>_calibration.json`; that
+  name is only the default destination of `save_calibration()`. A no-argument load does not
+  read that directory or guess file names, so do not rename a calibration and expect it to
+  be picked up.
+- **The `channel` inside `LITEGRIP_CALIB` must match this instance.** If it does not, a
+  no-argument load skips the file and falls back to the factory one, so a `can1` unit never
+  silently adopts `can0`'s calibration. `path=` does not skip it; it only warns.
+- **`path=` falls back to the factory calibration when it cannot read the file, and may still
+  return `True`.** Do not trust the return value alone: `Calibration loaded from <path>` in
+  the log names the file actually read, or check the values below.
+
+Verify the loaded calibration before commanding motion:
+
+```python
+cfg = gripper.config
+print(cfg.calibrated)                                               # must be True
+print(abs(cfg.pos_open_rad - cfg.pos_closed_rad) * cfg.rad_to_mm)   # travel, mm
+```
+
+With `calibrated=False`, every motion method raises `CommandError`, so this check is also the gate before motion.
 
 ### Reading the results
 
@@ -556,10 +609,9 @@ the config as their first argument rather than being called on the gripper.
 | `CommandError` naming a calibration | No calibration loaded for this channel. Call `load_calibration()`. |
 | `ConnectError`, or no status frame ever | `can0` is down, or the bitrate is not 1 Mbit/s. See step 2. |
 | `HardwareError` from `enable()` | The motor never reported `err == 1`. Check power, then `clear_fault()`. |
-| The jaws move the wrong way | The unit is reverse-mounted, not normal. Construct with `mount="reverse"`. |
 | `close()` returns `ok=False` | The jaw parked further than `stop_tol` from the limit. The gap comes from `zero()` probing harder than `close()` presses, so raising `stop_lead_mm` barely moves it — check that the calibration describes the real travel, and raise `stop_tol` if the unit is genuinely parked on the stop. |
 | `travel_guard` is set | The runaway watch tripped: the jaw walked past the closed-side stop while a force was held — an empty `grasp()` does this when the stop is not where the calibration says. Check the calibration describes the real travel, and that nothing has removed the stop. The jaws are now outside the calibrated travel: `disable()`, push them back clear of the stop by hand, then `enable()`, before commanding anything else. |
-| A `can1` unit's `load_calibration()` returns `False` | A no-argument load reads the factory file, which declares `channel: can0`, so this unit has no implicit source. Give it a template, or name its own file with `path=` or `LITEGRIP_CALIB`. |
+| A `can1` unit's `load_calibration()` returns `False` | A no-argument load reads the factory file, which declares `channel: can0`, so this unit has no implicit source. Name its own file with `path=` or `LITEGRIP_CALIB`; see [Using your own calibration file](#using-your-own-calibration-file). |
 | The held force sags below the setpoint | You changed the hold gains, or something is back-driving the jaws faster than the feed-forward. `hold_kp` / `hold_kd` are deprecated and ignored. |
 | `import litegrip` loads older code than the checkout you are reading | An installed copy does not update itself across `git pull`. Check `litegrip.__file__`, or `pip install -e .` in the checkout. |
 

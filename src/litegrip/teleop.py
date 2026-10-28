@@ -543,7 +543,7 @@ def check_ready(cfg: Any) -> None:
         raise TeleopNotReady(
             "gripper is not calibrated: pos_closed_rad / pos_open_rad are still "
             "placeholder defaults and the direction is a guess. Run "
-            "load_calibration() / load_template(), or zero() first.")
+            "load_calibration(), or zero() first.")
     if abs(float(cfg.pos_closed_rad) - float(cfg.pos_open_rad)) <= 1e-6:
         raise TeleopNotReady(
             "zero travel: pos_closed_rad equals pos_open_rad — recalibrate.")

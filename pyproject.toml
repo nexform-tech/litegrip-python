@@ -66,5 +66,5 @@ where = ["src"]
 [tool.setuptools.package-data]
 # py.typed tells type checkers the annotations are real. The JSON files are the
 # read-only fallback used when a unit has never been calibrated on site: the
-# factory one, plus the normal/reverse direction templates.
+# factory one, plus the legacy direction templates kept for compatibility.
 litegrip = ["py.typed", "*.json"]
