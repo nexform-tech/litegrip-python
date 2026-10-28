@@ -73,23 +73,21 @@ def _zenoh_transport(role: str, key: str, port: int, host: Optional[str],
 # The calibration the SDK ships for the unit it ships with.  This is the
 # *standard* value: a no-argument load_calibration() reads it and nothing else.
 # A calibration measured on the buyer's machine is never picked up by accident
-# — name it with ``path=``, ``template=`` or ``LITEGRIP_CALIB``.
+# — name it with ``path=`` or ``LITEGRIP_CALIB``.
 _FACTORY_CALIB = _os.path.join(_os.path.dirname(__file__), "factory_calibration.json")
 
-# Pre-made calibration templates shipped with the package.  Each is a pair of
-# nominal limits whose *ordering* declares the mounting direction: "normal"
-# closes at the larger rad value, "reverse" at the smaller one.  They are a
-# labelling seed, not a per-unit calibration — the limits are nominal, so run
-# zero() to measure the real travel.  Pick one by eye after watching which way
-# the jaws move::
-#
-#     gripper.load_calibration(CALIB_TEMPLATES["reverse"])   # by path
-#     gripper.load_template("reverse")                       # or by name
+# Calibration templates kept for backward compatibility.  They are
+# **deprecated**: shipped grippers have one mounting, which the factory
+# calibration already describes, so new code uses a no-argument
+# load_calibration() or an explicit ``path=``.  Each template is a pair of
+# nominal limits whose *ordering* still declares a direction (the "normal" one
+# closes at the larger rad value); they are a labelling seed, not a per-unit
+# calibration, so run zero() to measure the real travel.
 #
 # They deliberately carry no `channel`, `can_id`, `mst_id` or gain values: a
 # template declares a *direction*, and adopting a device identity or a tuned
-# kp/kd from it would silently rewrite what the caller set.  Use
-# :func:`list_templates` to enumerate the names for a UI.
+# kp/kd from it would silently rewrite what the caller set.  list_templates()
+# is likewise deprecated and kept only so existing callers keep working.
 CALIB_TEMPLATES = {
     "normal": _os.path.join(_os.path.dirname(__file__), "calibration_normal.json"),
     "reverse": _os.path.join(_os.path.dirname(__file__), "calibration_reverse.json"),
@@ -179,9 +177,11 @@ def default_calib_path(channel: str = DefaultParams.CAN_CHANNEL) -> str:
 
 
 def list_templates() -> List[str]:
-    """The calibration template names, in declaration order (normal first).
+    """The legacy calibration template names, in declaration order.
 
-    For a UI that has to offer the mount as a choice.
+    **Deprecated.**  Kept for backward compatibility; shipped grippers have
+    one mounting and the factory calibration already describes it.  Returns
+    the historical names so existing callers keep working.
     """
     return list(CALIB_TEMPLATES)
 
@@ -280,13 +280,10 @@ class LiteGrip:
         so the gripper goes limp when the object is released.  Set ``False``
         to leave the motor enabled after disconnecting.
     mount:
-        Template name declaring which way this unit is mounted —
-        ``"normal"`` or ``"reverse"`` (see :data:`CALIB_TEMPLATES` and
-        :func:`list_templates`).  Loads that template immediately, so
-        ``LiteGrip("can1", mount="reverse")`` is all a two-gripper setup
-        needs.  ``None`` (default) loads nothing; call
-        :meth:`load_calibration` yourself.  This *declares* the mount; read
-        the resulting direction back from :attr:`GripperConfig.mount`.
+        **Deprecated.**  Kept for backward compatibility.  Shipped grippers
+        have one mounting, which the factory calibration already describes;
+        leave this ``None`` (the default) and call :meth:`load_calibration`
+        yourself.
 
     The gripper works as a context manager::
 
@@ -384,12 +381,11 @@ class LiteGrip:
 
     @property
     def mount(self) -> Optional[str]:
-        """``"normal"`` / ``"reverse"``, or ``None`` while uncalibrated.
+        """The legacy mount label, or ``None`` while uncalibrated.
 
-        Read back from the loaded limits (see
-        :attr:`~litegrip.GripperConfig.mount`) — not necessarily the name
-        that was *declared*, since a calibration run keeps the direction but
-        rewrites the travel.
+        **Deprecated.**  Kept for backward compatibility.  Shipped grippers
+        have one mounting, so a calibrated unit reports ``"normal"``.  Read
+        the limits from :attr:`GripperConfig` when you need the travel.
         """
         return self._config.mount
 
@@ -1118,15 +1114,13 @@ class LiteGrip:
 
         Three ways to say which file, and they are mutually exclusive:
 
-        * ``template="reverse"`` — a name from :data:`CALIB_TEMPLATES`
-          (:func:`list_templates`).  Strict: if that template cannot be read
-          this raises instead of falling back, because the fallback would be
-          the factory file, and that file is a *normal* mount — answering a
-          request for reverse with normal is the one failure the name exists
-          to prevent.
+        * ``template=...`` — **deprecated**, kept for backward compatibility.
+          A name from :data:`CALIB_TEMPLATES` (:func:`list_templates`).
+          Strict: if that template cannot be read this raises instead of
+          falling back to the factory file.
         * ``path=...`` — an explicit file, which may be anywhere (including a
           template's path).  Falls back to the built-in factory calibration
-          if it cannot be read.
+          if it cannot be read, and may still return True when it does.
         * neither — the factory calibration the SDK ships, and nothing else.
           A calibration measured on this machine is never picked up by
           accident: name it with ``path=``, or point ``LITEGRIP_CALIB`` at it
@@ -1134,8 +1128,8 @@ class LiteGrip:
 
           The factory file declares ``channel: can0``, so a ``can1`` unit gets
           nothing from a no-argument load — it fails loudly rather than
-          silently adopting ``can0``'s direction.  Give it a calibration with
-          ``mount=``, ``path=`` or ``LITEGRIP_CALIB``.
+          silently adopting ``can0``'s calibration.  Give it a calibration
+          with ``path=`` or ``LITEGRIP_CALIB``.
 
           Any file in ``~/.litegrip`` that this load passed over is named in a
           warning, with the call that would use it.
@@ -1143,9 +1137,8 @@ class LiteGrip:
         Call this after :meth:`connect` but before :meth:`enable`.
 
         The limits in the file decide the direction: whichever of the two is
-        numerically larger is the closed side.  Loading a template is how a
-        reverse-mounted gripper is declared, and the direction a file implies
-        is logged.
+        numerically larger is the closed side, and the direction a file
+        implies is logged.
 
         Args:
             path: JSON file path.
@@ -1266,12 +1259,15 @@ class LiteGrip:
         return True
 
     def load_template(self, name: str) -> bool:
-        """Load a pre-made calibration template by name, declaring the mount.
+        """Load a legacy calibration template by name.
 
-        Names come from :func:`list_templates` (``"normal"`` / ``"reverse"``).
+        **Deprecated.**  Kept for backward compatibility; shipped grippers
+        have one mounting and the factory calibration describes it.  New code
+        uses :meth:`load_calibration` with no arguments or ``path=``.
+
         Thin wrapper over ``load_calibration(template=name)`` so the name is
-        resolved in one place; see that method for why a template never falls
-        back to the factory file.
+        resolved in one place; see that method for the template's strict
+        fallback behavior.
 
         Args:
             name: Template name.
@@ -1756,8 +1752,8 @@ class LiteGrip:
 
         A stall only says "something stopped me", never *which* end was hit —
         both ends are hard stops.  So the direction is not discovered here: it
-        comes from :attr:`GripperConfig.close_sign` (load a calibration
-        template first for a reverse mount), and this routine preserves it.
+        comes from :attr:`GripperConfig.close_sign`, and this routine
+        preserves it.
 
         Safety: at a hard stop the encoder keeps creeping (backlash, elastic
         deformation, micro-slip), so the position-based stall test alone can

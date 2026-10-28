@@ -346,15 +346,13 @@ class WriteZeroResult:
 def _check_calibrated(config: GripperConfig) -> None:
     """确认配置真的带上了标定，并有一段非零行程。
 
-    两种限位顺序都合法（``pos_closed_rad`` 可以小于 ``pos_open_rad``，那就是
-    反装），所以这里**不**看谁大谁小 —— 只看有没有标定过的实数。没标定的
-    配置里所有方向都是猜的，必须拦住。
+    两种限位顺序都合法，所以这里**不**看谁大谁小 —— 只看有没有标定过的实数。
+    没标定的配置里所有方向都是猜的，必须拦住。
     """
     if not config.calibrated:
         raise CommandError(
             "配置尚未标定：pos_closed_rad / pos_open_rad 还是占位默认值，"
-            "无法判断方向。先 load_calibration()（可选 "
-            "CALIB_TEMPLATES[\"reverse\"]）或跑一次 zero()。")
+            "无法判断方向。先 load_calibration() 或跑一次 zero()。")
     if abs(config.pos_closed_rad - config.pos_open_rad) <= 1e-6:
         raise CommandError(
             f"行程为零：pos_closed_rad={config.pos_closed_rad} 与 "
