@@ -933,7 +933,7 @@ class LiteGrip:
         print("  夹爪将自动缓慢移动。到达极限时按 Enter 确认。")
 
         s = self._config.close_sign
-        print(f"  方向：{'正向' if s > 0 else '反装'}（由当前配置的限位顺序推出）")
+        print(f"  方向：闭合时 rad {'增大' if s > 0 else '减小'}（由当前标定限位推出）")
         print()
 
         def _step_to_limit(direction: str, sign: float, label: str) -> float:
@@ -1202,9 +1202,9 @@ class LiteGrip:
             if strict:
                 raise CommandError(
                     f"标定模板 {template!r} 读不出来（{sources[0]}）。不作出厂"
-                    f"回退 —— 出厂文件是正装，用它会静默把方向换成正装。")
+                    f"回退 —— 出厂文件的限位方向未必与所点名的模板一致。")
             log.warning("No calibration found (tried: %s). "
-                        "Run zero() first, or load a template.",
+                        "Run zero() first, or restore the factory calibration.",
                         ", ".join(sources))
             return False
 
@@ -1255,7 +1255,7 @@ class LiteGrip:
                  loaded_from,
                  abs(self._config.pos_open_rad - self._config.pos_closed_rad)
                  * self._config.rad_to_mm,
-                 "正向（rad 增大 = 闭合）" if s > 0 else "反装（rad 减小 = 闭合）")
+                 "闭合时 rad 增大" if s > 0 else "闭合时 rad 减小")
         return True
 
     def load_template(self, name: str) -> bool:
@@ -1788,7 +1788,7 @@ class LiteGrip:
         self._can.update_state(timeout_s=0.1)
         init_pos = self._can.get_position()
         print(f"标定开始  初始位置: {init_pos:.4f} rad  "
-              f"（方向：{'正向' if s > 0 else '反装'}）")
+              f"（方向：闭合时 rad {'增大' if s > 0 else '减小'}）")
 
         def _find_limit(direction: str) -> float:
             sign = s if direction == "close" else -s
