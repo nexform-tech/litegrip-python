@@ -174,7 +174,9 @@ young. Ask both when the difference matters.
 | `open(speed_mm_s=None, *, progress=None)` → `MoveResult` | Ramps toward the calibrated open-side stop. With `GripperConfig.work_stroke_mm` set it stops at that opening instead — the shipped calibration sets `80.0` against the unit's 85 mm of travel, so a plain `open()` ends 5 mm short of the open end. |
 | `close(speed_mm_s=None, *, progress=None)` → `MoveResult` | The same, toward the closed side. `work_stroke_mm` is an open-side number and does not change where a close ends. |
 | `home()` → `MoveResult` | Ramps to the calibrated closed position. |
-| `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | Closes onto the object — or onto the closed-side calibrated stop if there is nothing there — then ramps to and holds `force_n` N. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. The hold takes over only once the jaw is stopped: it is `stalled=True` (something is between the jaws) or `reached=True` (the jaws closed empty). `hold_s=0` holds until a fault, the runaway watch, or Ctrl+C. `force_n=None` uses `MotionConfig.force_n` (20 N). |
+| `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | Closes onto the object — or onto the closed-side calibrated stop if there is nothing there — then ramps to and holds `force_n` N. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. The hold takes over only once the jaw is stopped: it is `stalled=True` (something is between the jaws) or `reached=True` (the jaws closed empty). `hold_s=0` holds until a fault, the runaway watch, Ctrl+C, or a `release()` / `request_release()` from another thread — which ends the grasp with `released=True`. `force_n=None` uses `MotionConfig.force_n` (20 N). |
+| `release(clearance_mm=10.0, *, abort=False, timeout_s=None)` → `ReleaseResult` | Ends an in-progress `grasp()` and opens the jaws from the pose where the grip was declared, by `clearance_mm` more, clamped to the calibrated open stop. Safe to call from any thread while `grasp(hold_s=0)` is blocked in another: it queues the request, the grasp thread performs the opening, and the call returns that outcome. With no grasp running it opens from the current position in the calling thread. `abort=True` is the E-stop form: torque off, no opening move, `ok=False`. A second call during the same grasp joins the first. |
+| `request_release(clearance_mm=10.0, *, abort=False)` → `bool` | Non-blocking form of `release()`: records the request if a grasp is running and returns `True`, else `False`. Never sends a frame, so it is safe for a UI thread, a signal handler or an E-stop callback. The grasp thread acts on it before its next frame (within 5 ms). |
 | `goto(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | Ramp to a position in millimetres. |
 | `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | The same in radians. `dq_target` and `tau_feedforward` must be 0: the ramp derives the velocity feed-forward from its own schedule, so both are refused with `CommandError` rather than ignored. |
 | `move_to(target_rad, kp=None, kd=None, tau_feedforward=0.0, duration=1.0)` → `MoveResult` | The same as `goto_rad`, with a longer default `duration`. |
@@ -203,6 +205,18 @@ it. A NaN or ±inf position is refused with `CommandError`, never clamped.
 and the hold frames carry `kp = kd = 0`, so the drive's output *is* the feed-forward torque
 `force_n × 0.1 Nm`. That is what makes the force independent of the workpiece: as a soft object
 yields, the jaws follow it and the grip stays at the setpoint.
+
+**The hold is ended by `release()`, and only by it.** A `grasp(hold_s=0)` keeps sending hold frames
+until something stops it; there is no separate "stop pressing, stay where you are" call. `release()`
+opens from the pose the grip was *declared* at — the end of the force-carrying approach — by
+`clearance_mm` more, not from wherever the set force pressed the jaws to: a 20 N grip drives a few
+millimetres further in, and opening from there would free that much less. The target is
+`max(current, grip pose) + clearance_mm`, clamped to the calibrated open stop and reached by the
+same bounded ramp as every other move. Because a grasp may be holding in one thread while the caller
+wants it to stop from another, `release()` never sends frames from the caller's thread: it records
+the request, the grasp thread sees it before its next frame (5 ms) and performs the opening, and the
+caller gets that result. `request_release()` is the same without the wait, for threads that must not
+block. `abort=True` drops the torque and sends no opening move — the E-stop form.
 
 **A force is only meaningful against something.** There is no call that applies a force at the
 current position, and that is deliberate. Such a call cannot tell whether anything is between the
@@ -346,7 +360,8 @@ What it *means*, and what to check, is per action:
 | Type | Fields | `bool()` is |
 | --- | --- | --- |
 | `MoveResult` | `ok`, `reached`, `stalled`, `state`, `target_rad`, `limit_rad`, `final_cmd_rad`, `steps`, `protected`, `released` | `ok` |
-| `GraspResult` | `ok`, `reached`, `stalled`, `state`, `target_rad`, `force_n`, `cycles`, `travel_guard` | `ok` |
+| `GraspResult` | `ok`, `reached`, `stalled`, `state`, `target_rad`, `force_n`, `cycles`, `travel_guard`, `released` | `ok` |
+| `ReleaseResult` | `ok`, `state`, `opened_mm`, `target_rad`, `aborted` | `ok` |
 | `EnableResult` | `ok`, `state`, `tries` | `ok` |
 
 **Read `ok`.** Three combinations look alarming and are correct:
@@ -370,6 +385,10 @@ A fourth combination is a failure, and new in this version:
   accelerates until the runaway watch releases it. The call releases in place instead and reports
   `cycles=0`. Nothing was gripped. If you see this, the closing leg is being starved — a stale
   state read, or friction the mechanism's own budget cannot overcome.
+
+- **`grasp()` ended by a release** returns `released=True`: `ok=True` when the opening completed,
+  `ok=False` when it was an E-stop (`release(abort=True)`), which sends no opening move. `reached`
+  and `stalled` still describe the closing leg; `state` is the pose after the release.
 
 Stalling far from the limit gives `ok=False`: something blocked the travel. The diagnostic fields
 — `final_cmd_rad`, `steps`, `state` — are what you log when it is false.
@@ -422,6 +441,7 @@ with LiteGrip("can0") as gripper:
 | `force_n` | `20.0` | default `grasp` force |
 | `force_ramp_n_s` | `20.0` | rate the held force climbs to its setpoint, N/s |
 | `hold_interval` | `0.2` | force-hold slice length, seconds |
+| `release_wait_s` | `10.0` | how long `release()` waits for the grasp thread when `timeout_s` is not given |
 | `hold_runaway_rad` | `0.05` | past the closed stop by this much, the force hold drops the torque and stops |
 | `margin` | `0.05` | fraction of travel kept in reserve from the stop by the `limit_target` helper; no shipped call reaches it |
 | `max_lead_mm` | `4.0` | cap on how far the command may lead the measured position, on moves that carry no force setpoint |
@@ -553,8 +573,8 @@ python3 examples/trajectory.py --play pick --repeat 3
 - **A capture that did not fill raises** rather than returning a short recording as if it were
   whole.
 - **Record without zero-gravity when something else drives.** `record_start(zero_gravity=False)`
-  only *reads* state, so the caller may run a `grasp()` or a move sequence from another thread and
-  capture it.
+  only *reads* state, so the caller may run a `grasp()` (ended with `release()`) or a move sequence
+  from another thread and capture it.
 - `LITEGRIP_TRAJ_DIR` moves the trajectory directory. Recording, replay and teleop are mutually
   exclusive and raise `TrajectoryBusyError` / `TeleopBusyError`; `disconnect()` stops whichever is
   running.
