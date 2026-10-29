@@ -42,6 +42,7 @@ from .actions import (
     MotionConfig,
     MoveProgress,
     MoveResult,
+    ReleaseResult,
     WriteZeroResult,
     _check_calibrated,
     clamp_to_travel,
@@ -1381,17 +1382,92 @@ class LiteGrip:
 
         Args:
             force_n: Gripping force in N; ``None`` = ``MotionConfig.force_n``.
-            hold_s: Hold time in seconds; ``0`` = hold until a fault or
-                Ctrl+C.
+            hold_s: Hold time in seconds; ``0`` = hold until a fault,
+                Ctrl+C, or a :meth:`release` / :meth:`request_release` from
+                another thread.
             progress: Optional progress callback.
 
         Returns:
             :class:`~litegrip.actions.GraspResult` — truthy when the hold
             ended normally.  ``stalled=True`` with ``reached=False`` means
             it closed onto an object, which is the expected outcome.
+            ``released=True`` means the grasp ended because a release was
+            requested: ``ok=True`` for a normal release, ``ok=False`` for
+            an abort.
         """
         self._check_connected()
         return self._actions.grasp(force_n, hold_s, progress=progress)
+
+    def release(
+        self,
+        clearance_mm: float = 10.0,
+        *,
+        abort: bool = False,
+        timeout_s: Optional[float] = None,
+    ) -> ReleaseResult:
+        """End an in-progress :meth:`grasp` and open the jaws — thread-safe.
+
+        Call it from any thread, including while ``grasp(hold_s=0)`` is blocked
+        in another one.  The grasp thread owns the CAN frames, so this method
+        never sends any itself while a grasp is running: it records the request
+        and waits for the grasp thread to finish releasing, then returns that
+        outcome.
+
+        With no grasp running it performs the release in the calling thread.
+
+        The jaws open from the pose where the grip was **declared** (the end of
+        the force-carrying approach), not from where the set force pressed them
+        to: a 20 N grip drives a few millimetres further in, and opening from
+        there would free that much less.  The target is
+        ``max(current, grip) + clearance_mm``, clamped to the calibrated open
+        limit, reached by the same bounded position ramp as every other move —
+        never a step command.
+
+        ``abort=True`` is the E-stop form: it drops the torque and sends no
+        opening move, returning as soon as the grasp thread has done so.
+
+        Calling it twice is safe: a second call during the same grasp joins the
+        first and returns its outcome instead of opening again.
+
+        Args:
+            clearance_mm: Extra opening beyond the grip pose, in mm; must be a
+                non-negative finite number.
+            abort: E-stop: torque off only, no opening move.
+            timeout_s: How long to wait for the grasp thread; ``None`` =
+                :attr:`MotionConfig.release_wait_s` (10 s).  On timeout the
+                result is ``ok=False`` and a warning is logged.
+
+        Returns:
+            :class:`~litegrip.actions.ReleaseResult`.
+
+        Raises:
+            CommandError: ``clearance_mm`` is not a non-negative finite number,
+                or no grasp is running and the config is uncalibrated.
+            NotInitializedError: no grasp is running and the gripper is not
+                connected/enabled.
+        """
+        self._check_connected()
+        return self._actions.release(clearance_mm, abort=abort,
+                                     timeout_s=timeout_s)
+
+    def request_release(self, clearance_mm: float = 10.0, *,
+                        abort: bool = False) -> bool:
+        """Non-blocking form of :meth:`release`; never touches the CAN bus.
+
+        Records the request if a grasp is running and returns ``True``; returns
+        ``False`` when there is no grasp to release.  Safe for a UI thread, a
+        signal handler or an E-stop callback: it takes only the release lock,
+        never ``_io_lock``, and sends no frame.  The grasp thread performs the
+        release before its next frame (within 5 ms).
+
+        Args:
+            clearance_mm: Extra opening beyond the grip pose, in mm.
+            abort: E-stop: torque off only, no opening move.
+
+        Returns:
+            True if a grasp was active and the request was recorded.
+        """
+        return self._actions.request_release(clearance_mm, abort=abort)
 
     def zero(self) -> CalibrationData:
         """Full calibration: probe both mechanical limits and save.

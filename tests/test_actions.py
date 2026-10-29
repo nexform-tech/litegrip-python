@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 
 import _sdkpath  # noqa: F401
 from litegrip import (CommandError, GraspResult, GripperConfig, GripperState,
-                      LiteGrip, MotionConfig, UnitConversion, clamp_to_travel,
-                      closing_travel_excursion_rad, force_approach_terms,
-                      limit_target, press_target, work_limit_target)
+                      LiteGrip, MotionConfig, ReleaseResult, UnitConversion,
+                      clamp_to_travel, closing_travel_excursion_rad,
+                      force_approach_terms, limit_target, press_target,
+                      work_limit_target)
 from litegrip.actions import GripperActions, MoveResult
 
 from fake_can import (DT, POS_CLOSED_RAD, POS_OPEN_RAD, RAD_TO_MM,
@@ -984,6 +987,233 @@ class TestGraspHandsOverOnlyOnContact(unittest.TestCase):
         self.assertTrue(all(f.tau_ff == 0.0 for f in fake.frames),
                         "交接了：发出了前馈力矩帧")
         self.assertTrue(any(f.kp == 0.0 for f in fake.frames), "没有撤力帧")
+
+
+class TestRelease(unittest.TestCase):
+    """松开：跨线程结束 ``grasp()``、从交接点张余量、急停、不重复张开。
+
+    线程用例里 ``sleep_fn`` 用 ``time.sleep(0)`` 而不是空函数：空函数下夹取
+    线程会独占 GIL 一直跑，主线程的请求要等解释器切片的 5 ms 才递得进去 ——
+    用例还是能过，但等待时间不确定。``sleep(0)`` 只是让出 GIL，不真的睡。
+    """
+
+    OBJECT_RAD = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2
+
+    def _motion(self, **kw) -> MotionConfig:
+        return MotionConfig(sleep_fn=lambda _: time.sleep(0),
+                            monotonic_fn=tick_clock(0.1), **kw)
+
+    def _start_hold(self, g, progress=None):
+        """后台线程里起一个 ``grasp(hold_s=0)``。
+
+        Returns:
+            ``(线程, 结果容器, 保力已开始的事件)``
+        """
+        started = threading.Event()
+        outcome = {}
+
+        def report(p):
+            if p.phase == "hold":
+                started.set()
+            if progress is not None:
+                progress(p)
+
+        def run():
+            outcome["res"] = g.grasp(force_n=20.0, hold_s=0.0, progress=report)
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return t, outcome, started
+
+    def test_release_from_another_thread_ends_a_zero_hold_and_opens_from_the_grip_pose(self):
+        """``hold_s=0`` 在另一个线程里，``release()`` 把它结束并从交接点张 10 mm。
+
+        工件会屈服（``yield_rad_s``）：设定力在保力期间把夹爪往闭合侧继续推，
+        所以松开那一刻的位置**不是**交接点。基准必须取交接点 —— 也就是从夹爪
+        声明抓住的位置再张 10 mm，而不是从被压实后的位置。
+        """
+        g, fake = make_gripper(block_rad=self.OBJECT_RAD,
+                               yield_rad_s=0.05, yield_tau_nm=0.5,
+                               motion=self._motion())
+        t, outcome, started = self._start_hold(g)
+        self.assertTrue(started.wait(2.0), "保力段没有开始")
+        grip_rad = g.actions._grip_rad
+        self.assertIsNotNone(grip_rad, "交接点没有记录")
+        # 等保力把夹爪往里再压一段（工件屈服），这样「交接点」与「停下处」
+        # 才是两个不同的数；否则这条用例分不出用哪个当基准。
+        deadline = time.monotonic() + 2.0
+        while fake.motor.pos - grip_rad < 0.01 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertGreater(fake.motor.pos - grip_rad, 0.01,
+                           "工件没有屈服，用例分不出基准")
+        hold_from = len(fake.frames)
+
+        result = g.release(clearance_mm=10.0, timeout_s=5.0)
+        t.join(2.0)
+        self.assertFalse(t.is_alive(), "grasp 没有在松开后返回")
+
+        res = outcome["res"]
+        self.assertTrue(res.released, res)
+        self.assertTrue(res.ok, res)
+        self.assertIsInstance(result, ReleaseResult)
+        self.assertTrue(result.ok, result)
+        self.assertFalse(result.aborted)
+
+        # 基准按**交接点**复算；若错用了松开那一刻的位置，目标会少那几毫米。
+        gcfg = g.config
+        s = gcfg.close_sign
+        grip_mm = (gcfg.pos_closed_rad - grip_rad) * s * gcfg.rad_to_mm
+        expected_mm = grip_mm + 10.0
+        expected_rad = gcfg.pos_closed_rad - s * expected_mm / gcfg.rad_to_mm
+        self.assertAlmostEqual(result.target_rad, expected_rad, places=6)
+        self.assertAlmostEqual(result.opened_mm, expected_mm, places=4)
+        self.assertAlmostEqual(res.state.position_rad, expected_rad,
+                               delta=g.motion_config.reach_tol)
+
+        # 张开是斜坡：保力之后有一串位置帧，第一帧不是一步跳到目标。
+        opens = [f for f in fake.frames[hold_from:] if f.kp != 0.0]
+        self.assertGreater(len(opens), 5, "张开不是一段斜坡而是阶跃")
+        first_pos = opens[0].pos_after
+        self.assertLess(abs(opens[0].q - first_pos),
+                        abs(expected_rad - first_pos) / 2,
+                        "第一帧就跳到了目标附近")
+        # 正装时张开是 rad 减小，整段单调。
+        self.assertTrue(all(b.q <= a.q + 1e-9
+                            for a, b in zip(opens, opens[1:])))
+
+    def test_release_during_the_approach_aborts_it(self):
+        """接近途中按下松开：不再交接，改从当前位置张开。"""
+        g, fake = make_gripper(motion=self._motion())
+        asked = []
+
+        def progress(p):
+            if p.phase == "move" and not asked:
+                asked.append(True)
+                self.assertTrue(g.request_release(clearance_mm=5.0))
+
+        res = g.grasp(force_n=20.0, hold_s=0.0, progress=progress)
+
+        self.assertTrue(asked, "接近段没有进度回调，用例没测到")
+        self.assertTrue(res.released, res)
+        self.assertTrue(res.ok, res)
+        self.assertEqual(res.cycles, 0, "接近段被中止了却还交接了保力")
+        # 一帧保力帧都不该发（保力帧是唯一带 tau_ff 的帧）。
+        self.assertFalse([f for f in fake.frames if f.tau_ff != 0.0])
+        # 还没交接 → 基准是当前位置；当前位置离张开端不足 5 mm，目标被夹到
+        # 标定张开限位。
+        self.assertAlmostEqual(res.state.position_rad, POS_OPEN_RAD,
+                               delta=g.motion_config.reach_tol)
+
+    def test_abort_sends_no_open_ramp_and_returns_promptly(self):
+        """``abort=True``：只撤力、不发张开运动，尽快返回。"""
+        g, fake = make_gripper(block_rad=self.OBJECT_RAD, motion=self._motion())
+        t, outcome, started = self._start_hold(g)
+        self.assertTrue(started.wait(2.0), "保力段没有开始")
+        abort_from = len(fake.frames)
+
+        t0 = time.monotonic()
+        result = g.release(abort=True, timeout_s=5.0)
+        elapsed = time.monotonic() - t0
+        t.join(2.0)
+        self.assertFalse(t.is_alive(), "急停没有让 grasp 返回")
+
+        res = outcome["res"]
+        self.assertTrue(result.aborted)
+        self.assertFalse(result.ok)
+        self.assertFalse(res.ok, res)
+        self.assertTrue(res.released, res)
+        self.assertLess(elapsed, 1.0, "急停等了 %.2f s" % elapsed)
+        # 急停之后只有零增益帧：没有张开斜坡。
+        tail = fake.frames[abort_from:]
+        self.assertTrue(tail, "急停一帧都没发")
+        self.assertTrue(all(f.kp == 0.0 for f in tail),
+                        "急停发了带刚度的张开帧")
+
+    def test_release_without_a_grasp_opens_from_the_current_position(self):
+        """没有夹取在跑：在调用方线程里直接张，基准是当前位置。"""
+        g, fake = make_gripper(start_rad=POS_CLOSED_RAD, stops=True,
+                               motion=self._motion())
+
+        result = g.release(clearance_mm=5.0)
+
+        gcfg = g.config
+        expected_rad = (gcfg.pos_closed_rad
+                        - gcfg.close_sign * 5.0 / gcfg.rad_to_mm)
+        self.assertTrue(result.ok, result)
+        self.assertFalse(result.aborted)
+        self.assertAlmostEqual(result.target_rad, expected_rad, places=6)
+        self.assertAlmostEqual(result.opened_mm, 5.0, places=4)
+        self.assertTrue(fake.frames, "一帧都没发")
+        self.assertAlmostEqual(result.state.position_rad, expected_rad,
+                               delta=g.motion_config.reach_tol)
+
+    def test_a_second_release_does_not_open_twice(self):
+        """同一个夹取里第二次 ``release()`` 直接拿第一次的结果，不再张开。"""
+        g, _ = make_gripper(block_rad=self.OBJECT_RAD, motion=self._motion())
+        opening = threading.Event()
+
+        t, outcome, started = self._start_hold(g)
+        self.assertTrue(started.wait(2.0), "保力段没有开始")
+
+        calls = []
+        original = g.actions._do_release
+
+        def counted(req):
+            calls.append(req)
+            opening.set()
+            # 等第二次请求真的排进来再放行张开斜坡 —— 这样「第二次调用发生在
+            # 第一次的松开进行中」是确定的，不靠线程调度。
+            deadline = time.monotonic() + 2.0
+            while not g.actions._release_pending() and time.monotonic() < deadline:
+                time.sleep(0.001)
+            return original(req)
+
+        g.actions._do_release = counted
+
+        results = []
+
+        def first_release():
+            results.append(g.release(clearance_mm=10.0, timeout_s=5.0))
+
+        first = threading.Thread(target=first_release, daemon=True)
+        first.start()
+        self.assertTrue(opening.wait(2.0), "第一次松开没有开始张开")
+        second = g.release(clearance_mm=10.0, timeout_s=5.0)
+
+        first.join(2.0)
+        t.join(2.0)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(t.is_alive(), "grasp 没有返回")
+        self.assertEqual(len(calls), 1, "第二次 release 又张开了一次")
+        self.assertTrue(all(r.ok for r in results + [second]))
+        self.assertTrue(outcome["res"].released)
+
+    def test_request_release_alone_does_not_send_frames(self):
+        """``request_release`` 只递请求：不碰 CAN，也不获取 ``_io_lock``。"""
+        g, fake = make_gripper(motion=self._motion())
+        # 没有夹取：返回 False，且总线上没有任何帧。
+        self.assertFalse(g.request_release(clearance_mm=3.0))
+        self.assertEqual(fake.frames, [])
+
+        # 有夹取：把夹取线程停在保力的进度回调里，再确认这个调用本身不发帧。
+        parked = threading.Event()
+        let_go = threading.Event()
+
+        def progress(p):
+            if p.phase == "hold" and not parked.is_set():
+                parked.set()
+                let_go.wait(2.0)
+
+        t, outcome, started = self._start_hold(g, progress=progress)
+        self.assertTrue(parked.wait(2.0), "夹取线程没有停在保力回调里")
+        before = len(fake.frames)
+        self.assertTrue(g.request_release(clearance_mm=3.0))
+        self.assertEqual(len(fake.frames), before,
+                         "request_release 自己发了帧")
+        let_go.set()
+        t.join(2.0)
+        self.assertFalse(t.is_alive())
+        self.assertTrue(outcome["res"].released)
 
 
 class TestForceHoldIsTorqueOnly(unittest.TestCase):
