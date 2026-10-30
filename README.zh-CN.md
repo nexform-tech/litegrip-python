@@ -163,7 +163,7 @@ print(state.position_mm, state.force_n, state.timestamp)
 | `open(speed_mm_s=None, *, progress=None)` → `MoveResult` | 爬坡走向标定的张开侧限位。若 `GripperConfig.work_stroke_mm` 有值，则停在那段行程处 —— 出厂标定设的是 `80.0`，对着这台机器 85 mm 的行程，所以裸调 `open()` 会在距张开端 5 mm 处停下。 |
 | `close(speed_mm_s=None, *, progress=None)` → `MoveResult` | 一样，方向朝闭合侧。`work_stroke_mm` 是张开侧的数字，不改变 `close()` 的落点。 |
 | `home()` → `MoveResult` | 爬坡回到标定的闭合位置。 |
-| `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | 闭到工件上（中间没东西就闭到闭合侧标定限位），再爬到 `force_n` N 并保持。闭合段就把 `force_n` 当力矩预算，所以顶到工件时压得不会比设定值更狠。保力只在爪子**停下来**之后接手：`stalled=True`（爪子间夹着东西）或 `reached=True`（空爪闭到底）。但**从起点就没动过**就停下不算接触 —— 也可能是预算低于静摩擦 —— 这种情形调用原地撤力、返回 `no_bite=True`，不进保力段。`hold_s=0` 表示保持到故障、失控监视触发或 Ctrl+C。`force_n=None` 用 `MotionConfig.force_n`（20 N）。 |
+| `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | 闭到工件上（中间没东西就闭到闭合侧标定限位），再爬到 `force_n` N 并保持。闭合段就把 `force_n` 当力矩预算，所以顶到工件时压得不会比设定值更狠。保力只在爪子**停下来**之后接手：`stalled=True`（爪子间夹着东西）或 `reached=True`（空爪闭到底）。但**从起点就没动过**就停下、且预算低于 `MotionConfig.breakaway_nm` 时不算接触 —— 那是预算压不出静摩擦 —— 这种情形调用原地撤力、返回 `no_bite=True`，不进保力段。`hold_s=0` 表示保持到故障、失控监视触发或 Ctrl+C。`force_n=None` 用 `MotionConfig.force_n`（20 N）。 |
 | `goto(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | 爬坡走到毫米目标。 |
 | `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | 一样的，单位 rad。`dq_target` 与 `tau_feedforward` 必须是 0：速度前馈由斜坡按自己的排程给出，所以这两个值一律拒绝并抛 `CommandError`，不是静默忽略。 |
 | `move_to(target_rad, kp=None, kd=None, tau_feedforward=0.0, duration=1.0)` → `MoveResult` | 和 `goto_rad` 一样，只是 `duration` 的默认值更长。 |
@@ -332,12 +332,21 @@ print(abs(cfg.pos_open_rad - cfg.pos_closed_rad) * cfg.rad_to_mm)   # 行程，m
   撤力。此时调用改为原地撤力，报 `cycles=0`。什么也没夹住。见到它就说明闭合段被饿着了 ——
   读数过期，或者机构自身预算吃不掉的摩擦。
 
+第五种组合是拒夹：
+
 - **`grasp()` 返回 `ok=False, no_bite=True`**，意思是接近段带着力，却**从起点就没推动过**
-  爪子：停住时离起始位置还不到 `MotionConfig.no_bite_mm`（0.5 mm）。这不是接触 —— 更常见的
-  是力矩预算压不出脱离静摩擦需要的力，而不是工件正好摆在起点 —— 而这恰好就是交接会让爪子
-  带着一整段自由行程冲进纯力矩帧、一路加速的情形。所以保力段一帧都不发，调用原地撤力，
-  `cycles` 为 0，`stalled` 与 `reached` 在这条路上都是 `False`。要救它得把设定值抬到静摩擦
-  之上，不是把保力拉长。
+  爪子：停住时离起始位置还不到 `MotionConfig.no_bite_mm`（0.5 mm），**而且**这一段的预算
+  （`force_n × 0.1 × press_safety`）低于 `MotionConfig.breakaway_nm`（这台机器 0.2 Nm，
+  也就是设定值 2.2 N 及以下）。这不是接触 —— 是力矩预算压不出脱离静摩擦需要的力 —— 而这
+  恰好就是交接会让爪子带着一整段自由行程冲进纯力矩帧、一路加速的情形。所以保力段一帧都不
+  发，调用原地撤力，`cycles` 为 0，`stalled` 与 `reached` 在这条路上都是 `False`。要救它得
+  把设定值抬到脱离力之上（这台机器约 2.5 N），不是把保力拉长。预算在脱离力之上时，零位移
+  **就是**顶到了东西，照常交接：工件已经贴在张开侧、或者 `release(abort=True)` 之后原地
+  重夹，都还能夹住。
+
+两个边界值得知道。起点落在闭合端 `reach_tol`（0.9 mm）以内时整段不判堵转 —— 它报
+`reached`，保力段前面本来也没有自由行程。另外判的是预算、不是工件：粘手的工件正好摆在起点、
+而设定值又低于脱离力时，这一次夹取会被拒。
 
 在离限位很远的地方堵转，才会给 `ok=False`：有东西挡住了行程。为假时该记的，就是那几个诊断
 字段 —— `final_cmd_rad`、`steps`、`state`。
@@ -394,6 +403,7 @@ with LiteGrip("can0") as gripper:
 | `stop_lead_mm` | `0.7` | 接近限位时的同一上限，用来压住压紧力矩 |
 | `press_safety` | `0.9` | 带力的接近段最多能花掉设定值的多少 |
 | `no_bite_mm` | `0.5` | 带力接近段离起点这么近就停住时，判为没咬住、不交接（见上文 `grasp()`） |
+| `breakaway_nm` | `0.2` | 实测静摩擦脱离力矩；只有预算低于它时，零位移停住才算拒夹而不是接触 |
 | `reach_tol` | `0.02` | 判定 `reached` 的位置容差，rad |
 | `stop_tol` | `0.03` | 要算「压到位」，爪子得停到离标定限位多近 |
 | `settle_s` | `0.3` | 爬坡结束后在目标上停留的时间 |

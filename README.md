@@ -174,7 +174,7 @@ young. Ask both when the difference matters.
 | `open(speed_mm_s=None, *, progress=None)` → `MoveResult` | Ramps toward the calibrated open-side stop. With `GripperConfig.work_stroke_mm` set it stops at that opening instead — the shipped calibration sets `80.0` against the unit's 85 mm of travel, so a plain `open()` ends 5 mm short of the open end. |
 | `close(speed_mm_s=None, *, progress=None)` → `MoveResult` | The same, toward the closed side. `work_stroke_mm` is an open-side number and does not change where a close ends. |
 | `home()` → `MoveResult` | Ramps to the calibrated closed position. |
-| `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | Closes onto the object — or onto the closed-side calibrated stop if there is nothing there — then ramps to and holds `force_n` N. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. The hold takes over only once the jaw is stopped: it is `stalled=True` (something is between the jaws) or `reached=True` (the jaws closed empty). A stop that came **without the jaw ever moving from where the approach began** is not treated as contact — the budget may simply be below static friction — so the call releases in place and returns `no_bite=True` instead of handing over the hold. `hold_s=0` holds until a fault, the runaway watch, Ctrl+C, or a `release()` / `request_release()` from another thread — which ends the grasp with `released=True`. `force_n=None` uses `MotionConfig.force_n` (20 N). |
+| `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | Closes onto the object — or onto the closed-side calibrated stop if there is nothing there — then ramps to and holds `force_n` N. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. The hold takes over only once the jaw is stopped: it is `stalled=True` (something is between the jaws) or `reached=True` (the jaws closed empty). A stop that came **without the jaw ever moving from where the approach began**, with a budget below `MotionConfig.breakaway_nm`, is not treated as contact — the budget simply cannot break static friction — so the call releases in place and returns `no_bite=True` instead of handing over the hold. `hold_s=0` holds until a fault, the runaway watch, Ctrl+C, or a `release()` / `request_release()` from another thread — which ends the grasp with `released=True`. `force_n=None` uses `MotionConfig.force_n` (20 N). |
 | `release(clearance_mm=10.0, *, abort=False, timeout_s=None)` → `ReleaseResult` | Ends an in-progress `grasp()` and opens the jaws from the pose where the grip was declared, by `clearance_mm` more, clamped to the calibrated open stop. Safe to call from any thread while `grasp(hold_s=0)` is blocked in another: it queues the request, the grasp thread performs the opening, and the call returns that outcome. With no grasp running it opens from the current position in the calling thread. `abort=True` is the E-stop form: torque off, no opening move, `ok=False`. A second call during the same grasp joins the first. |
 | `request_release(clearance_mm=10.0, *, abort=False)` → `bool` | Non-blocking form of `release()`: records the request if a grasp is running and returns `True`, else `False`. Never sends a frame, so it is safe for a UI thread, a signal handler or an E-stop callback. The grasp thread acts on it before its next frame (within 5 ms). |
 | `goto(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | Ramp to a position in millimetres. |
@@ -386,13 +386,24 @@ A fourth combination is a failure, and new in this version:
   `cycles=0`. Nothing was gripped. If you see this, the closing leg is being starved — a stale
   state read, or friction the mechanism's own budget cannot overcome.
 
+A fifth is a refusal:
+
 - **`grasp()` with `ok=False, no_bite=True`** means the approach carried its force but never moved
-  the jaws: it stopped within `MotionConfig.no_bite_mm` (0.5 mm) of where it started. That is not
-  contact — it is more often a budget that cannot break static friction than a part sitting at the
-  start pose — and it is exactly the case where handing over the hold would send a jaw with a free
+  the jaws: it stopped within `MotionConfig.no_bite_mm` (0.5 mm) of where it started *and* its
+  budget (`force_n × 0.1 × press_safety`) was below `MotionConfig.breakaway_nm` (0.2 N·m on this
+  unit, so setpoints up to 2.2 N). That is not contact — it is a budget that cannot break static
+  friction — and it is exactly the case where handing over the hold would send a jaw with a free
   stroke ahead of it into the torque-only frames and let it accelerate. So the hold is never
   entered, the call releases in place, and `cycles` is 0. `stalled` and `reached` are both `False`
-  on this path. The remedy is a setpoint above the breakaway, not a longer hold.
+  on this path. The remedy is a setpoint above the breakaway (~2.5 N here), not a longer hold.
+  Above the breakaway a zero-displacement stop *is* contact and is held normally: a part already
+  against the open jaw, or a re-grasp in place after `release(abort=True)`, still grips.
+
+Two edges worth knowing. An approach that starts within `reach_tol` (0.9 mm) of the closed stop
+gets no stall verdict at all — it reports `reached` instead, and the hold has nothing to run
+because the jaws are already on the end stop. And the refusal is about the budget, not the part:
+if a grippy part sits at the start pose *and* the setpoint is below the breakaway, the grasp is
+refused rather than risked.
 
 - **`grasp()` ended by a release** returns `released=True`: `ok=True` when the opening completed,
   `ok=False` when it was an E-stop (`release(abort=True)`), which sends no opening move. `reached`
@@ -456,6 +467,7 @@ with LiteGrip("can0") as gripper:
 | `stop_lead_mm` | `0.7` | the same cap on the approach to a stop, so the pressing torque stays bounded |
 | `press_safety` | `0.9` | fraction of the setpoint a force-carrying approach may spend |
 | `no_bite_mm` | `0.5` | a force-carrying approach that stops this close to its start pose is refused, not read as contact (see `grasp()` above) |
+| `breakaway_nm` | `0.2` | measured static-friction breakaway; only a budget below it makes a zero-displacement stop a refusal rather than contact |
 | `reach_tol` | `0.02` | position tolerance for `reached`, radians |
 | `stop_tol` | `0.03` | how close to the calibrated stop the jaw must park to count as pressed home |
 | `settle_s` | `0.3` | time spent holding the target after the ramp |

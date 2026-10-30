@@ -159,14 +159,28 @@ class MotionConfig:
     # 力，于是夹爪带着设定力在自由行程里一路加速（2026-10-29 实测：2 N 夹取
     # 的接近段压 0.18 Nm 原地不动，接手的保力段压 0.20 Nm 推了 19 mm）。
     #
-    # 所以带设定力的接近段里，位移小于这个值的停住**不算接触**：报「没能脱离
-    # 静摩擦」（``MoveResult.no_bite``）、撤力、不交接。代价是「工件就贴在起点
-    # 旁边、夹爪还没走开就顶上了」也按这个处理 —— 那一次夹取会报失败，而反过来
-    # 放行会把一次误判变成一次带力冲程，两边代价不对称，所以选失败。
+    # 所以带设定力的接近段里，位移小于这个值的停住，且预算压不出脱离力（见
+    # ``breakaway_nm``）时**不算接触**：报「没能脱离静摩擦」（``MoveResult.no_bite``）、
+    # 撤力、不交接。代价是「工件就贴在起点旁边、夹爪还没走开就顶上了」也按这个
+    # 处理 —— 那一次夹取会报失败，而反过来放行会把一次误判变成一次带力冲程，
+    # 两边代价不对称，所以选失败。
     #
     # 0.5 mm 是台架闭合侧粘滑死区（约 0.0103 rad ≈ 0.76 mm）的下面：比死区更短
     # 的「顶住」读数本来就分辨不出来，真工件也做不到停在这么窄的缝里。
     no_bite_mm: float = 0.5
+
+    # ── 脱离力：判断「没动」是哪一种的力矩门槛 ────────────────────────
+    # 上面那条判据只在**这一段的预算本来就压不出脱离力**时才成立。预算远高于
+    # 脱离力时，夹爪没动几乎只可能是顶上了东西 —— 那正是「夹住了」，该交接，
+    # 保力段照着设定值压，不会跑。所以判据再收紧一层：只有预算
+    # (``force_n × 0.1 × press_safety``) 低于这个值，零位移才判 ``no_bite``；
+    # 否则照旧 ``stalled``。少了这一层，20 N 夹一个已经贴在张开侧的工件、或者
+    # ``release(abort=True)`` 之后原地重夹（那一次松开不发张开指令），都会被拒。
+    #
+    # 0.2 Nm 就是这台机器上实测的脱离力（2026-10-29：接近段 0.18 Nm 原地不动，
+    # 保力段 0.20 Nm 推走 19 mm，落在 1.8–2.0 N 之间）。换成设定值：≤ 2.2 N 的
+    # 夹取预算不到它，零位移判拒夹；≥ 2.5 N 的预算在它之上，零位移判顶住东西。
+    breakaway_nm: float = 0.2
 
     # ── 行进段堵转保护（≈7 N） ────────────────────────────────────────
     # 普通移动（``press=True`` 的 open/close）行进段的领先上限是 max_lead_mm，
@@ -817,6 +831,14 @@ class GripperActions:
         排程由摩擦和读数延迟定。两条都没成立时**如实报 ``ok=False``** 并撤力
         返回（``reached`` / ``stalled`` 都是 ``False``，``cycles=0``），不放跑。
 
+        还有一条不算交接：**从起点就没动过**。带设定力的接近段如果停住时离它
+        自己的起点不到 :attr:`MotionConfig.no_bite_mm`（0.5 mm），而且这一段的
+        预算（``force_n × 0.1 × press_safety``）低于
+        :attr:`MotionConfig.breakaway_nm`（0.2 Nm，实测脱离力），那它不是顶到
+        工件，而是压根没脱离静摩擦 —— 交过去的话保力段 1.0 倍的力矩正好越过
+        脱离力，夹爪会在自由行程里带着设定力一路走。这一条报 ``no_bite=True``、
+        ``cycles=0``、撤力返回，一帧保力都不发（见 :attr:`MotionConfig.no_bite_mm`）。
+
         保力段是纯力矩源，没有位置指令可夹，所以它有自己的一条护栏
         （:attr:`MotionConfig.hold_runaway_rad`）：越出闭合侧标定限位太多就撤力
         返回，结果里 ``ok=False`` / ``travel_guard=True``。正常夹取不会触发。
@@ -831,8 +853,9 @@ class GripperActions:
         Returns:
             :class:`GraspResult`。夹住工件时 ``stalled=True`` 且
             ``reached=False``（压不到空载目标位置是正常的）。闭合段结束时夹爪
-            既没到位也没堵转时 ``ok=False``、``cycles=0`` —— 见上。被松开结束
-            时 ``released=True``：正常松开 ``ok=True``，急停 ``ok=False``。
+            既没到位也没堵转时 ``ok=False``、``cycles=0`` —— 见上。接近段没能
+            脱离静摩擦时 ``ok=False``、``no_bite=True``、``cycles=0``。被松开
+            结束时 ``released=True``：正常松开 ``ok=True``，急停 ``ok=False``。
 
         Raises:
             CommandError: ``force_n`` / ``hold_s`` 不是有限数。两条都不是
@@ -894,16 +917,7 @@ class GripperActions:
                     "交过去会在自由行程里一路加速 —— 撤力返回，不下发保力。",
                     force, force * UnitConversion.N_TO_NM * cfg.press_safety,
                     move.state.position_mm)
-                return GraspResult(
-                    ok=False,
-                    reached=move.reached,
-                    stalled=move.stalled,
-                    state=move.state,
-                    target_rad=move.target_rad,
-                    force_n=force,
-                    cycles=0,
-                    no_bite=True,
-                )
+                return self._refused_handover(move, force, no_bite=True)
 
             if not (move.reached or move.stalled):
                 # 既没到位也没顶上东西 —— 夹爪还在自由行程里，而位置环是此刻
@@ -916,16 +930,7 @@ class GripperActions:
                             "%+.5f rad，目标 %+.5f rad）—— 它还在自由行程里，而保"
                             "力段没有位置项也没有速度项，交过去会一路加速。撤力返回。",
                             move.state.position_rad, move.target_rad)
-                return GraspResult(
-                    ok=False,
-                    reached=move.reached,
-                    stalled=move.stalled,
-                    state=move.state,
-                    target_rad=move.target_rad,
-                    force_n=force,
-                    cycles=0,
-                    travel_guard=False,
-                )
+                return self._refused_handover(move, force)
 
             # 交接点：带力接近段的终点（夹爪「声明」抓住的位置），不是随后被
             # 20 N 压实后停下的位置。松开的基准取它，见 _do_release。
@@ -965,6 +970,31 @@ class GripperActions:
                 self._release_req = None
                 self._grip_rad = None
                 self._hold_done.set()
+
+    @staticmethod
+    def _refused_handover(
+        move: MoveResult,
+        force: float,
+        *,
+        no_bite: bool = False,
+    ) -> GraspResult:
+        """交接被拒时的 :class:`GraspResult`：一帧保力都没发。
+
+        两条拒绝路径 —— 接近段从起点就没动过（``no_bite``），和闭合段结束时
+        既没到位也没堵转 —— 结果形状完全一样，只有 ``no_bite`` 不同。放在一处
+        构造，免得将来改了字段只改到一条（见 ``grasp()`` 里的两处调用）。
+        """
+        return GraspResult(
+            ok=False,
+            reached=move.reached,
+            stalled=move.stalled,
+            state=move.state,
+            target_rad=move.target_rad,
+            force_n=force,
+            cycles=0,
+            travel_guard=False,
+            no_bite=no_bite,
+        )
 
     def _grasp_ends_with_release(
         self,
@@ -1580,6 +1610,11 @@ class GripperActions:
         # 整段斜坡都是「不动」。`home()` 紧跟在 `close()` 之后（两个都瞄着闭合
         # 端，只剩一点点齿隙）就是这个形状。压紧路径不受影响：那里目标在限位
         # 外侧，「到了还不动」正是要判的堵转。
+        # 带设定力的接近段里，这一条还留了个小口子：起点落在 ``reach_tol``
+        # （0.02 rad ≈ 0.9 mm）以内时不判堵转，于是 ``no_bite`` 也设不上 ——
+        # 但那时 ``reached`` 为真、夹爪已经在闭合端 0.9 mm 之内，保力段前面
+        # 没有自由行程可跑，交过去最多把最后那点缝隙压到限位上。所以这条口子
+        # 不补，README 说的是「从起点就没动过」不是「任何情况下都不交接」。
         judge_stall = press or dist_mm > cfg.reach_tol * gcfg.rad_to_mm
 
         # 两档领先上限：行进段用 max_lead_mm 破静摩擦，贴近限位后收窄到
@@ -1708,8 +1743,12 @@ class GripperActions:
                 # 「没动」不等于「顶到工件」：带设定力时，从起点起就没挪过位的
                 # 停住也可能是这一段压不出脱离静摩擦的力矩。这一条不能当接触，
                 # 否则交接给纯力矩的保力段就是一次带力冲程（见
-                # ``MotionConfig.no_bite_mm``）。
+                # ``MotionConfig.no_bite_mm``）。但只有预算本来就在脱离力之下时
+                # 才这么判 —— 预算远高于脱离力还没动，那是真顶上了东西
+                # （见 ``MotionConfig.breakaway_nm``）。
                 if (force_n is not None
+                        and force_n * UnitConversion.N_TO_NM * cfg.press_safety
+                        < cfg.breakaway_nm
                         and abs(pos - before.position_rad)
                         < cfg.no_bite_mm / gcfg.rad_to_mm):
                     no_bite = True
