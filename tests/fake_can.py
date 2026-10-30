@@ -81,7 +81,11 @@ class FakeMotor:
                  limit_hi: Optional[float] = None,
                  yield_rad_s: float = 0.0, yield_tau_nm: float = 0.0,
                  creep_rad_s_per_nm: float = 0.0,
-                 report_lag_ticks: int = 0):
+                 report_lag_ticks: int = 0,
+                 breakaway_tau_nm: float = 0.0):
+        # 静摩擦的脱离力矩 Nm：站在原地的夹爪要帧里力矩过这个门槛才动。
+        # 0 = 没有静摩擦（默认，别的用例逐位不变）。
+        self.breakaway_tau_nm = breakaway_tau_nm
         # 读数延迟（帧）。真机上 ``get_state(wait=False)`` 拿的是缓存读数，可能
         # 落后几帧；而力控接近段的指令是 ``min(排程, 读数 + 领先上限)``，领先只
         # 有零点几毫米时，``速度 × 延迟`` 就把它吃光了 —— 夹爪于是推不动排程。
@@ -155,6 +159,13 @@ class FakeMotor:
         v = dq + self.GAIN * (kp / self.KP_NOMINAL) * (q - self.pos)
         # 纯前馈力矩下的蠕变（见类上方的说明）。默认 0 时不参与运算。
         v += self.creep_rad_s_per_nm * tau_ff
+        # 静摩擦：**站在原地的**夹爪，帧里的力矩（``kp × 位移 + 前馈``）不过
+        # ``breakaway_tau_nm`` 就一动不动；一旦动起来这道门就不再拦（动摩擦
+        # 按 0 建），所以是「脱离力」而不是「阻力」。真机上 0.9 倍设定值的
+        # 接近段压不出脱离力、夹爪原地站住，就是这一个模型。
+        if (self.breakaway_tau_nm > 0.0 and self.vel == 0.0
+                and abs(kp * (q - self.pos) + tau_ff) < self.breakaway_tau_nm):
+            v = 0.0
         v = max(-self.VMAX, min(self.VMAX, v))
         new = self.pos + v * dt
         if self.block_rad is not None:
@@ -194,14 +205,16 @@ class FakeLiteGripCAN:
                  limit_hi: Optional[float] = None,
                  yield_rad_s: float = 0.0, yield_tau_nm: float = 0.0,
                  creep_rad_s_per_nm: float = 0.0,
-                 report_lag_ticks: int = 0):
+                 report_lag_ticks: int = 0,
+                 breakaway_tau_nm: float = 0.0):
         self.motor = FakeMotor(pos=pos, block_rad=block_rad,
                                sticky_rad=sticky_rad, err=err,
                                limit_lo=limit_lo, limit_hi=limit_hi,
                                yield_rad_s=yield_rad_s,
                                yield_tau_nm=yield_tau_nm,
                                creep_rad_s_per_nm=creep_rad_s_per_nm,
-                               report_lag_ticks=report_lag_ticks)
+                               report_lag_ticks=report_lag_ticks,
+                               breakaway_tau_nm=breakaway_tau_nm)
         self.frames: List[Frame] = []
         self.initialize_results = list(initialize_results or [])
         self.initialize_calls = 0
@@ -370,6 +383,7 @@ def make_gripper(
     yield_tau_nm: float = 0.0,
     creep_rad_s_per_nm: float = 0.0,
     report_lag_ticks: int = 0,
+    breakaway_tau_nm: float = 0.0,
 ):
     """造一个「已连接、已使能、已标定」的 LiteGrip，底层换成 :class:`FakeLiteGripCAN`。
 
@@ -393,6 +407,10 @@ def make_gripper(
     ``report_lag_ticks`` 让上报位置落后若干帧 —— 真机上 ``get_state(wait=False)``
     拿的是缓存读数。力控接近段的指令是 ``min(排程, 读数 + 领先上限)``，领先只有
     零点几毫米时延迟就把它吃光了，夹爪因此推不动排程。默认 0，不影响别的用例。
+
+    ``breakaway_tau_nm`` 给夹爪装上静摩擦：站在原地的夹爪要帧里力矩过这个门槛
+    才动，动起来以后不再拦。用来复现「接近段的力矩预算低于脱离力，夹爪从起点就
+    没动过」那个工况（判据见 ``MotionConfig.no_bite_mm``）。默认 0 = 无静摩擦。
 
     ``start_rad`` 默认停在张开侧（两种装法各自的那一端）。
 
@@ -419,7 +437,8 @@ def make_gripper(
                            yield_rad_s=yield_rad_s,
                            yield_tau_nm=yield_tau_nm,
                            creep_rad_s_per_nm=creep_rad_s_per_nm,
-                           report_lag_ticks=report_lag_ticks)
+                           report_lag_ticks=report_lag_ticks,
+                           breakaway_tau_nm=breakaway_tau_nm)
     g._can = fake
     g._connected = True
     g._enabled = True

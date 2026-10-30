@@ -151,6 +151,23 @@ class MotionConfig:
     # 照设定的力往下发。
     press_safety: float = 0.9           # 预算余量：撞上时实测力落在设定值之下
 
+    # ── 带设定力的接近段「从起点就没动过」的判据 mm ───────────────────
+    # 位置窗口判据只能看见「没动」，可「没动」有三种：真顶到工件、顶到限位、
+    # 以及**这一段的力矩预算低于静摩擦，压根没能脱离**。第三种最危险：它会被
+    # 当成接触，交接给纯力矩的保力段 —— 那一段没有位置项也没有速度项，而保力
+    # 的力矩是设定值的 1.0 倍、接近段只有 0.9 倍，多出来的这一成正好越过脱离
+    # 力，于是夹爪带着设定力在自由行程里一路加速（2026-10-29 实测：2 N 夹取
+    # 的接近段压 0.18 Nm 原地不动，接手的保力段压 0.20 Nm 推了 19 mm）。
+    #
+    # 所以带设定力的接近段里，位移小于这个值的停住**不算接触**：报「没能脱离
+    # 静摩擦」（``MoveResult.no_bite``）、撤力、不交接。代价是「工件就贴在起点
+    # 旁边、夹爪还没走开就顶上了」也按这个处理 —— 那一次夹取会报失败，而反过来
+    # 放行会把一次误判变成一次带力冲程，两边代价不对称，所以选失败。
+    #
+    # 0.5 mm 是台架闭合侧粘滑死区（约 0.0103 rad ≈ 0.76 mm）的下面：比死区更短
+    # 的「顶住」读数本来就分辨不出来，真工件也做不到停在这么窄的缝里。
+    no_bite_mm: float = 0.5
+
     # ── 行进段堵转保护（≈7 N） ────────────────────────────────────────
     # 普通移动（``press=True`` 的 open/close）行进段的领先上限是 max_lead_mm，
     # 一旦夹爪在半路被硬挡，``kp × 领先上限`` ≈ 7.6 N·m 会一直压着；而位置
@@ -276,6 +293,11 @@ class MoveResult:
     # 只有 ``grasp()`` 的带力接近段会检查它：那一段走的不是用户要的终点，而是
     # 夹取的第一步，松开请求意味着「别夹了」。``grasp()`` 据此改走张开。
     release_requested: bool = False
+    # 带设定力的接近段**从起点就没动过**：停住时离起始位置还不到
+    # :attr:`MotionConfig.no_bite_mm`。这不是接触 —— 也可能是力矩预算低于静
+    # 摩擦、夹爪压根没能脱离（判据和代价见 ``MotionConfig.no_bite_mm``）。置位
+    # 时 ``stalled`` 为 False，``grasp()`` 不交接、直接撤力返回。
+    no_bite: bool = False
 
     def __bool__(self) -> bool:
         return self.ok
@@ -302,6 +324,11 @@ class GraspResult:
     # 请求后先完成松开（张开到 ``max(当前, 夹取点) + 余量``），再返回。与
     # ``travel_guard`` 的区别是这不是故障 —— 松开是用户要的正常收尾。
     released: bool = False
+    # 接近段从起点就没能推动夹爪：位移小于 ``MotionConfig.no_bite_mm``，设定值
+    # 的 0.9 倍力矩压不出脱离静摩擦需要的力。这一条**不交接**，保力段一帧都不
+    # 发 —— 交过去它会在自由行程里一路加速（见 ``MotionConfig.no_bite_mm``）。
+    # 置位时 ``stalled`` / ``reached`` 都是 False，``cycles`` 为 0。
+    no_bite: bool = False
 
     def __bool__(self) -> bool:
         return self.ok
@@ -853,6 +880,30 @@ class GripperActions:
             req = self._take_release_request()
             if req is not None:
                 return self._grasp_ends_with_release(req, move, force, cycles=0)
+
+            if move.no_bite:
+                # 接近段从起点就没动过：可能是工件就在那里，也可能是设定值的
+                # 0.9 倍力矩压不出脱离静摩擦需要的力。两者在电机看来一模一样，
+                # 而接手的是纯力矩的保力段（没有位置、没有限速，力矩还比接近段
+                # 高一成）—— 猜错的代价是一次带力冲程，猜对（拒夹）的代价只是
+                # 一次报失败。所以宁可报失败，也不交接。
+                self._release(move.state.position_rad)
+                log.warning(
+                    "夹取未交接：接近段从起点就没能推动夹爪（设定 %.1f N，预算 "
+                    "%.3f Nm，停在 %.1f mm，目标是闭合端）。保力段是纯力矩源，"
+                    "交过去会在自由行程里一路加速 —— 撤力返回，不下发保力。",
+                    force, force * UnitConversion.N_TO_NM * cfg.press_safety,
+                    move.state.position_mm)
+                return GraspResult(
+                    ok=False,
+                    reached=move.reached,
+                    stalled=move.stalled,
+                    state=move.state,
+                    target_rad=move.target_rad,
+                    force_n=force,
+                    cycles=0,
+                    no_bite=True,
+                )
 
             if not (move.reached or move.stalled):
                 # 既没到位也没顶上东西 —— 夹爪还在自由行程里，而位置环是此刻
@@ -1558,6 +1609,7 @@ class GripperActions:
 
         hist = [before.position_rad]
         stalled = False
+        no_bite = False                          # 带力接近段从起点就没动过（见上）
         protected = False
         release_requested = False                # 松开请求叫停了带力接近段
         over_torque = 0                          # 连续过阈的采样点数
@@ -1653,10 +1705,27 @@ class GripperActions:
             if (judge_stall and win_delta is not None
                     and (press or in_ramp)
                     and win_delta < win_thresh_rad):
-                stalled = True
-                log.info("堵转：最近 %d 次采样(%.2f s)净位移仅 %.5f rad "
-                         "(< %.5f)，停在 %+.5f rad",
-                         win, win_s, win_delta, win_thresh_rad, pos)
+                # 「没动」不等于「顶到工件」：带设定力时，从起点起就没挪过位的
+                # 停住也可能是这一段压不出脱离静摩擦的力矩。这一条不能当接触，
+                # 否则交接给纯力矩的保力段就是一次带力冲程（见
+                # ``MotionConfig.no_bite_mm``）。
+                if (force_n is not None
+                        and abs(pos - before.position_rad)
+                        < cfg.no_bite_mm / gcfg.rad_to_mm):
+                    no_bite = True
+                    log.warning(
+                        "接近段没能脱离静摩擦：预算 %.3f Nm 下，夹爪从 %+.5f rad "
+                        "起只挪了 %.2f mm 就停住（目标 %+.5f rad，还差 %.1f mm）。"
+                        "「没动」也可能是力矩不够，不是顶到工件 —— 不交接、撤力。",
+                        force_n * UnitConversion.N_TO_NM * cfg.press_safety,
+                        before.position_rad,
+                        abs(pos - before.position_rad) * gcfg.rad_to_mm,
+                        target, abs(pos - target) * gcfg.rad_to_mm)
+                else:
+                    stalled = True
+                    log.info("堵转：最近 %d 次采样(%.2f s)净位移仅 %.5f rad "
+                             "(< %.5f)，停在 %+.5f rad",
+                             win, win_s, win_delta, win_thresh_rad, pos)
                 break
 
             # 行进段堵转力矩保护（≈7 N）：与位置窗口判据**互补** —— 位置窗口对
@@ -1703,6 +1772,7 @@ class GripperActions:
             steps=last_i,
             protected=protected,
             release_requested=release_requested,
+            no_bite=no_bite,
         )
 
     def _hold_force(

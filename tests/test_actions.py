@@ -1879,6 +1879,73 @@ class TestForceApproachPressBudget(unittest.TestCase):
             self.assertAlmostEqual(f.tau_ff, 2.0, places=9)
 
 
+class TestTheApproachRefusesToHandOverWithoutBite(unittest.TestCase):
+    """接近段从起点就没动过时不许交接：那是「没能脱离静摩擦」，不是接触。
+
+    2026-10-29 台架实测（2 N 夹取）：接近段压 0.18 Nm，整个 0.25 s 堵转窗口只挪了
+    0.0004 rad；它被判成「顶到工件」，接手的保力段压 0.20 Nm —— 设定值的 1.0 倍，
+    比接近段高出一成，正好越过脱离力 —— 于是夹爪带着设定力在自由行程里推了 19 mm，
+    夹取点报在工件前 19–39 mm。操作者看到的是「先不动，然后飞速闭合」。
+
+    判据见 ``MotionConfig.no_bite_mm``：带设定力的接近段里，位移小于这个值的停住
+    不算接触 —— 报 ``no_bite``、撤力，保力段一帧都不发。
+    """
+
+    #: 脱离力：2 N 的预算（0.18 Nm）压不动，3 N 的（0.27 Nm）压得动。
+    BREAKAWAY_NM = 0.22
+
+    def _grasp(self, force_n, hold_s=0.2, **kw):
+        motion = MotionConfig(sleep_fn=lambda _: None,
+                              monotonic_fn=tick_clock(0.1))
+        g, fake = make_gripper(stops=True, motion=motion,
+                               breakaway_tau_nm=self.BREAKAWAY_NM, **kw)
+        return g, fake, g.grasp(force_n=force_n, hold_s=hold_s)
+
+    @staticmethod
+    def _budget(force_n):
+        return force_n * UnitConversion.N_TO_NM * MotionConfig().press_safety
+
+    def test_the_setpoint_below_the_breakaway_is_refused_not_held(self):
+        _g, fake, res = self._grasp(2.0)
+
+        self.assertLess(self._budget(2.0), self.BREAKAWAY_NM)      # 前提
+        self.assertFalse(res.ok, res)
+        self.assertTrue(res.no_bite, res)
+        self.assertFalse(res.stalled, res)          # 停住 ≠ 顶到工件
+        self.assertFalse(res.reached, res)
+        self.assertEqual(res.cycles, 0)
+        self.assertEqual([f for f in fake.frames if f.tau_ff != 0.0], [],
+                         "保力段一帧都不许发：它是纯力矩源，没有位置也没有限速")
+        self.assertEqual(fake.frames[-1].kp, 0.0, "结尾要撤力")
+
+    def test_the_setpoint_above_the_breakaway_still_grasps(self):
+        _g, fake, res = self._grasp(3.0)
+
+        self.assertGreater(self._budget(3.0), self.BREAKAWAY_NM)   # 前提
+        self.assertFalse(res.no_bite, res)
+        self.assertTrue(res.reached, res)
+        self.assertTrue(res.ok, res)
+        self.assertGreater(res.cycles, 0)
+
+    def test_a_workpiece_at_the_start_is_refused_as_well(self):
+        """代价写在测试里：工件就贴在起点时，这一次夹取也会被拒。
+
+        电机分不出「顶住工件」和「压不出脱离力」—— 两者都是零位移。拒夹的代价
+        是操作者看到一次失败、重摆一次；放行的代价是一次带力冲程（上面那个 19 mm
+        的推程）。两边不对称，所以选拒夹。
+        """
+        start = POS_OPEN_RAD
+        block = start + 0.001 * (POS_CLOSED_RAD - POS_OPEN_RAD)   # ≈ 0.09 mm
+        motion = MotionConfig(sleep_fn=lambda _: None,
+                              monotonic_fn=tick_clock(0.1))
+        g, fake = make_gripper(stops=True, motion=motion, block_rad=block)
+        res = g.grasp(force_n=20.0, hold_s=0.2)
+
+        self.assertTrue(res.no_bite, res)
+        self.assertFalse(res.ok, res)
+        self.assertEqual([f for f in fake.frames if f.tau_ff != 0.0], [])
+
+
 class TestNonFiniteInputIsRefused(unittest.TestCase):
     """非有限值不许变成运动：拒绝带原因，而且**一帧都不发**。
 
