@@ -274,7 +274,8 @@ def _report(result, trace: Trace, cfg, motion, label: str, grasped: bool) -> str
     st = result.state
     lines = [
         f"  ok={result.ok} reached={result.reached} stalled={result.stalled} "
-        f"runaway_watch={result.travel_guard} err={st.error_code}",
+        f"no_bite={result.no_bite} runaway_watch={result.travel_guard} "
+        f"err={st.error_code}",
         f"  stopped at {st.position_mm:+.1f} mm ({st.position_rad:+.6f} rad), "
         f"empty target was {to_mm(cfg, result.target_rad):+.1f} mm, "
         f"off by {abs(st.position_rad - result.target_rad) * cfg.rad_to_mm:.2f} mm",
@@ -329,14 +330,45 @@ def _hold_problem(result) -> str | None:
                 "the closed stop by more than MotionConfig.hold_runaway_rad, so "
                 "the torque was dropped — either nothing is stopping the closing "
                 "direction, or the calibration no longer describes the travel")
+    if result.no_bite:
+        # Not a hold problem at all: grasp() refused the hand-over, so no hold
+        # ran and there was no fault. The judges name this
+        # (_no_bite_problem); here it must not be mistaken for "err=0".
+        return None
     if not result.ok:
         return f"the hold phase ended abnormally (err={result.state.error_code})"
     return None
 
 
-def _judge_empty(result, trace: Trace, cfg, _motion) -> list[str]:
+def _no_bite_problem(result, motion) -> str:
+    """The one ending that is a refusal rather than a motion, said plainly.
+
+    ``grasp()`` dropped the torque because the approach never moved the jaws
+    and its budget was below the breakaway (``MotionConfig.breakaway_nm``).
+    Reporting that as "the closing leg ran out of frames while still
+    travelling" — the message the other endings get — points the operator the
+    opposite way, and "err=0" reads like a fault that did not happen.
+    """
+    floor_n = motion.breakaway_nm / (N_TO_NM * motion.press_safety)
+    return (f"refused, not held (no_bite=True): the closing leg never moved the "
+            f"jaws. Its budget ({result.force_n:g} N = "
+            f"{result.force_n * N_TO_NM:g} Nm, of which the approach may spend "
+            f"{motion.press_safety:g}) is below the breakaway "
+            f"({motion.breakaway_nm:g} Nm), so grasp() dropped the torque "
+            f"instead of handing the jaws to the torque-only hold — that would "
+            f"have powered them across the free stroke. The jaws stopped at "
+            f"{result.state.position_mm:+.1f} mm. Raise --force above "
+            f"{floor_n + 0.1:.1f} N (or check whether something is already "
+            f"against the jaws before closing)")
+
+
+def _judge_empty(result, trace: Trace, cfg, motion) -> list[str]:
     """Clear jaws: it should reach the closed stop and not report a stall."""
     problems = []
+    if result.no_bite:
+        # A refusal, not a movement. Everything below judges the closing leg
+        # and the hold that followed — neither ran.
+        return [_no_bite_problem(result, motion)]
     if not result.reached:
         short_mm = (abs(result.state.position_rad - result.target_rad)
                     * cfg.rad_to_mm)
@@ -372,6 +404,8 @@ def _judge_empty(result, trace: Trace, cfg, _motion) -> list[str]:
 def _judge_loaded(result, trace: Trace, cfg, motion) -> list[str]:
     """An object between the jaws: it should stall early and then hold."""
     problems = []
+    if result.no_bite:
+        return [_no_bite_problem(result, motion)]
     short = _stall_ramp_mm(result, trace, cfg, motion)
     if short is not None:
         # stalled could not have become True here, so saying it did not fire is
