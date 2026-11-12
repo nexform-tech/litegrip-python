@@ -23,12 +23,13 @@ Two rules worth losing a session over:
   divergent formats would decode silently wrong, which is why the format is
   pinned in :mod:`litegrip.teleop`.
 
-The readiness channel (``litearm/v4/{id}/gripper_ready``, see
-:func:`~litegrip.teleop.ready_topic`) is a local extension: it is a second key on
-the same session, in the reverse direction, and it is **not** part of the litearm
-link — a litearm peer simply never declares it.  It is only wired when a
-``ready_key`` is passed, so an endpoint built without one is one-way, exactly as
-before.
+The reverse channels (``litearm/v4/{id}/gripper_ready`` and
+``litearm/v4/{id}/gripper_feedback``, see
+:func:`~litegrip.teleop.ready_topic` / :func:`~litegrip.teleop.feedback_topic`)
+are local extensions: extra keys on the same session, in the reverse direction,
+and **not** part of the litearm link — a litearm peer simply never declares them.
+Each is only wired when its key is passed, so an endpoint built without one is
+one-way, exactly as before.
 
 zenoh is an optional dependency: install it with ``pip install litegrip-python[zenoh]``.
 This module is imported lazily so the base SDK still works without it.
@@ -92,15 +93,16 @@ class _Endpoint:
 class Listener(_Endpoint):
     """Leader side: listen on a port and wait for a follower to connect.
 
-    ``ready_key`` is optional and adds the follower -> leader readiness channel:
-    a second declaration on the *same* session, so it needs no extra port.  It
-    is an extension over ``liteteleop/link.py`` (which is one-way) and is only
-    declared when a key is given, so the one-way comparison still holds when it
-    is not.
+    ``ready_key`` and ``feedback_key`` are optional and add the follower ->
+    leader channels (readiness and squeeze): further declarations on the *same*
+    session, so they need no extra port.  They are extensions over
+    ``liteteleop/link.py`` (which is one-way) and are only declared when a key is
+    given, so the one-way comparison still holds when they are not.
     """
 
     def __init__(self, port: int, key: str,
-                 ready_key: Optional[str] = None) -> None:
+                 ready_key: Optional[str] = None,
+                 feedback_key: Optional[str] = None) -> None:
         super().__init__()
         cfg = _base_config()
         cfg.insert_json5("listen/endpoints", f'["tcp/0.0.0.0:{int(port)}"]')
@@ -125,6 +127,17 @@ class Listener(_Endpoint):
 
             self._ready_sub = self._session.declare_subscriber(ready_key, _on_ready)
 
+        self._feedback_slot: Optional[LatestSlot] = None
+        self._feedback_sub = None
+        if feedback_key:
+            self._feedback_slot = LatestSlot()
+
+            def _on_feedback(sample) -> None:
+                self._feedback_slot.put(bytes(sample.payload), time.monotonic())
+
+            self._feedback_sub = self._session.declare_subscriber(
+                feedback_key, _on_feedback)
+
     def put(self, payload: bytes) -> None:
         """Publish one frame.  Non-blocking."""
         self._pub.put(payload)
@@ -132,6 +145,10 @@ class Listener(_Endpoint):
     def ready_subscription(self) -> "_SlotSubscription":
         """Subscribe-side handle for the readiness channel."""
         return _SlotSubscription(self._ready_slot)
+
+    def feedback_subscription(self) -> "_SlotSubscription":
+        """Subscribe-side handle for the follower-force channel."""
+        return _SlotSubscription(self._feedback_slot)
 
     @property
     def matching(self) -> bool:
@@ -150,13 +167,14 @@ class Connector(_Endpoint):
     latest slot.  Blocking work there (e.g. a ``goto_rad`` that waits for an ACK)
     stalls the zenoh thread.
 
-    ``ready_key`` is optional and adds the follower -> leader readiness channel
-    (a publisher on the same session); see :class:`Listener`.
+    ``ready_key`` / ``feedback_key`` are optional and add the follower -> leader
+    channels (publishers on the same session); see :class:`Listener`.
     """
 
     def __init__(self, host: str, port: int, key: str,
                  on_frame: Optional[Callable[[bytes], None]] = None,
-                 ready_key: Optional[str] = None) -> None:
+                 ready_key: Optional[str] = None,
+                 feedback_key: Optional[str] = None) -> None:
         super().__init__()
         cfg = _base_config()
         cfg.insert_json5("listen/endpoints", "[]")
@@ -176,11 +194,18 @@ class Connector(_Endpoint):
         self._sub = self._session.declare_subscriber(key, _handler)
         self._ready_pub = (self._session.declare_publisher(ready_key)
                            if ready_key else None)
+        self._feedback_pub = (self._session.declare_publisher(feedback_key)
+                              if feedback_key else None)
 
     def put_ready(self, payload: bytes) -> None:
         """Publish one ready frame.  Non-blocking."""
         if self._ready_pub is not None:
             self._ready_pub.put(payload)
+
+    def put_feedback(self, payload: bytes) -> None:
+        """Publish one follower-force frame.  Non-blocking."""
+        if self._feedback_pub is not None:
+            self._feedback_pub.put(payload)
 
     def latest(self) -> int:
         """Frames received so far (used to display a rate)."""
@@ -310,11 +335,15 @@ class ZenohTeleopTransport(TeleopTransport):
             When set, the *reverse* direction is carried on the same session:
             the master may ``sub`` it and the slave may ``pub`` it.  ``None``
             leaves the transport one-way, exactly as before.
+        feedback_key: The follower-force topic, normally
+            ``feedback_topic(grip_id)``.  Same treatment as ``ready_key``, on
+            its own key so the pinned one-byte ready frame is untouched.
     """
 
     def __init__(self, role: str, key: str, port: int = DEFAULT_GRIP_PORT,
                  host: Optional[str] = None,
-                 ready_key: Optional[str] = None) -> None:
+                 ready_key: Optional[str] = None,
+                 feedback_key: Optional[str] = None) -> None:
         if role not in ("master", "slave"):
             raise ValueError(f"role must be 'master' or 'slave', got {role!r}")
         if role == "slave" and not host:
@@ -322,13 +351,16 @@ class ZenohTeleopTransport(TeleopTransport):
         self._role = role
         self._key = key
         self._ready_key = ready_key
+        self._feedback_key = feedback_key
         self._endpoint: Optional[_Endpoint] = None
         self._slot: Optional[LatestSlot] = None
         self._sub: Optional[_SlotSubscription] = None
         self._ready_sub: Optional[_SlotSubscription] = None
+        self._feedback_sub: Optional[_SlotSubscription] = None
 
         if role == "master":
-            self._endpoint = Listener(int(port), key, ready_key=ready_key)
+            self._endpoint = Listener(int(port), key, ready_key=ready_key,
+                                      feedback_key=feedback_key)
         else:
             self._slot = LatestSlot()
 
@@ -339,7 +371,8 @@ class ZenohTeleopTransport(TeleopTransport):
                 self._slot.put(payload, time.monotonic())
 
             self._endpoint = Connector(host, int(port), key, on_frame=_on_wire,
-                                       ready_key=ready_key)
+                                       ready_key=ready_key,
+                                       feedback_key=feedback_key)
 
     @property
     def matching(self) -> bool:
@@ -356,11 +389,14 @@ class ZenohTeleopTransport(TeleopTransport):
         return 0
 
     def pub(self, topic: str, payload: bytes) -> None:
-        # Each role publishes on exactly one key: the master its teleop frames,
-        # the slave its ready frames.
+        # Each role publishes on its own keys: the master its teleop frames, the
+        # slave its ready and follower-force frames.
         if self._role == "master":
             self._check_topic(topic, self._key)
             self._endpoint.put(payload)
+            return
+        if self._feedback_key is not None and topic == self._feedback_key:
+            self._endpoint.put_feedback(payload)
             return
         if self._ready_key is None:
             raise TeleopError(
@@ -371,12 +407,16 @@ class ZenohTeleopTransport(TeleopTransport):
 
     def sub(self, topic: str) -> TeleopSubscription:
         # Mirror of ``pub``: the slave subscribes to the teleop key, the master
-        # to the ready key.
+        # to the ready and follower-force keys.
         if self._role == "slave":
             self._check_topic(topic, self._key)
             if self._sub is None:
                 self._sub = _SlotSubscription(self._slot)
             return self._sub
+        if self._feedback_key is not None and topic == self._feedback_key:
+            if self._feedback_sub is None:
+                self._feedback_sub = self._endpoint.feedback_subscription()
+            return self._feedback_sub
         if self._ready_key is None:
             raise TeleopError(
                 "this zenoh transport was built without a ready key; it cannot "

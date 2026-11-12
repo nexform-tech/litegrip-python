@@ -47,14 +47,19 @@ from .actions import (
     _check_calibrated,
     clamp_to_travel,
 )
-from .teleop import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX, DEFAULT_GRIP_ID,
+from .teleop import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX,
+                     DEFAULT_FEEDBACK_DAMPING, DEFAULT_FEEDBACK_GAIN_NM_PER_N,
+                     DEFAULT_FEEDBACK_MAX_TAU_NM, DEFAULT_FEEDBACK_THRESHOLD_N,
+                     DEFAULT_FEEDBACK_TIMEOUT_S, DEFAULT_GRIP_ID,
                      DEFAULT_GRIP_PORT, DEFAULT_LEAD_CAP_MM,
                      DEFAULT_READY_PERIOD_S, DEFAULT_READY_TIMEOUT_S,
-                     DEFAULT_READY_TOLERANCE_MM, DEFAULT_TORQUE_LIMIT_NM)
+                     DEFAULT_READY_TOLERANCE_MM, DEFAULT_TORQUE_LIMIT_NM,
+                     TORQUE_GUARD_HOLD)
 
 
 def _zenoh_transport(role: str, key: str, port: int, host: Optional[str],
-                     ready_key: Optional[str] = None) -> "TeleopTransport":
+                     ready_key: Optional[str] = None,
+                     feedback_key: Optional[str] = None) -> "TeleopTransport":
     """Build a point-to-point zenoh transport, or explain how to get one.
 
     zenoh is an optional dependency, so a bare ``import`` failure is turned into
@@ -68,7 +73,7 @@ def _zenoh_transport(role: str, key: str, port: int, host: Optional[str],
             "the zenoh teleoperation link needs the optional zenoh dependency — "
             "install it with `pip install litegrip-python[zenoh]`") from e
     return ZenohTeleopTransport(role, key, port=port, host=host,
-                                ready_key=ready_key)
+                                ready_key=ready_key, feedback_key=feedback_key)
 
 
 # The calibration the SDK ships for the unit it ships with.  This is the
@@ -2193,11 +2198,18 @@ class LiteGrip:
         watchdog_s: float = 0.2,
         dq_max: float = DEFAULT_DQ_MAX,
         torque_limit_nm: float = DEFAULT_TORQUE_LIMIT_NM,
+        torque_guard_action: str = TORQUE_GUARD_HOLD,
         lead_cap_mm: float = DEFAULT_LEAD_CAP_MM,             # [遥操对齐块]
         require_ready: bool = True,
         ready_timeout_s: float = DEFAULT_READY_TIMEOUT_S,
         ready_tolerance_mm: float = DEFAULT_READY_TOLERANCE_MM,
         ready_period_s: float = DEFAULT_READY_PERIOD_S,
+        force_feedback: bool = False,
+        feedback_gain_nm_per_n: float = DEFAULT_FEEDBACK_GAIN_NM_PER_N,
+        feedback_threshold_n: float = DEFAULT_FEEDBACK_THRESHOLD_N,
+        feedback_max_tau_nm: float = DEFAULT_FEEDBACK_MAX_TAU_NM,
+        feedback_damping: float = DEFAULT_FEEDBACK_DAMPING,
+        feedback_timeout_s: float = DEFAULT_FEEDBACK_TIMEOUT_S,
         rate_hz: float = 50.0,
     ) -> dict:
         """Start leader/follower teleoperation on this gripper.
@@ -2234,8 +2246,13 @@ class LiteGrip:
             dq_max: Slave only — ceiling in rad/s on the leader velocity fed
                 forward to the follower.  ``0`` disables the feedforward.
             torque_limit_nm: Slave only — ceiling in Nm on the follower's own
-                torque; held over it the follower releases in place.  ``0``
-                disables the guard.  See :class:`~litegrip.GripperTeleop`.
+                torque; held over it the follower acts per
+                ``torque_guard_action``.  ``0`` disables the guard.  See
+                :class:`~litegrip.GripperTeleop`.
+            torque_guard_action: Slave only — ``"hold"`` (default) keeps
+                pressing with a bounded pure-torque frame so a grasp survives;
+                ``"release"`` drops to zero stiffness and lets go, the previous
+                behaviour.
             lead_cap_mm: Slave only — ceiling in mm on how far the *align*
                 command may lead the measured position, which bounds the align
                 torque.  The follow loop is not capped.  ``0`` disables the cap.
@@ -2249,6 +2266,17 @@ class LiteGrip:
             ready_tolerance_mm: Slave only — arrival tolerance for announcing
                 ready, in mm of travel.
             ready_period_s: Slave only — how often to republish the ready state.
+            force_feedback: Send the follower's squeeze back and render it on
+                the leader as resistance.  Needs the zenoh link (the UDP master
+                is publish-only and silently runs without it).
+            feedback_gain_nm_per_n: Leader torque per newton of follower
+                squeeze above the threshold.  ``0`` disables it.
+            feedback_threshold_n: Follower squeeze below which the leader feels
+                nothing.
+            feedback_max_tau_nm: Ceiling on the leader's rendered resistance.
+            feedback_damping: Leader damping applied only during contact.
+            feedback_timeout_s: Age past which the force is ignored and both
+                torque and damping drop to zero.
             rate_hz: Loop rate.
 
         Returns:
@@ -2264,7 +2292,7 @@ class LiteGrip:
                 positive.
         """
         from .teleop import (GripperTeleop, TeleopBusyError, check_ready,
-                             ready_topic, teleop_topic)
+                             feedback_topic, ready_topic, teleop_topic)
         from .teleop import UdpTeleopTransport
 
         self._check_connected()
@@ -2286,6 +2314,11 @@ class LiteGrip:
         try:
             key = teleop_topic(grip_id)
             ready_key = ready_topic(grip_id)
+            # Declared on every session, even with the feature off: the leader's
+            # zenoh endpoint is resident and its key set cannot change later.
+            # An unused key costs nothing and a later session that enables
+            # feedback then just works.
+            feedback_key = feedback_topic(grip_id)
             created_transport = None
             if transport is None:
                 if link == "zenoh":
@@ -2295,10 +2328,11 @@ class LiteGrip:
                         #    已死的端点 ⇒ 此后每一轮都在往死会话里 put。（真机实测：
                         #    第一次配对正常，之后每次从端 0 帧。）常驻端点的生命周期
                         #    只归 `disconnect()` → `_close_teleop_pub()`。
-                        transport = self._open_teleop_pub(port, key, ready_key)
+                        transport = self._open_teleop_pub(port, key, ready_key,
+                                                          feedback_key)
                     else:
                         transport = _zenoh_transport("slave", key, port, host,
-                                                     ready_key)
+                                                     ready_key, feedback_key)
                         created_transport = transport
                 elif link == "udp":
                     if host is None:
@@ -2324,10 +2358,18 @@ class LiteGrip:
                 align_speed_mm_s=align_speed_mm_s,                      # [遥操对齐块]
                 watchdog_s=watchdog_s, dq_max=dq_max,
                 torque_limit_nm=torque_limit_nm, lead_cap_mm=lead_cap_mm,  # [遥操对齐块]
+                torque_guard_action=torque_guard_action,
                 ready_topic=ready_key, require_ready=require_ready,
                 ready_timeout_s=ready_timeout_s,
                 ready_tolerance_mm=ready_tolerance_mm,
-                ready_period_s=ready_period_s)
+                ready_period_s=ready_period_s,
+                force_feedback=force_feedback,
+                feedback_topic=feedback_key,
+                feedback_gain_nm_per_n=feedback_gain_nm_per_n,
+                feedback_threshold_n=feedback_threshold_n,
+                feedback_max_tau_nm=feedback_max_tau_nm,
+                feedback_damping=feedback_damping,
+                feedback_timeout_s=feedback_timeout_s)
             manager.start()
         except BaseException:
             self._release_session("teleop")
@@ -2337,7 +2379,8 @@ class LiteGrip:
         return manager.status()
 
     def _open_teleop_pub(self, port: int, key: str,
-                         ready_key: Optional[str] = None) -> "TeleopTransport":
+                         ready_key: Optional[str] = None,
+                         feedback_key: Optional[str] = None) -> "TeleopTransport":
         """Return the leader's resident publisher, building it on first use.
 
         ⚠ **Resident, not per session.**  Rebuilding the zenoh listener on every
@@ -2349,7 +2392,7 @@ class LiteGrip:
         """
         if self._teleop_pub is None:
             self._teleop_pub = _zenoh_transport("master", key, port, None,
-                                                ready_key)
+                                                ready_key, feedback_key)
         return self._teleop_pub
 
     def _close_teleop_pub(self) -> None:
