@@ -446,9 +446,9 @@ with LiteGrip("can0") as slave:
 
 | 方法 | 做什么 |
 | --- | --- |
-| `teleop_start(mode, *, transport=None, link="zenoh", host=None, port=17448, grip_id="gripA", kp=None, kd=None, align=True, watchdog_s=0.2, dq_max=10.0, torque_limit_nm=0.0, require_ready=True, ...)` → `dict` | 为 `mode="master"` 或 `"slave"` 起后台循环。两端必须共用 `grip_id`，并且都已连接、已使能。 |
+| `teleop_start(mode, *, transport=None, link="zenoh", host=None, port=17448, grip_id="gripA", kp=None, kd=None, align=True, watchdog_s=0.2, dq_max=10.0, torque_limit_nm=0.0, torque_guard_action="hold", require_ready=True, force_feedback=False, feedback_gain_nm_per_n=0.10, ...)` → `dict` | 为 `mode="master"` 或 `"slave"` 起后台循环。两端必须共用 `grip_id`，并且都已连接、已使能。 |
 | `teleop_stop(timeout=2.0)` → `dict` | 停掉循环，爪子保持在当前位置。 |
-| `teleop_status()` → `dict` | `active`、`mode`、`frames`、`last_frame_age_ms`、`stale`、`openness`、`position_mm`、`force_n`、`loop_hz`、`rejected`、`send_failed`、`fault`、`torque_nm`、`over_torque`、`torque_trips`、`ready` 等。 |
+| `teleop_status()` → `dict` | `active`、`mode`、`frames`、`last_frame_age_ms`、`stale`、`openness`、`position_mm`、`force_n`、`loop_hz`、`rejected`、`send_failed`、`fault`、`torque_nm`、`over_torque`、`torque_trips`、`ready`、`feedback_force_n`、`feedback_tau_nm`、`feedback_rx`、`feedback_tx` 等。 |
 
 链路是**点对点 zenoh**，属于可选依赖：
 
@@ -476,9 +476,19 @@ python3 examples/teleop.py --mode slave --channel can0 --fake-leader --torque-li
 - **从端报告就位之前，主端一直带着增益顶着自己的爪子**，所以操作者无法在一个还在移动的从端
   下面把目标推走。等待由 `ready_timeout_s`（默认 `10.0`）兜底；`require_ready=False` 恢复
   立即交还。
-- **可选的力矩护栏会放掉压得太狠的从端。** 设了 `torque_limit_nm` 之后，超过限值 60 ms 它就
-  **就地**把刚度和阻尼降到零，等主端重新张开后重新武装。默认是 `0` —— **不显式要求就不启用**。
-  这个值要按机器挑：它取决于爪子之间那个工件有多脆。
+- **可选的力矩护栏会拦住压得太狠的从端。** 设了 `torque_limit_nm` 之后，超过限值 60 ms 它就
+  停止跟随，**改用该限值继续压住**（`kp=kd=0`、`tau=±torque_limit_nm`，方向取触发瞬间实测
+  力矩的符号），被夹住的工件因此不会被钳口顶开；等主端重新张开后重新武装。
+  `torque_guard_action="release"` 恢复旧行为 —— **就地**把刚度和阻尼降到零，工件会直接把
+  钳口顶开。默认是 `0` —— **不显式要求就不启用**。这个值要按机器挑：它取决于爪子之间那个
+  工件有多脆。
+- **从端的夹持力可以让主端感觉到。** 打开 `force_feedback=True` 后，从端在
+  `litearm/v4/{grip_id}/gripper_feedback` 上发布 `force_n`（正 = 夹紧，已按安装方向归一化），
+  主端按 `min(max(0, force_n - feedback_threshold_n) * feedback_gain_nm_per_n,
+  feedback_max_tau_nm)` 渲染反向阻力。默认阈值 `2.0` N、增益 `0.10` Nm/N、封顶 `1.0` Nm；
+  阻尼（`0.1`）只在收到新鲜力时生效，超过 `feedback_timeout_s`（`0.3`）后力矩和阻尼一起归零。
+  该功能默认关闭，且依赖 zenoh 链路 —— UDP 主端只能发不能收，所以自动没有反馈。新增的 key
+  是附加的，旧版本对端会自动退化为纯位置遥操。
 - **跟丢主端的从端保持原位，不会卸力。** 超过 `watchdog_s`（默认 `0.2`）没有新帧，`stale`
   置真、爪子停在原处。
 - **从端把主端的速度前馈进去**（对相邻两帧做差分），所以不会拖在移动的主端后面。`dq_max=0`

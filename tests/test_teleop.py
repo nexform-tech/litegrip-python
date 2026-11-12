@@ -12,6 +12,7 @@ only delivers to subscribers that already exist, so publishing before
 
 from __future__ import annotations
 
+import struct
 import time
 import types
 import unittest
@@ -19,21 +20,25 @@ import unittest.mock
 
 import _sdkpath  # noqa: F401
 from litegrip import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX,
-                      DEFAULT_LEAD_CAP_MM, DEFAULT_READY_TOLERANCE_MM,
+                      DEFAULT_FEEDBACK_DAMPING, DEFAULT_LEAD_CAP_MM,
+                      DEFAULT_READY_TOLERANCE_MM, FEEDBACK_FRAME_SIZE,
                       FRAME_SIZE, READY_FRAME_SIZE, GripperTeleop,
                       InProcTeleopTransport, TeleopBusyError, TeleopError,
-                      TeleopNotReady, UdpTeleopTransport, decode_frame,
-                      decode_ready_frame, encode_frame, encode_ready_frame,
+                      TeleopNotReady, UdpTeleopTransport, decode_feedback_frame,
+                      decode_frame, decode_ready_frame, encode_feedback_frame,
+                      encode_frame, encode_ready_frame, feedback_topic,
                       ready_topic,
                       teleop_topic)
 from litegrip.teleop import (MAX_FRAME_GAP_S, TORQUE_REARM_OPENNESS,
-                             TORQUE_TRIP_CYCLES, clamp_to_calibrated, check_ready,
+                             TORQUE_TRIP_CYCLES, TORQUE_GUARD_RELEASE,
+                             clamp_to_calibrated, check_ready,
                              openness_to_rad, rad_to_openness, travel_mm)
 
 from fake_can import POS_CLOSED_RAD, POS_OPEN_RAD, RAD_TO_MM, make_gripper
 
 TOPIC = teleop_topic("gripA")
 READY = ready_topic("gripA")
+FEEDBACK = feedback_topic("gripA")
 
 # Far longer than the stub-sleep loop needs; a timeout here means the loop is
 # not running at all, not that the machine is slow.
@@ -51,6 +56,24 @@ def _wait_until(predicate, timeout_s: float = WAIT_S) -> bool:
 
 def _nop_sleep(_seconds: float) -> None:
     """Stub the loop's pacing so tests do not pay the frame interval."""
+
+
+def _publish_until(transport, topic, payload, predicate,
+                   timeout_s: float = WAIT_S) -> bool:
+    """Republish ``payload`` until ``predicate()`` holds.
+
+    The force channel has a timeout, and the loop under ``_nop_sleep`` runs far
+    faster than wall time, so a single frame is gone (stale) before a poll can
+    observe it.  Keep feeding it, as a real follower would.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        transport.pub(topic, payload)
+        if predicate():
+            return True
+        time.sleep(0.001)
+    transport.pub(topic, payload)
+    return predicate()
 
 
 class _PreSubTransport(InProcTeleopTransport):
@@ -105,6 +128,35 @@ class FrameCodecTest(unittest.TestCase):
             decode_ready_frame(b"")
         with self.assertRaises(ValueError):
             decode_ready_frame(b"\x01\x00")
+
+    def test_feedback_topic_is_its_own_sibling(self):
+        # Its own key, so neither the pinned one-byte ready frame nor the
+        # byte-identical litearm teleop frame is touched.
+        self.assertEqual(FEEDBACK, "litearm/v4/gripA/gripper_feedback")
+        self.assertEqual(feedback_topic(), FEEDBACK)
+        self.assertNotIn(FEEDBACK, (teleop_topic(), ready_topic()))
+
+    def test_feedback_frame_is_one_double(self):
+        self.assertEqual(FEEDBACK_FRAME_SIZE, 8)
+        self.assertEqual(len(encode_feedback_frame(0.0)), FEEDBACK_FRAME_SIZE)
+
+    def test_feedback_roundtrip(self):
+        self.assertAlmostEqual(
+            decode_feedback_frame(encode_feedback_frame(7.25)), 7.25)
+
+    def test_feedback_decode_rejects_wrong_size(self):
+        with self.assertRaises(ValueError):
+            decode_feedback_frame(b"")
+        with self.assertRaises(ValueError):
+            decode_feedback_frame(b"\x00" * (FEEDBACK_FRAME_SIZE - 1))
+
+    def test_feedback_codec_rejects_non_finite(self):
+        # A NaN would decode into a leader torque and be clamped onto a stop.
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaises(ValueError):
+                encode_feedback_frame(bad)
+            with self.assertRaises(ValueError):
+                decode_feedback_frame(struct.pack(">d", bad))
 
 
 class ConversionTest(unittest.TestCase):
@@ -391,6 +443,32 @@ class LiteGripTeleopApiTest(unittest.TestCase):
         finally:
             g.teleop_stop()
 
+    def test_start_wires_the_feedback_topic_and_defaults_off(self):
+        g, _ = make_gripper()
+        transport = InProcTeleopTransport()
+        g.teleop_start("master", transport=transport)
+        try:
+            # Derived and wired even while off: the zenoh endpoint is resident
+            # and cannot learn a new key mid-session.
+            self.assertEqual(g._teleop._feedback_topic, FEEDBACK)
+            self.assertFalse(g._teleop._force_feedback)
+        finally:
+            g.teleop_stop()
+
+    def test_start_passes_force_feedback_through(self):
+        g, _ = make_gripper()
+        transport = InProcTeleopTransport()
+        g.teleop_start("master", transport=transport, force_feedback=True,
+                       feedback_gain_nm_per_n=0.2,
+                       torque_guard_action=TORQUE_GUARD_RELEASE)
+        try:
+            self.assertTrue(g._teleop._force_feedback)
+            self.assertAlmostEqual(g._teleop._feedback_gain, 0.2)
+            self.assertEqual(g._teleop._torque_guard_action,
+                             TORQUE_GUARD_RELEASE)
+        finally:
+            g.teleop_stop()
+
     def test_start_can_opt_out_of_the_gate(self):
         g, _ = make_gripper()
         transport = InProcTeleopTransport()
@@ -472,7 +550,7 @@ class LiteGripTeleopApiTest(unittest.TestCase):
             def close(self):
                 self.closed = True
 
-        def _factory(role, key, port, host, ready_key=None):
+        def _factory(role, key, port, host, ready_key=None, feedback_key=None):
             built.append(_FakeLink())
             return built[-1]
 
@@ -851,13 +929,18 @@ class ReadinessHandshakeTest(unittest.TestCase):
 
 
 class TorqueGuardTest(unittest.TestCase):
-    """The follower releases when its own torque stays over the limit.
+    """The follower holds when its own torque stays over the limit.
 
     Torque here is the follower's own reading — the status frame's ``tau``,
     derived from coil current — never the leader's ``force_n`` on the wire.
     Position is deliberately not consulted: a jam partway through the travel is
     indistinguishable from slow motion.  The guard is opt-in (``0`` disables it),
     so the loop tests elsewhere run with it off.
+
+    The default action is **hold**: a bounded pure-torque frame (``kp=kd=0``,
+    ``tau=±torque_limit_nm``) keeps pressing, so a grasp survives instead of
+    springing open.  ``release`` restores the old zero-stiffness let-go and is
+    covered as the opt-in.
     """
 
     def _mgr(self, **kwargs):
@@ -960,11 +1043,73 @@ class TorqueGuardTest(unittest.TestCase):
             GripperTeleop(g, InProcTeleopTransport(), "slave", TOPIC,
                           torque_limit_nm=-0.1)
 
-    def test_slave_releases_in_place_and_keeps_streaming(self):
-        # A block partway through the travel, under a command to close: the
-        # follower presses it and its torque climbs past the limit.
+    def test_rejects_an_unknown_torque_guard_action(self):
+        g, _ = make_gripper()
+        with self.assertRaises(ValueError):
+            GripperTeleop(g, InProcTeleopTransport(), "slave", TOPIC,
+                          torque_guard_action="explode")
+
+    def test_rejects_a_negative_feedback_gain(self):
+        g, _ = make_gripper()
+        with self.assertRaises(ValueError):
+            GripperTeleop(g, InProcTeleopTransport(), "master", TOPIC,
+                          feedback_gain_nm_per_n=-0.1)
+
+    def test_rejects_a_feedback_cap_past_the_motor(self):
+        g, _ = make_gripper()
+        with self.assertRaises(ValueError):
+            GripperTeleop(g, InProcTeleopTransport(), "master", TOPIC,
+                          feedback_max_tau_nm=11.0)
+
+    def test_rejects_a_non_positive_feedback_timeout(self):
+        g, _ = make_gripper()
+        with self.assertRaises(ValueError):
+            GripperTeleop(g, InProcTeleopTransport(), "master", TOPIC,
+                          feedback_timeout_s=0.0)
+
+    # ── hold: the grasp survives ──────────────────────────────────────
+
+    def _tripped_slave(self, **kwargs):
+        """A follower that closes onto a block until the guard trips."""
         block = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2.0
         g, fake = make_gripper(start_rad=POS_OPEN_RAD, block_rad=block)
+        transport = _PreSubTransport()
+        mgr = GripperTeleop(g, transport, "slave", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep, align=False, watchdog_s=5.0,
+                            torque_limit_nm=1.0, **kwargs)
+        transport.pub(TOPIC, encode_frame(0.0, 0.0, 0.0, 0.0))
+        return g, fake, mgr
+
+    def test_slave_holds_with_bounded_torque_and_keeps_streaming(self):
+        # A block partway through the travel, under a command to close: the
+        # follower presses it and its torque climbs past the limit.  The old
+        # behaviour dropped both gains, so the object pushed the jaws open — a
+        # grasp that springs.  Now a pure-torque frame keeps a bounded squeeze.
+        g, fake, mgr = self._tripped_slave()
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: mgr.status()["over_torque"]))
+            # Holding: zero stiffness, zero damping, bounded torque in the
+            # direction the jaws were pushing (here: closing, positive).
+            self.assertTrue(_wait_until(
+                lambda: fake.frames and fake.frames[-1].kp == 0.0
+                and fake.frames[-1].kd == 0.0
+                and abs(fake.frames[-1].tau_ff - 1.0) < 1e-9))
+            tripped = len(fake.frames)
+            # Still streaming, so the motor does not latch comm loss.
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > tripped + 5))
+            self.assertAlmostEqual(fake.frames[-1].tau_ff, 1.0, places=6)
+            # Not released: the fake motor still reports the holding torque.
+            self.assertAlmostEqual(fake.motor.tau, 1.0, places=6)
+        finally:
+            mgr.stop()
+
+    def test_hold_pushes_along_the_trip_direction_on_a_reverse_mount(self):
+        # On the reverse mount closing decreases radians, so the torque at the
+        # trip is negative.  The hold must follow *that* sign, not ``close_sign``
+        # blindly — a wrong direction would press the jaws the other way.
+        block = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2.0
+        g, fake = make_gripper(reverse=True, block_rad=block)
         transport = _PreSubTransport()
         mgr = GripperTeleop(g, transport, "slave", TOPIC, rate_hz=200.0,
                             sleep_fn=_nop_sleep, align=False, watchdog_s=5.0,
@@ -972,23 +1117,33 @@ class TorqueGuardTest(unittest.TestCase):
         transport.pub(TOPIC, encode_frame(0.0, 0.0, 0.0, 0.0))
         mgr.start()
         try:
-            self.assertTrue(_wait_until(lambda: mgr.status()["over_torque"]))
-            tripped = len(fake.frames)
-            # Released in place: zero stiffness, zero damping.
+            self.assertEqual(g.config.close_sign, -1.0)
             self.assertTrue(_wait_until(
                 lambda: fake.frames and fake.frames[-1].kp == 0.0
-                and fake.frames[-1].kd == 0.0))
-            # Still streaming, so the motor does not latch comm loss.
-            self.assertTrue(_wait_until(lambda: len(fake.frames) > tripped + 5))
-            self.assertEqual(fake.frames[-1].kp, 0.0)
+                and abs(fake.frames[-1].tau_ff + 1.0) < 1e-9))
         finally:
             mgr.stop()
 
-    def test_align_releases_in_place_when_the_guard_trips(self):
+    def test_release_action_is_the_opt_in_let_go(self):
+        g, fake, mgr = self._tripped_slave(
+            torque_guard_action=TORQUE_GUARD_RELEASE)
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: mgr.status()["over_torque"]))
+            # Released in place: zero stiffness, zero damping, no torque — the
+            # pre-existing behaviour, now only by request.
+            self.assertTrue(_wait_until(
+                lambda: fake.frames and fake.frames[-1].kp == 0.0
+                and fake.frames[-1].kd == 0.0
+                and fake.frames[-1].tau_ff == 0.0))
+        finally:
+            mgr.stop()
+
+    def test_align_holds_when_the_guard_trips(self):
         # The align used to run inside a blocking ``goto_rad``, outside the
         # guard's reach: ``torque_limit_nm`` did not cover it, and a jam during
         # the align pressed until the move finished.  It now sends through the
-        # loop's own path, so the guard sees it.
+        # loop's own path, so the guard sees it — and holds like the follow loop.
         block = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2.0
         g, fake = make_gripper(start_rad=POS_OPEN_RAD, block_rad=block)
         transport = _PreSubTransport()
@@ -999,26 +1154,197 @@ class TorqueGuardTest(unittest.TestCase):
         mgr.start()
         try:
             self.assertTrue(_wait_until(
-                lambda: any(f.kp == 0.0 for f in fake.frames)))
+                lambda: any(f.kp == 0.0 and abs(f.tau_ff - 1.0) < 1e-9
+                            for f in fake.frames)))
         finally:
             mgr.stop()
 
-    def test_slave_releases_in_place_on_the_handoff(self):
-        block = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2.0
-        g, fake = make_gripper(start_rad=POS_OPEN_RAD, block_rad=block)
-        transport = _PreSubTransport()
-        mgr = GripperTeleop(g, transport, "slave", TOPIC, rate_hz=200.0,
-                            sleep_fn=_nop_sleep, align=False, watchdog_s=5.0,
-                            torque_limit_nm=1.0)
-        transport.pub(TOPIC, encode_frame(0.0, 0.0, 0.0, 0.0))
+    def test_slave_holds_on_the_handoff(self):
+        g, fake, mgr = self._tripped_slave()
         mgr.start()
         try:
             self.assertTrue(_wait_until(lambda: mgr.status()["over_torque"]))
         finally:
             mgr.stop()
-        # The final frame must not re-apply the gains and press again.
+        # The final frame must not re-apply the gains and press again — but it
+        # must keep the bounded hold, or the part drops the moment we stop.
         self.assertEqual(fake.frames[-1].kp, 0.0)
         self.assertEqual(fake.frames[-1].kd, 0.0)
+        self.assertAlmostEqual(fake.frames[-1].tau_ff, 1.0, places=6)
+
+
+class ForceFeedbackTest(unittest.TestCase):
+    """The follower -> leader squeeze channel.
+
+    Coarse by design: only the squeeze above the threshold is reflected, in
+    proportion to the gain, capped, and signed to oppose closing on the
+    leader's own mount.  A wrong sign would drive the operator's hand *into*
+    the grasp, so both mounts matter.  It degrades to off on any link that
+    cannot carry it (the publish-only UDP master, a stale channel).
+    """
+
+    @staticmethod
+    def _slave(**kwargs):
+        g, fake = make_gripper(start_rad=POS_CLOSED_RAD)
+        transport = _PreSubTransport()
+        fb_sub = transport.sub(FEEDBACK)     # before start, so nothing is missed
+        mgr = GripperTeleop(g, transport, "slave", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep, align=False, watchdog_s=5.0,
+                            force_feedback=True, feedback_topic=FEEDBACK,
+                            **kwargs)
+        return g, fake, transport, fb_sub, mgr
+
+    def _master(self, **kwargs):
+        g, fake = make_gripper(start_rad=POS_OPEN_RAD)
+        # A real slack jaw does not move under zero gain; the fake one is purely
+        # kinematic, so freeze it or the slack frame would drag it closed.
+        fake.motor.step = lambda *a, **k: None
+        transport = InProcTeleopTransport()
+        mgr = GripperTeleop(g, transport, "master", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep, force_feedback=True,
+                            feedback_topic=FEEDBACK, **kwargs)
+        return g, fake, transport, mgr
+
+    # ── follower ──────────────────────────────────────────────────────
+
+    def test_slave_publishes_the_mount_normalised_squeeze(self):
+        g, fake, transport, fb_sub, mgr = self._slave()
+        # 0.5 Nm of coil torque on the shipped mount is +5 N of squeeze.
+        fake.get_torque = lambda: 0.5
+        mgr.start()
+        try:
+            frame = []
+
+            def newest():
+                payload = fb_sub.drain_latest()
+                if payload is not None:
+                    frame[:] = [payload]
+                return bool(frame)
+
+            self.assertTrue(_wait_until(newest))
+            self.assertAlmostEqual(decode_feedback_frame(frame[0]), 5.0,
+                                   places=6)
+            self.assertGreater(mgr.status()["feedback_tx"], 0)
+        finally:
+            mgr.stop()
+
+    # ── leader ────────────────────────────────────────────────────────
+
+    def _contact_frame(self, fake, g):
+        target = -g.config.close_sign * 0.8
+        return [f for f in reversed(fake.frames)
+                if abs(f.tau_ff - target) < 1e-9]
+
+    def test_master_renders_resistance_from_a_fresh_squeeze(self):
+        # 10 N of squeeze: (10 - 2) N * 0.10 Nm/N = 0.8 Nm, under the 1.0 cap,
+        # signed to oppose closing on the leader's mount.
+        g, fake, transport, mgr = self._master()
+        target = -g.config.close_sign * 0.8
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 0))
+            # ⚠ The status sample has to be taken **while the channel is still
+            #   being fed**.  `sleep_fn` is a no-op, so the loop spins flat out
+            #   and stops rendering `feedback_tau_nm` as soon as the last frame
+            #   is older than the timeout — reading it after the publish loop
+            #   exits is a race (it lost on a loaded CI runner).
+            seen = []
+
+            def rendered():
+                st = mgr.status()
+                if (self._contact_frame(fake, g)
+                        and abs(st["feedback_tau_nm"] - target) < 1e-6):
+                    seen.append(st["feedback_tau_nm"])
+                    return True
+                return False
+
+            self.assertTrue(_publish_until(
+                transport, FEEDBACK, encode_feedback_frame(10.0), rendered))
+            frame = self._contact_frame(fake, g)[0]
+            self.assertEqual((frame.kp, frame.kd), (0.0, DEFAULT_FEEDBACK_DAMPING))
+            self.assertAlmostEqual(frame.tau_ff, target, places=6)
+            self.assertAlmostEqual(seen[0], target, places=6)
+        finally:
+            mgr.stop()
+
+    def test_master_feels_nothing_below_the_threshold(self):
+        g, fake, transport, mgr = self._master()
+        mgr.start()
+        try:
+            self.assertTrue(_publish_until(
+                transport, FEEDBACK, encode_feedback_frame(2.0),
+                lambda: mgr.status()["feedback_rx"] > 0))
+            before = len(fake.frames)
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > before + 5))
+            self.assertEqual(fake.frames[-1].tau_ff, 0.0)
+            self.assertEqual(fake.frames[-1].kd, 0.0)
+        finally:
+            mgr.stop()
+
+    def test_master_resistance_is_capped(self):
+        g, fake, transport, mgr = self._master(feedback_max_tau_nm=0.5)
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 0))
+            target = -g.config.close_sign * 0.5
+            self.assertTrue(_publish_until(
+                transport, FEEDBACK, encode_feedback_frame(10.0),
+                lambda: any(abs(f.tau_ff - target) < 1e-9
+                            for f in fake.frames)))
+        finally:
+            mgr.stop()
+
+    def test_master_drops_the_force_when_the_channel_goes_quiet(self):
+        # A dead link must not pin a force on the operator's hand.
+        g, fake, transport, mgr = self._master(feedback_timeout_s=0.02)
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 0))
+            self.assertTrue(_publish_until(
+                transport, FEEDBACK, encode_feedback_frame(10.0),
+                lambda: bool(self._contact_frame(fake, g))))
+            # Stop feeding it: the loop's own clock runs past the timeout.
+            self.assertTrue(_wait_until(
+                lambda: fake.frames[-1].tau_ff == 0.0
+                and fake.frames[-1].kd == 0.0))
+            self.assertEqual(mgr.status()["feedback_tau_nm"], 0.0)
+        finally:
+            mgr.stop()
+
+    def test_feedback_is_off_by_default(self):
+        g, fake = make_gripper(start_rad=POS_OPEN_RAD)
+        fake.motor.step = lambda *a, **k: None
+        transport = InProcTeleopTransport()
+        mgr = GripperTeleop(g, transport, "master", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep, feedback_topic=FEEDBACK)
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 0))
+            transport.pub(FEEDBACK, encode_feedback_frame(10.0))
+            before = len(fake.frames)
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > before + 5))
+            self.assertEqual(fake.frames[-1].tau_ff, 0.0)
+            self.assertEqual(mgr.status()["feedback_rx"], 0)
+        finally:
+            mgr.stop()
+
+    def test_a_publish_only_master_runs_without_feedback(self):
+        # The UDP master has no receive path at all; the feature must turn
+        # itself off rather than fail the session or hold a stale force.
+        g, fake = make_gripper(start_rad=POS_OPEN_RAD)
+        fake.motor.step = lambda *a, **k: None
+        transport = UdpTeleopTransport(pub_addr=("127.0.0.1", 1))
+        mgr = GripperTeleop(g, transport, "master", TOPIC, rate_hz=200.0,
+                            sleep_fn=_nop_sleep, force_feedback=True,
+                            feedback_topic=FEEDBACK)
+        mgr.start()
+        try:
+            self.assertTrue(_wait_until(lambda: len(fake.frames) > 0))
+            self.assertIsNone(mgr._feedback_sub)
+            self.assertEqual(fake.frames[-1].tau_ff, 0.0)
+        finally:
+            mgr.stop()
+            transport.close()
 
 
 class LeadCapTest(unittest.TestCase):

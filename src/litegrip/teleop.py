@@ -47,12 +47,21 @@ Safety notes
   loop is deliberately left uncapped so the follower stays responsive; the
   ``torque_limit_nm`` guard is what protects it under load.
 * When ``torque_limit_nm`` is set (``0``, the default, disables it) the follower
-  watches its own torque and releases when it stays over the limit for
-  :data:`TORQUE_TRIP_CYCLES` cycles — see
-  :meth:`GripperTeleop._update_torque_guard`.  Position is deliberately not used
-  for this: a jam partway through the travel is indistinguishable from slow
+  watches its own torque and, once it stays over the limit for
+  :data:`TORQUE_TRIP_CYCLES` cycles, holds there with a bounded pure-torque frame
+  (``torque_guard_action="hold"``, the default) — see
+  :meth:`GripperTeleop._update_torque_guard`.  Holding rather than releasing is
+  what makes a grasp survive: zero stiffness lets whatever is between the jaws
+  push them straight back open.  ``torque_guard_action="release"`` restores the
+  old release-in-place behaviour.  Position is deliberately not used for the
+  decision: a jam partway through the travel is indistinguishable from slow
   motion, and the calibrated travel comes from two hand-measured limits, which
   makes it the least trustworthy number in the loop.
+* ``force_feedback`` (``False``, the default) publishes the follower's own
+  squeeze on :func:`feedback_topic` each cycle; the master renders it as a
+  bounded resistance torque while its jaws are hand-movable, so the operator can
+  feel a grasp.  It is coarse by design — a threshold, a proportional gain and a
+  ceiling.  A transport that cannot subscribe (UDP master) simply runs without it.
 * A **non-finite** frame (NaN / ±inf) is *dropped*, never clamped.  ``_clamp01``
   passes NaN through and ``min(hi, NaN)`` returns ``hi``, so clamping a NaN
   target silently commands the follower to its closed stop.  Bad readings are
@@ -61,7 +70,7 @@ Safety notes
 * A ``slave`` whose leader goes quiet **holds** its last target at the follow
   gains (it does not relax to zero torque).  The jaws therefore keep pressing
   whatever is between them — the same behaviour as the litearm original.  A
-  tripped torque guard overrides that and stays released.
+  tripped torque guard overrides that with its own bounded pure-torque hold.
 * The leader's readiness gate is about **when it hands back**, never about
   withholding frames: it publishes from the first cycle either way, so a
   follower always has something to align to and neither end can block on the
@@ -185,6 +194,28 @@ DEFAULT_READY_PERIOD_S = 0.1
 #: after this.  See :meth:`GripperTeleop._relaxed`.
 DEFAULT_READY_TIMEOUT_S = 10.0
 
+#: What the follower does when its torque guard trips.  ``hold`` keeps pressing
+#: with a bounded pure-torque frame (``kp=kd=0``, ``tau=±torque_limit_nm``) so a
+#: grasp is not dropped; ``release`` sets zero stiffness and lets go, which is
+#: what this module did before the option existed.  The pure-torque hold mirrors
+#: the force-hold path in :mod:`litegrip.actions`, which is validated on the
+#: machine and keeps streaming to avoid the DM4310 comm-loss fault.
+TORQUE_GUARD_HOLD = "hold"
+TORQUE_GUARD_RELEASE = "release"
+TORQUE_GUARD_ACTIONS = (TORQUE_GUARD_HOLD, TORQUE_GUARD_RELEASE)
+
+#: Force feedback defaults — coarse by design.  ``gain`` converts newtons of the
+#: follower's squeeze into newton-metres on the leader; ``threshold`` keeps light
+#: contact and follow-loop friction silent; ``max_tau_nm`` is the safety ceiling
+#: on what the leader's motor pushes into the operator's hand, and
+#: ``timeout_s`` drops both the torque and the damping when the feedback channel
+#: goes quiet so a dead link cannot pin a force on.  ``0`` gain disables it.
+DEFAULT_FEEDBACK_GAIN_NM_PER_N = 0.10
+DEFAULT_FEEDBACK_THRESHOLD_N = 2.0
+DEFAULT_FEEDBACK_MAX_TAU_NM = 1.0
+DEFAULT_FEEDBACK_DAMPING = 0.1
+DEFAULT_FEEDBACK_TIMEOUT_S = 0.3
+
 
 def encode_frame(openness: float, position_mm: float, force_n: float,
                  timestamp: float) -> bytes:
@@ -249,6 +280,51 @@ def decode_ready_frame(payload: bytes) -> bool:
     return _READY_FRAME.unpack(payload)[0] != 0
 
 
+# ── Feedback codec ────────────────────────────────────────────────────────
+
+_FEEDBACK_FRAME = struct.Struct(">d")
+
+#: Size of one feedback frame in bytes (one big-endian double).
+FEEDBACK_FRAME_SIZE = _FEEDBACK_FRAME.size
+
+
+def encode_feedback_frame(force_n: float) -> bytes:
+    """Pack one follower-force frame — the squeeze, in newtons.
+
+    Carried on its own topic rather than folded into the ready byte or the
+    teleop frame: the ready frame is pinned at one byte for older peers, and the
+    teleop frame is byte-identical to the litearm stack's.  Reusing the *session*
+    is free; reusing the *frame* is not.  ``force_n`` is the SDK's
+    mounting-normalised squeeze (``close_sign * torque_nm``), so positive always
+    means "closing on something" on either mount.
+
+    Raises:
+        ValueError: ``force_n`` is not finite.  A NaN would otherwise decode
+            into a leader target and be clamped onto a stop.
+    """
+    value = float(force_n)
+    if not math.isfinite(value):
+        raise ValueError(f"feedback force must be finite, got {force_n!r}")
+    return _FEEDBACK_FRAME.pack(value)
+
+
+def decode_feedback_frame(payload: bytes) -> float:
+    """Unpack a feedback frame into the follower squeeze in newtons.
+
+    Raises:
+        ValueError: wrong length, or a non-finite value (the sender's clock is
+            not trusted, but its arithmetic is checked).
+    """
+    if len(payload) != FEEDBACK_FRAME_SIZE:
+        raise ValueError(
+            f"feedback frame must be {FEEDBACK_FRAME_SIZE} bytes, "
+            f"got {len(payload)}")
+    value = _FEEDBACK_FRAME.unpack(payload)[0]
+    if not math.isfinite(value):
+        raise ValueError(f"feedback frame carries a non-finite force: {value!r}")
+    return value
+
+
 def teleop_topic(grip_id: str = DEFAULT_GRIP_ID) -> str:
     """Topic the leader publishes and the follower subscribes to.
 
@@ -272,6 +348,17 @@ def ready_topic(grip_id: str = DEFAULT_GRIP_ID) -> str:
     never matches it, which is the intended "old peer" behaviour.
     """
     return f"litearm/v4/{grip_id}/gripper_ready"
+
+
+def feedback_topic(grip_id: str = DEFAULT_GRIP_ID) -> str:
+    """Topic the follower publishes its squeeze on and the leader subscribes to.
+
+    A third sibling on the same transport, in the reverse direction.  Like
+    :func:`ready_topic` it is an extension: a peer that does not know it never
+    matches, which is exactly the desired "old peer" behaviour — the handshake
+    still works and the force feedback is simply absent.
+    """
+    return f"litearm/v4/{grip_id}/gripper_feedback"
 
 
 # ── Transport abstraction ─────────────────────────────────────────────────
@@ -599,10 +686,13 @@ class GripperTeleop:
             ``kp * lead_cap_mm / rad_to_mm``.  The follow loop is not capped.
             ``0`` disables the cap.  See :meth:`_cap_lead`.
         torque_limit_nm: Slave only — ceiling in Nm on the follower's own torque.
-            Held over the limit for :data:`TORQUE_TRIP_CYCLES` cycles it
-            releases in place and stays released until the leader reopens by
-            :data:`TORQUE_REARM_OPENNESS`.  ``0`` disables the guard.  See
-            :meth:`_update_torque_guard`.
+            Held over the limit for :data:`TORQUE_TRIP_CYCLES` cycles it acts
+            according to ``torque_guard_action`` and stays in that state until
+            the leader reopens by :data:`TORQUE_REARM_OPENNESS`.  ``0`` disables
+            the guard.  See :meth:`_update_torque_guard`.
+        torque_guard_action: Slave only — ``"hold"`` (default) keeps pressing
+            with a bounded pure-torque frame so a grasp survives; ``"release"``
+            drops to zero stiffness and lets go, the pre-existing behaviour.
         ready_topic: The follower-ready channel, or ``None`` to run without a
             handshake (the master then goes slack from its first cycle).  When
             set, the master holds under gain until a ready frame arrives and the
@@ -617,6 +707,26 @@ class GripperTeleop:
             position is within this many mm of the commanded one.
         ready_period_s: Slave only — republish the ready state at least this
             often (it is also resent on every change).
+        force_feedback: Publish the follower's squeeze and render it on the
+            leader as resistance.  ``False`` (the default) keeps the old
+            behaviour.  Needs ``feedback_topic`` and a subscribe-capable
+            transport on the master; otherwise it degrades to off.
+        feedback_topic: The follower-force channel.  ``None`` disables force
+            feedback.
+        feedback_gain_nm_per_n: Leader torque per newton of follower squeeze
+            above the threshold.  ``0`` disables it.
+        feedback_threshold_n: Follower squeeze below which the leader feels
+            nothing — keeps follow-loop friction and light contact silent.
+        feedback_max_tau_nm: Ceiling on the leader's rendered resistance, in Nm.
+            Keep it well under the motor limit: this drives the operator's
+            hand.
+        feedback_damping: Leader velocity damping (``kd``) applied only while a
+            fresh feedback frame exists.  It is pure viscous braking (the master
+            sends ``kp=0`` and a zero velocity target) and breaks the
+            torque→open→torque-drop loop that couples the operator into the
+            follower.  ``0`` disables it.
+        feedback_timeout_s: Age past which a feedback frame is ignored; both the
+            torque and the damping drop to zero.
         sub_transport: Slave only — a separate transport to subscribe on when
             the leader is remote (the master's transport is local-only).
         sleep_fn, time_fn: Timing seams for tests.  ``time_fn`` must be
@@ -637,12 +747,20 @@ class GripperTeleop:
         watchdog_s: float = 0.2,
         dq_max: float = DEFAULT_DQ_MAX,
         torque_limit_nm: float = DEFAULT_TORQUE_LIMIT_NM,
+        torque_guard_action: str = TORQUE_GUARD_HOLD,
         lead_cap_mm: float = DEFAULT_LEAD_CAP_MM,             # [遥操对齐块]
         ready_topic: Optional[str] = None,
         require_ready: bool = True,
         ready_timeout_s: float = DEFAULT_READY_TIMEOUT_S,
         ready_tolerance_mm: float = DEFAULT_READY_TOLERANCE_MM,
         ready_period_s: float = DEFAULT_READY_PERIOD_S,
+        force_feedback: bool = False,
+        feedback_topic: Optional[str] = None,
+        feedback_gain_nm_per_n: float = DEFAULT_FEEDBACK_GAIN_NM_PER_N,
+        feedback_threshold_n: float = DEFAULT_FEEDBACK_THRESHOLD_N,
+        feedback_max_tau_nm: float = DEFAULT_FEEDBACK_MAX_TAU_NM,
+        feedback_damping: float = DEFAULT_FEEDBACK_DAMPING,
+        feedback_timeout_s: float = DEFAULT_FEEDBACK_TIMEOUT_S,
         sub_transport: Optional[TeleopTransport] = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         time_fn: Callable[[], float] = time.monotonic,
@@ -660,6 +778,29 @@ class GripperTeleop:
             raise ValueError(
                 f"torque_limit_nm must be >= 0 (0 disables the guard), "
                 f"got {torque_limit_nm!r}")
+        if torque_guard_action not in TORQUE_GUARD_ACTIONS:
+            raise ValueError(
+                f"torque_guard_action must be one of {TORQUE_GUARD_ACTIONS}, "
+                f"got {torque_guard_action!r}")
+        if float(feedback_gain_nm_per_n) < 0.0:
+            raise ValueError(
+                f"feedback_gain_nm_per_n must be >= 0 (0 disables it), "
+                f"got {feedback_gain_nm_per_n!r}")
+        if float(feedback_threshold_n) < 0.0:
+            raise ValueError(
+                f"feedback_threshold_n must be >= 0, "
+                f"got {feedback_threshold_n!r}")
+        if not 0.0 <= float(feedback_max_tau_nm) <= 10.0:
+            raise ValueError(
+                f"feedback_max_tau_nm must be in [0, 10], "
+                f"got {feedback_max_tau_nm!r}")
+        if not 0.0 <= float(feedback_damping) <= 5.0:
+            raise ValueError(
+                f"feedback_damping must be in [0, 5], "
+                f"got {feedback_damping!r}")
+        if not float(feedback_timeout_s) > 0.0:
+            raise ValueError(
+                f"feedback_timeout_s must be > 0, got {feedback_timeout_s!r}")
         if float(lead_cap_mm) < 0.0:
             raise ValueError(
                 f"lead_cap_mm must be >= 0 (0 disables the cap), "
@@ -685,12 +826,20 @@ class GripperTeleop:
         self._watchdog_s = watchdog_s
         self._dq_max = float(dq_max)
         self._torque_limit_nm = float(torque_limit_nm)
+        self._torque_guard_action = torque_guard_action
         self._lead_cap_mm = float(lead_cap_mm)
         self._ready_topic = ready_topic
         self._require_ready = bool(require_ready)
         self._ready_timeout_s = float(ready_timeout_s)
         self._ready_tolerance_mm = float(ready_tolerance_mm)
         self._ready_period_s = float(ready_period_s)
+        self._force_feedback = bool(force_feedback)
+        self._feedback_topic = feedback_topic
+        self._feedback_gain = float(feedback_gain_nm_per_n)
+        self._feedback_threshold_n = float(feedback_threshold_n)
+        self._feedback_max_tau_nm = float(feedback_max_tau_nm)
+        self._feedback_damping = float(feedback_damping)
+        self._feedback_timeout_s = float(feedback_timeout_s)
         self._sub_tp = sub_transport
         self._sleep_fn = sleep_fn
         self._time_fn = time_fn
@@ -726,6 +875,19 @@ class GripperTeleop:
         self._torque_trips = 0
         self._torque_over_cycles = 0
         self._trip_openness = 0.0
+        #: Sign latched at the trip, so the hold presses back into whatever
+        #: stopped the jaws rather than assuming the closing direction.
+        self._hold_tau_sign = 1.0
+        #: Force feedback.  Master side: ``_feedback_sub`` / ``_feedback_force_n``
+        #: are the reverse channel and its newest sample; ``_feedback_rx_ts``
+        #: gates it on :attr:`_feedback_timeout_s`.  Slave side: ``_feedback_tx``
+        #: counts what it published.
+        self._feedback_sub: Optional[TeleopSubscription] = None
+        self._feedback_force_n = 0.0
+        self._feedback_rx_ts: Optional[float] = None
+        self._feedback_rx = 0
+        self._feedback_tx = 0
+        self._feedback_tau_nm = 0.0
         #: Readiness handshake.  Master side: ``_follower_ready`` is the last
         #: state heard, ``_master_relaxed`` latches once the gate opens so a
         #: later not-ready does not snatch control back from the operator, and
@@ -812,8 +974,8 @@ class GripperTeleop:
         """Leave the gripper holding position — never disable (§8 rule 4/6).
 
         A tripped torque guard is the exception: re-applying the follow gains
-        would press the very thing the guard just let go of, so the final frame
-        stays at zero torque.
+        would press the very thing the guard is holding, so the final frame is
+        the guard's own (bounded torque for ``hold``, zero for ``release``).
         """
         try:
             if self._mode == "master":
@@ -821,11 +983,11 @@ class GripperTeleop:
                 # gains, which is exactly the hand-off we want.
                 self._g.exit_zero_gravity()
             else:
-                q = clamp_to_calibrated(
-                    self._g.config, self._g.get_state(wait=False).position_rad)
+                state = self._g.get_state(wait=False)
                 if self._over_torque:
-                    self._send(q, 0.0, 0.0)
+                    self._guard_hold_frame(state)
                 else:
+                    q = clamp_to_calibrated(self._g.config, state.position_rad)
                     self._send(q, self._resolve_kp(), self._resolve_kd())
         except Exception as e:  # noqa: BLE001
             log.debug("hand-off on stop failed: %s", e)
@@ -858,7 +1020,8 @@ class GripperTeleop:
             # The gripper's own error_code was not "enabled".
             "fault": self._fault,
             # Slave only: the follower's own torque (Nm), and whether the guard
-            # has released it.  ``torque_trips`` counts trips this session.
+            # has tripped it (``hold`` keeps pressing, ``release`` lets go).
+            # ``torque_trips`` counts trips this session.
             "torque_nm": round(self._torque_nm, 4),
             "over_torque": self._over_torque,
             "torque_trips": self._torque_trips,
@@ -874,12 +1037,20 @@ class GripperTeleop:
             "ready_rx": self._ready_rx,
             "ready_pubs": self._ready_pubs,
             "ready_timed_out": self._ready_timed_out,
+            # Force feedback.  ``feedback_force_n`` is the squeeze heard
+            # (master) or last published (slave); ``feedback_tau_nm`` is what
+            # the master is currently pushing into the operator's hand.
+            "feedback_force_n": round(self._feedback_force_n, 4),
+            "feedback_tau_nm": round(self._feedback_tau_nm, 4),
+            "feedback_rx": self._feedback_rx,
+            "feedback_tx": self._feedback_tx,
         }
 
     # ── master ────────────────────────────────────────────────────────
 
     def _master_loop(self) -> None:
         self._ready_sub = self._open_ready_sub()
+        self._feedback_sub = self._open_feedback_sub()
         if self._ready_sub is None:
             log.info("[master] zero-gravity, publishing to %s", self._topic)
         else:
@@ -888,6 +1059,15 @@ class GripperTeleop:
             log.info("[master] holding under gain, publishing to %s; releasing "
                      "when %s reports ready (waiting %s)",
                      self._topic, self._ready_topic, wait)
+        if self._feedback_sub is not None:
+            log.info("[master] force feedback on: %s (gain %.2f Nm/N, "
+                     "threshold %.1f N, cap %.2f Nm)",
+                     self._feedback_topic, self._feedback_gain,
+                     self._feedback_threshold_n, self._feedback_max_tau_nm)
+        elif self._force_feedback:
+            log.warning("[master] force feedback requested but the transport "
+                        "cannot provide %s; running without it",
+                        self._feedback_topic)
         self._master_t0 = self._time_fn()
         try:
             while self._running:
@@ -900,8 +1080,14 @@ class GripperTeleop:
                     log.exception("[master] CAN error; loop exiting")
                     break
                 self._note_grip_fault(state)
-                if self._ready_sub is not None and not self._follower_ready:
+                # Both reverse channels are drained every cycle, not just until
+                # the gate opens: the ready state is latched once heard, but the
+                # force has to keep arriving for the whole session or the leader
+                # would stop feeling the grasp the moment it was handed back.
+                if self._ready_sub is not None:
                     self._read_ready(self._ready_sub)
+                if self._feedback_sub is not None:
+                    self._read_feedback(self._feedback_sub)
                 # Keep the frame stream alive: the DM motor self-locks a
                 # "communication loss" fault ~100 ms after frames stop, so a
                 # frame goes out every cycle even though nothing is commanded.
@@ -910,7 +1096,8 @@ class GripperTeleop:
                 # which is the very thing the gate exists to prevent.
                 try:
                     if self._relaxed():
-                        self._send(0.0, 0.0, 0.0, quiet=True)
+                        tau, damping = self._master_feedback()
+                        self._send(0.0, 0.0, damping, tau=tau, quiet=True)
                     else:
                         self._send(clamp_to_calibrated(
                             self._g.config, state.position_rad),
@@ -1033,13 +1220,16 @@ class GripperTeleop:
                     # and runs at the loop rate.
                     state = self._g.get_state(wait=False)
                     self._note_grip_fault(state)
+                    self._publish_feedback(state)
                     self._update_torque_guard(state)
                     self._announce_ready(state, cfg, q_cmd)
                     if self._over_torque:
-                        # Released in place: zero stiffness and damping, but the
-                        # frames keep flowing so the motor does not latch its
-                        # comm-loss fault.
-                        self._send(q_cmd, 0.0, 0.0)
+                        # Hold at the measured angle.  ``hold`` keeps pressing
+                        # with a bounded pure-torque frame so the grasp survives;
+                        # ``release`` drops both gains.  Either way the frames
+                        # keep flowing so the motor does not latch its comm-loss
+                        # fault.
+                        self._guard_hold_frame(state)
                     else:
                         # Deliberately uncapped: the follower commands the
                         # leader's opening outright so it stays responsive.  Only
@@ -1127,6 +1317,92 @@ class GripperTeleop:
         if ready != self._follower_ready:
             log.info("[master] follower %s", "ready" if ready else "not ready")
         self._follower_ready = ready
+
+    # ── force feedback ────────────────────────────────────────────────
+
+    def _open_feedback_sub(self) -> Optional[TeleopSubscription]:
+        """Subscribe to the follower-force channel, or ``None`` if it is off.
+
+        Same rule as :meth:`_open_ready_sub`: a transport that cannot subscribe
+        (the UDP master) simply runs without feedback.  This is why the feature
+        is safe to enable by default on a link that may be one-way.
+        """
+        if not self._force_feedback or self._feedback_topic is None:
+            return None
+        try:
+            return (self._sub_tp or self._tp).sub(self._feedback_topic)
+        except Exception as e:  # noqa: BLE001
+            log.warning("[master] cannot subscribe to %s (%s); force feedback "
+                        "is off", self._feedback_topic, e)
+            return None
+
+    def _read_feedback(self, sub: TeleopSubscription) -> None:
+        """Drain the force channel.  The newest sample wins."""
+        msg = sub.drain_latest()
+        if msg is None:
+            return
+        try:
+            force = decode_feedback_frame(msg)
+        except ValueError as e:
+            log.debug("[master] ignoring bad feedback frame: %s", e)
+            return
+        self._feedback_force_n = force
+        self._feedback_rx_ts = self._time_fn()
+        self._feedback_rx += 1
+
+    def _master_feedback(self) -> Tuple[float, float]:
+        """The leader's ``(tau, kd)`` for this cycle.
+
+        Coarse on purpose: only the follower's squeeze above
+        :attr:`_feedback_threshold_n` is reflected, proportional to
+        :attr:`_feedback_gain`, capped at :attr:`_feedback_max_tau_nm`, and
+        signed to *oppose closing* on this gripper's mount.  The force on the
+        wire is already normalised so positive means "squeezing", and
+        ``close_sign`` is the leader's own closing direction — a wrong sign here
+        would drive the hand *into* the grasp, so it is covered by a test for
+        both mounts.
+
+        Damping is returned only while there is real contact.  With ``kp=0`` and
+        a zero velocity target the MIT law gives ``tau_motor = -kd*dq_measured``:
+        pure viscous braking, which breaks the follower-torque → leader-opens →
+        follower-opens → torque-drops loop without ever pushing the jaws closed.
+        Applied always, it would make a free-moving leader feel sticky.
+
+        A stale or missing frame drops both to zero — a dead link must not pin a
+        force on the operator's hand.
+        """
+        self._feedback_tau_nm = 0.0
+        if not self._force_feedback or self._feedback_gain <= 0.0:
+            return 0.0, 0.0
+        ts = self._feedback_rx_ts
+        if ts is None or (self._time_fn() - ts) > self._feedback_timeout_s:
+            return 0.0, 0.0
+        squeeze = max(0.0, self._feedback_force_n - self._feedback_threshold_n)
+        mag = min(squeeze * self._feedback_gain, self._feedback_max_tau_nm)
+        if mag <= 0.0:
+            return 0.0, 0.0
+        close_sign = float(getattr(self._g.config, "close_sign", 1.0) or 1.0)
+        tau = -close_sign * mag
+        self._feedback_tau_nm = tau
+        return tau, self._feedback_damping
+
+    def _publish_feedback(self, state: Any) -> None:
+        """Publish this cycle's squeeze, slave side.  Non-fatal on failure."""
+        if not self._force_feedback or self._feedback_topic is None:
+            return
+        tp = self._ready_tp
+        if tp is None:
+            return
+        force = float(getattr(state, "force_n", 0.0) or 0.0)
+        if not math.isfinite(force):
+            return
+        self._feedback_force_n = force
+        try:
+            tp.pub(self._feedback_topic, encode_feedback_frame(force))
+            self._feedback_tx += 1
+        except Exception as e:  # noqa: BLE001
+            if self._feedback_tx == 0:
+                log.warning("[slave] feedback publish failed: %s", e)
 
     def _relaxed(self) -> bool:
         """Whether the leader may hand back this cycle — **latched**.
@@ -1301,11 +1577,11 @@ class GripperTeleop:
                 self._note_grip_fault(state)
                 self._update_torque_guard(state)
                 if self._over_torque:
-                    # Released in place, exactly as the follow loop would.  Hold
-                    # where the jaws are; do not keep driving into whatever
-                    # tripped the guard.
-                    self._send(clamp_to_calibrated(cfg, state.position_rad),
-                               0.0, 0.0)
+                    # Exactly what the follow loop would do.  Hold where the
+                    # jaws are; do not keep driving into whatever tripped the
+                    # guard (``hold`` leaves a bounded force on it, ``release``
+                    # lets go).
+                    self._guard_hold_frame(state)
                     return
                 q_sched = start + dist_rad * (i / steps)
                 self._send(self._cap_lead(q_sched, state.position_rad),
@@ -1352,12 +1628,17 @@ class GripperTeleop:
                         self._mode, got)
 
     def _send(self, q: float, kp: float, kd: float, dq: float = 0.0,
-              quiet: bool = False) -> None:
+              tau: float = 0.0, quiet: bool = False) -> None:
         """Send one MIT frame and **check the return value** (§8 rule 10).
 
         ``dq`` is the follower's velocity target: zero for a hold (and for the
         master's slack frames), the leader's finite-difference velocity for a
         follower cycle — see :meth:`_estimate_dq`.
+
+        ``tau`` is the feed-forward torque.  It is how a bounded grasp is held
+        (with ``kp=kd=0`` it is the *only* torque) and how force feedback reaches
+        the operator's hand.  The CAN layer rejects anything past the motor's
+        range rather than clamping it.
 
         ``send_mit_frame`` returns ``False`` when the motor is not enabled or the
         CAN write fails — it does not raise, so ignoring the result means
@@ -1369,7 +1650,7 @@ class GripperTeleop:
         operator gets, and it should not make them check the 24 V supply when the
         interface went down.
         """
-        if not self._g.send_mit_frame(q=q, kp=kp, kd=kd, dq=dq):
+        if not self._g.send_mit_frame(q=q, kp=kp, kd=kd, dq=dq, tau=tau):
             self._send_failed += 1
             if self._send_failed == 1 and not quiet:
                 error = getattr(self._g, "last_send_error", None)
@@ -1393,7 +1674,7 @@ class GripperTeleop:
             log.warning("[%s] %s", self._mode, self._fault)
 
     def _update_torque_guard(self, state: Any) -> None:
-        """Release the follower when its torque stays over the limit.
+        """Hold or release the follower when its torque stays over the limit.
 
         Torque is the follower's own reading, not the leader's ``force_n`` on the
         wire: the jaws press whatever is between them, and the status frame's
@@ -1402,10 +1683,17 @@ class GripperTeleop:
         motion, and the calibrated limits are the loop's least trustworthy
         numbers.
 
-        Latching matters: releasing in place drops the torque to zero, so a
-        non-latching guard would re-engage on the very next cycle and chatter.
-        The follower re-arms only once the leader has reopened by
-        :data:`TORQUE_REARM_OPENNESS`, i.e. once the operator has backed off.
+        Latching matters: either action leaves the follower in a state that no
+        longer tracks the leader, so a non-latching guard would re-engage on the
+        very next cycle and chatter.  The follower re-arms only once the leader
+        has reopened by :data:`TORQUE_REARM_OPENNESS`, i.e. once the operator has
+        backed off.
+
+        The hold direction is the sign of the torque at the trip, not
+        ``close_sign`` blindly: an obstruction hit while *opening* must be
+        pushed back along the opening direction, not the closing one.  Latching
+        it also keeps the hold from flipping if the reading crosses zero once
+        the jaws settle.
 
         That target is capped at the open stop.  A trip within the margin of
         full open has no travel left to reopen into, and an uncapped target
@@ -1434,14 +1722,39 @@ class GripperTeleop:
                 self._over_torque = True
                 self._torque_trips += 1
                 self._trip_openness = self._last_openness
-                log.warning(
-                    "[%s] torque %.3f Nm >= limit %.3f Nm for %d cycles — "
-                    "releasing in place (reopen the leader to %.2f to re-arm)",
-                    self._mode, self._torque_nm, self._torque_limit_nm,
-                    TORQUE_TRIP_CYCLES,
-                    min(self._last_openness + TORQUE_REARM_OPENNESS, 1.0))
+                self._hold_tau_sign = 1.0 if self._torque_nm >= 0.0 else -1.0
+                reopen = min(self._last_openness + TORQUE_REARM_OPENNESS, 1.0)
+                if self._torque_guard_action == TORQUE_GUARD_HOLD:
+                    log.warning(
+                        "[%s] torque %.3f Nm >= limit %.3f Nm for %d cycles — "
+                        "holding at %.3f Nm (reopen the leader to %.2f to re-arm)",
+                        self._mode, self._torque_nm, self._torque_limit_nm,
+                        TORQUE_TRIP_CYCLES,
+                        self._hold_tau_sign * self._torque_limit_nm, reopen)
+                else:
+                    log.warning(
+                        "[%s] torque %.3f Nm >= limit %.3f Nm for %d cycles — "
+                        "releasing in place (reopen the leader to %.2f to re-arm)",
+                        self._mode, self._torque_nm, self._torque_limit_nm,
+                        TORQUE_TRIP_CYCLES, reopen)
         else:
             self._torque_over_cycles = 0
+
+    def _guard_hold_frame(self, state: Any) -> None:
+        """One frame that keeps the follower where the guard put it.
+
+        ``hold`` sends a pure-torque frame (``kp=kd=0``) at the latched limit, so
+        the jaws keep a bounded force on whatever stopped them — a grasp that
+        survives instead of a grasp that springs open.  That is the same path
+        :mod:`litegrip.actions` uses for force hold.  ``release`` sets zero
+        stiffness and lets the object push the jaws apart, as before.
+        """
+        q = clamp_to_calibrated(self._g.config, state.position_rad)
+        if self._torque_guard_action == TORQUE_GUARD_HOLD:
+            self._send(q, 0.0, 0.0,
+                       tau=self._hold_tau_sign * self._torque_limit_nm)
+        else:
+            self._send(q, 0.0, 0.0)
 
     def _resolve_kp(self) -> float:
         """Follow gain: the explicit one, else the calibration's ``kp``."""

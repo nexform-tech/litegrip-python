@@ -513,9 +513,9 @@ with LiteGrip("can0") as slave:
 
 | Method | What it does |
 | --- | --- |
-| `teleop_start(mode, *, transport=None, link="zenoh", host=None, port=17448, grip_id="gripA", kp=None, kd=None, align=True, watchdog_s=0.2, dq_max=10.0, torque_limit_nm=0.0, require_ready=True, ...)` → `dict` | Starts the background loop for `mode="master"` or `"slave"`. Both ends must share `grip_id` and be connected and enabled first. |
+| `teleop_start(mode, *, transport=None, link="zenoh", host=None, port=17448, grip_id="gripA", kp=None, kd=None, align=True, watchdog_s=0.2, dq_max=10.0, torque_limit_nm=0.0, torque_guard_action="hold", require_ready=True, force_feedback=False, feedback_gain_nm_per_n=0.10, ...)` → `dict` | Starts the background loop for `mode="master"` or `"slave"`. Both ends must share `grip_id` and be connected and enabled first. |
 | `teleop_stop(timeout=2.0)` → `dict` | Stops the loop and leaves the jaws holding. |
-| `teleop_status()` → `dict` | `active`, `mode`, `frames`, `last_frame_age_ms`, `stale`, `openness`, `position_mm`, `force_n`, `loop_hz`, `rejected`, `send_failed`, `fault`, `torque_nm`, `over_torque`, `torque_trips`, `ready`, and more. |
+| `teleop_status()` → `dict` | `active`, `mode`, `frames`, `last_frame_age_ms`, `stale`, `openness`, `position_mm`, `force_n`, `loop_hz`, `rejected`, `send_failed`, `fault`, `torque_nm`, `over_torque`, `torque_trips`, `ready`, `feedback_force_n`, `feedback_tau_nm`, `feedback_rx`, `feedback_tx`, and more. |
 
 The link is a point-to-point **zenoh** session, an optional dependency:
 
@@ -545,11 +545,23 @@ python3 examples/teleop.py --mode slave --channel can0 --fake-leader --torque-li
 - **The leader holds its jaws under gain until the follower reports ready**, so the operator
   cannot push the target out from under a follower that is still travelling. `ready_timeout_s`
   (default `10.0`) bounds the wait; `require_ready=False` restores the immediate hand-back.
-- **An optional torque guard releases a follower that is pressing too hard.** Set
-  `torque_limit_nm` and it goes to zero stiffness and damping *in place* after 60 ms over the
-  limit, then re-arms once the leader has reopened. The default is `0` — **the guard is off
-  unless you ask for it**. Pick the value per machine: it depends on how fragile the part between
-  the jaws is.
+- **An optional torque guard stops a follower that is pressing too hard.** Set
+  `torque_limit_nm` and, after 60 ms over the limit, the follower stops following and **keeps
+  pressing with that torque** (`kp=kd=0`, `tau=±torque_limit_nm`, signed by the torque measured
+  at the trip) so a clamped part is not pushed open; it re-arms once the leader has reopened.
+  `torque_guard_action="release"` restores the previous behaviour — zero stiffness and damping
+  *in place* — which lets the part push the jaws straight open. The default is `0` — **the guard
+  is off unless you ask for it**. Pick the value per machine: it depends on how fragile the part
+  between the jaws is.
+- **The follower's squeeze can be felt on the leader.** With `force_feedback=True` the follower
+  publishes `force_n` on `litearm/v4/{grip_id}/gripper_feedback` (positive means closing,
+  normalised for the mount) and the leader renders resistance at
+  `min(max(0, force_n - feedback_threshold_n) * feedback_gain_nm_per_n, feedback_max_tau_nm)`,
+  directed against closing. Defaults: threshold `2.0` N, gain `0.10` Nm/N, cap `1.0` Nm.
+  Damping (`0.1`) applies only while the force is fresh; torque and damping both drop to zero
+  after `feedback_timeout_s` (`0.3`). It is off by default and needs the zenoh link — a UDP
+  leader is publish-only, so it runs without feedback. The key is additive, so an older peer
+  simply runs position-only teleoperation.
 - **A follower that loses the leader holds its position, it does not go slack.** After
   `watchdog_s` (default `0.2`) without a fresh frame, `stale` goes true and the jaws stay put.
 - **The follower feeds the leader's velocity forward** by differencing successive frames, so it
