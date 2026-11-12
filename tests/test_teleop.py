@@ -1239,18 +1239,31 @@ class ForceFeedbackTest(unittest.TestCase):
         # 10 N of squeeze: (10 - 2) N * 0.10 Nm/N = 0.8 Nm, under the 1.0 cap,
         # signed to oppose closing on the leader's mount.
         g, fake, transport, mgr = self._master()
+        target = -g.config.close_sign * 0.8
         mgr.start()
         try:
             self.assertTrue(_wait_until(lambda: len(fake.frames) > 0))
+            # ⚠ The status sample has to be taken **while the channel is still
+            #   being fed**.  `sleep_fn` is a no-op, so the loop spins flat out
+            #   and stops rendering `feedback_tau_nm` as soon as the last frame
+            #   is older than the timeout — reading it after the publish loop
+            #   exits is a race (it lost on a loaded CI runner).
+            seen = []
+
+            def rendered():
+                st = mgr.status()
+                if (self._contact_frame(fake, g)
+                        and abs(st["feedback_tau_nm"] - target) < 1e-6):
+                    seen.append(st["feedback_tau_nm"])
+                    return True
+                return False
+
             self.assertTrue(_publish_until(
-                transport, FEEDBACK, encode_feedback_frame(10.0),
-                lambda: bool(self._contact_frame(fake, g))))
+                transport, FEEDBACK, encode_feedback_frame(10.0), rendered))
             frame = self._contact_frame(fake, g)[0]
             self.assertEqual((frame.kp, frame.kd), (0.0, DEFAULT_FEEDBACK_DAMPING))
-            self.assertAlmostEqual(frame.tau_ff, -g.config.close_sign * 0.8,
-                                   places=6)
-            self.assertAlmostEqual(mgr.status()["feedback_tau_nm"],
-                                   -g.config.close_sign * 0.8, places=6)
+            self.assertAlmostEqual(frame.tau_ff, target, places=6)
+            self.assertAlmostEqual(seen[0], target, places=6)
         finally:
             mgr.stop()
 
