@@ -82,10 +82,14 @@ class FakeMotor:
                  yield_rad_s: float = 0.0, yield_tau_nm: float = 0.0,
                  creep_rad_s_per_nm: float = 0.0,
                  report_lag_ticks: int = 0,
-                 breakaway_tau_nm: float = 0.0):
+                 breakaway_tau_nm: float = 0.0,
+                 speed_cap_rad_s: Optional[float] = None):
         # 静摩擦的脱离力矩 Nm：站在原地的夹爪要帧里力矩过这个门槛才动。
         # 0 = 没有静摩擦（默认，别的用例逐位不变）。
         self.breakaway_tau_nm = breakaway_tau_nm
+        # 速度上限 rad/s。设置后模拟带力接近段被摩擦/预算压慢的工况：
+        # 指令 50 mm/s，实际只能爬。None = 只有 VMAX。
+        self.speed_cap_rad_s = speed_cap_rad_s
         # 读数延迟（帧）。真机上 ``get_state(wait=False)`` 拿的是缓存读数，可能
         # 落后几帧；而力控接近段的指令是 ``min(排程, 读数 + 领先上限)``，领先只
         # 有零点几毫米时，``速度 × 延迟`` 就把它吃光了 —— 夹爪于是推不动排程。
@@ -166,7 +170,9 @@ class FakeMotor:
         if (self.breakaway_tau_nm > 0.0 and self.vel == 0.0
                 and abs(kp * (q - self.pos) + tau_ff) < self.breakaway_tau_nm):
             v = 0.0
-        v = max(-self.VMAX, min(self.VMAX, v))
+        vmax = (self.VMAX if self.speed_cap_rad_s is None
+                else min(self.VMAX, self.speed_cap_rad_s))
+        v = max(-vmax, min(vmax, v))
         new = self.pos + v * dt
         if self.block_rad is not None:
             if self._block_dir > 0:
@@ -206,7 +212,9 @@ class FakeLiteGripCAN:
                  yield_rad_s: float = 0.0, yield_tau_nm: float = 0.0,
                  creep_rad_s_per_nm: float = 0.0,
                  report_lag_ticks: int = 0,
-                 breakaway_tau_nm: float = 0.0):
+                 breakaway_tau_nm: float = 0.0,
+                 speed_cap_rad_s: Optional[float] = None,
+                 freeze_position_while_idle: bool = False):
         self.motor = FakeMotor(pos=pos, block_rad=block_rad,
                                sticky_rad=sticky_rad, err=err,
                                limit_lo=limit_lo, limit_hi=limit_hi,
@@ -214,7 +222,13 @@ class FakeLiteGripCAN:
                                yield_tau_nm=yield_tau_nm,
                                creep_rad_s_per_nm=creep_rad_s_per_nm,
                                report_lag_ticks=report_lag_ticks,
-                               breakaway_tau_nm=breakaway_tau_nm)
+                               breakaway_tau_nm=breakaway_tau_nm,
+                               speed_cap_rad_s=speed_cap_rad_s)
+        #: True = 没有帧到达时 ``get_position`` 不露真值，而是停在最后一次
+        #: 收到的读数。真机就是这样：读数只在状态帧里更新，总线空闲时不会
+        #: 自己变。默认 False，别的用例不受影响。
+        self._freeze_position = freeze_position_while_idle
+        self._position_cache = self.motor.reported_pos()
         self.frames: List[Frame] = []
         self.initialize_results = list(initialize_results or [])
         self.initialize_calls = 0
@@ -299,6 +313,8 @@ class FakeLiteGripCAN:
             self.refresh_pending = False
             self.last_update = time.monotonic()
             self.last_frame_time = time.time()
+            if self._freeze_position:
+                self._position_cache = self.motor.reported_pos()
             return True
         return False
 
@@ -310,6 +326,8 @@ class FakeLiteGripCAN:
         return self.refresh_ok
 
     def get_position(self) -> float:
+        if self._freeze_position:
+            return self._position_cache
         return self.motor.reported_pos()
 
     def get_velocity(self) -> float:
@@ -384,6 +402,8 @@ def make_gripper(
     creep_rad_s_per_nm: float = 0.0,
     report_lag_ticks: int = 0,
     breakaway_tau_nm: float = 0.0,
+    speed_cap_rad_s: Optional[float] = None,
+    freeze_position_while_idle: bool = False,
 ):
     """造一个「已连接、已使能、已标定」的 LiteGrip，底层换成 :class:`FakeLiteGripCAN`。
 
@@ -438,7 +458,9 @@ def make_gripper(
                            yield_tau_nm=yield_tau_nm,
                            creep_rad_s_per_nm=creep_rad_s_per_nm,
                            report_lag_ticks=report_lag_ticks,
-                           breakaway_tau_nm=breakaway_tau_nm)
+                           breakaway_tau_nm=breakaway_tau_nm,
+                           speed_cap_rad_s=speed_cap_rad_s,
+                           freeze_position_while_idle=freeze_position_while_idle)
     g._can = fake
     g._connected = True
     g._enabled = True

@@ -19,7 +19,7 @@ import time
 from typing import Dict, Optional
 
 from ..exceptions import CANTimeoutError
-from .transport import CanTransport
+from .transport import CanFrame, CanTransport
 from .protocol import (
     BROADCAST_ID,
     ControlMode,
@@ -241,16 +241,39 @@ class MotorController:
     # ── polling ──────────────────────────────────────────────────────────
 
     def poll(self, timeout_s: float = 0.0) -> Optional[MotorState]:
-        """Poll for one CAN frame. If it's a status frame for a registered
-        motor, decode it and update that MotorState.
+        """Read every status frame already queued; the newest state wins.
+
+        The motor answers each control frame with a status frame.  A caller
+        that sends a burst (a force-hold slice, a ramp step) and polls once per
+        burst leaves the rest of the answers in the socket buffer; reading one
+        frame then returns an *old* position, and the age is stamped when the
+        frame is read — so the stale reading looks fresh.  On 2026-11-18 that
+        made a position ramp start from the pose the jaws had at the start of a
+        hold: the first frame demanded ~0.7 rad of error and the jaws left at
+        23 rad/s out of a 20 mm/s move.
+
+        ``timeout_s`` only applies to the wait for the first frame; the drain
+        after it is non-blocking.  Parameter responses and foreign frames are
+        discarded without stopping the drain.
 
         Returns:
-            The MotorState that was updated, or None if no relevant frame arrived.
+            The MotorState updated by the newest relevant frame, or None if no
+            relevant frame arrived.
         """
-        frame = self._transport.recv(timeout_s=timeout_s)
-        if frame is None:
-            return None
+        updated: Optional[MotorState] = None
+        first = True
+        while True:
+            frame = self._transport.recv(
+                timeout_s=timeout_s if first else 0.0)
+            first = False
+            if frame is None:
+                return updated
+            motor = self._apply_status_frame(frame)
+            if motor is not None:
+                updated = motor
 
+    def _apply_status_frame(self, frame: CanFrame) -> Optional[MotorState]:
+        """Decode one received frame into its motor state, if it is one."""
         # Match frame.can_id against registered motors' mst_id
         motor = self._motors.get(frame.can_id)
         if motor is None:

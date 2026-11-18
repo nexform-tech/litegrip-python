@@ -163,7 +163,7 @@ print(state.position_mm, state.force_n, state.timestamp)
 | `open(speed_mm_s=None, *, progress=None)` → `MoveResult` | 爬坡走向标定的张开侧限位。若 `GripperConfig.work_stroke_mm` 有值，则停在那段行程处 —— 出厂标定设的是 `80.0`，对着这台机器 85 mm 的行程，所以裸调 `open()` 会在距张开端 5 mm 处停下。 |
 | `close(speed_mm_s=None, *, progress=None)` → `MoveResult` | 一样，方向朝闭合侧。`work_stroke_mm` 是张开侧的数字，不改变 `close()` 的落点。 |
 | `home()` → `MoveResult` | 爬坡回到标定的闭合位置。 |
-| `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | 闭到工件上（中间没东西就闭到闭合侧标定限位），再爬到 `force_n` N 并保持。闭合段就把 `force_n` 当力矩预算，所以顶到工件时压得不会比设定值更狠。保力只在爪子**停下来**之后接手：`stalled=True`（爪子间夹着东西）或 `reached=True`（空爪闭到底）。但**从起点就没动过**就停下、且预算低于 `MotionConfig.breakaway_nm` 时不算接触 —— 那是预算压不出静摩擦 —— 这种情形调用原地撤力、返回 `no_bite=True`，不进保力段。`hold_s=0` 表示保持到故障、失控监视触发或 Ctrl+C。`force_n=None` 用 `MotionConfig.force_n`（20 N）。 |
+| `grasp(force_n=None, hold_s=0.0, *, progress=None)` → `GraspResult` | 闭到工件上（中间没东西就闭到闭合侧标定限位），再爬到 `force_n` N 并保持。闭合段就把 `force_n` 当力矩预算，所以顶到工件时压得不会比设定值更狠。保力只在爪子**停下来**之后接手：`stalled=True`（爪子间夹着东西）或 `reached=True`（空爪闭到底）。带力接近段里 `stalled=True` 还要求窗口平均速度低于 `MotionConfig.stall_speed_mm_s`（2 mm/s）—— 还在慢速蠕动的夹爪不算接触，不交给纯力矩的保力段。但**从起点就没动过**就停下、且预算低于 `MotionConfig.breakaway_nm` 时不算接触 —— 那是预算压不出静摩擦 —— 这种情形调用原地撤力、返回 `no_bite=True`，不进保力段。`hold_s=0` 表示保持到故障、失控监视触发或 Ctrl+C。`force_n=None` 用 `MotionConfig.force_n`（20 N）。 |
 | `goto(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | 爬坡走到毫米目标。 |
 | `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | 一样的，单位 rad。`dq_target` 与 `tau_feedforward` 必须是 0：速度前馈由斜坡按自己的排程给出，所以这两个值一律拒绝并抛 `CommandError`，不是静默忽略。 |
 | `move_to(target_rad, kp=None, kd=None, tau_feedforward=0.0, duration=1.0)` → `MoveResult` | 和 `goto_rad` 一样，只是 `duration` 的默认值更长。 |
@@ -333,7 +333,9 @@ print(abs(cfg.pos_open_rad - cfg.pos_closed_rad) * cfg.rad_to_mm)   # 行程，m
 第四种组合是失败，也是这一版新增的：
 
 - **`grasp()` 返回 `ok=False, reached=False, stalled=False`**，意思是闭合段帧数用完了，既没
-  走到限位也没堵转 —— 爪子还在自由行程里。这一路**不会**进保力段：保力帧既没有位置项也没有
+  走到限位也没堵转 —— 爪子还在自由行程里。慢速蠕动也归这一路：窗口净位移虽小，平均速度仍
+  高于 `MotionConfig.stall_speed_mm_s`（2 mm/s），不算真停，闭合段一直走到帧数上界、按失败
+  收尾。这一路**不会**进保力段：保力帧既没有位置项也没有
   速度项，把一个还在走的爪子交给它们，压在它身上的就只剩前馈力矩，它会一路加速直到失控监视
   撤力。此时调用改为原地撤力，报 `cycles=0`。什么也没夹住。见到它就说明闭合段被饿着了 ——
   读数过期，或者机构自身预算吃不掉的摩擦。
@@ -621,6 +623,7 @@ logger 挂个 handler 就能看到，注意即使不挂 handler，告警也会�
 | `examples/stroke_test.py` | 这台机器能不能用？走完行程两端，成功时退出码 0。 |
 | `examples/grasp_test.py` | `grasp()` 说的和做的还一致吗 —— 空爪和夹着东西各一遍？ |
 | `examples/hold_force_test.py` | 保住的力是稳住了，还是漂到了更小的值？ |
+| `examples/api_test.py` | 常用高层 API 的交互冒烟测试：读取状态，以及 `enable()`、`open()`、`close()`、`goto()`、`grasp()`、`release()`、`stop()`、`disable()`。 |
 | `examples/zero_closed.py` | 低层 CAN 台架工具，一个子命令一个操作：`status`、`release`、`goto`、`zero`、`open`、`close`、`enable`、`disable`。 |
 | `examples/teleop.py` | 主从链路里的其中一端。 |
 | `examples/trajectory.py` | 手把手教一个动作，存起来，再放一遍。 |

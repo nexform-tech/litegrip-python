@@ -46,6 +46,11 @@ ROS 2 桥接、RPC 服务、产品代码都能直接调 :attr:`LiteGrip.actions`
 闭合侧有约 0.010 rad 的机械死区，慢速粘滑时单点忽大忽小。斜坡走完的保压段
 不判（那时夹爪本来就该不动）。
 
+带设定力的接近段还多一条**真停**条件：窗口平均速度低于
+:attr:`MotionConfig.stall_speed_mm_s` 才算停住。这一段的实际速度本来就可能被
+力矩预算和摩擦压到指令速度的 20% 以下，只按比例判会把「慢」当成「顶住」，
+把纯力矩保力段接到还在走的夹爪上。
+
 保力段（``grasp`` 的第二段）反过来：只下发前馈力矩，不给位置/速度增益。
 力控要的是力，带增益就会随夹爪的位移衰减，详见
 :meth:`GripperActions._hold_force`。
@@ -133,6 +138,12 @@ class MotionConfig:
     stall_cycles: int = 5               # 窗口采样点数
     stall_ratio: float = 0.2            # 窗口净位移 / 本该走的距离
     stall_delta: float = 0.0015         # 阈值下限 rad
+    # 带设定力接近段判「真停」的速度下限 mm/s。这一段是位置帧，但预算和摩擦
+    # 会把实际速度压到指令的 20% 以下 —— 那不是接触。窗口平均速度必须低于
+    # 这个值才允许交接给纯力矩保力段。2026-11-18 台架：5 N 接近段约 8 mm/s，
+    # 0.25 s 只走 2 mm，被 20% 阈值判成堵转；保力段随后把它加速到 7 rad/s，
+    # 从 78 mm 冲到 26 mm 的工件上。
+    stall_speed_mm_s: float = 2.0
 
     # ── 力矩 / 指令上限 ────────────────────────────────────────────────
     max_lead_mm: float = 4.0            # 行进段领先上限 mm（≈ kp × 上限）
@@ -822,7 +833,9 @@ class GripperActions:
         它才一路走到底。
 
         **交接只在「到位或顶上东西」时发生**（``reached or stalled``）。这两条
-        在真机上是同一件事的两面：夹爪都停着。这不是保守，是唯一的正确条件 ——
+        在真机上是同一件事的两面：夹爪都停着。带设定力的接近段里，「顶上」还要
+        过一条真停条件：窗口平均速度低于 :attr:`MotionConfig.stall_speed_mm_s`
+        —— 慢速蠕动不算接触（见该字段）。这不是保守，是唯一的正确条件 ——
         保力段是纯力矩源，帧里没有位置项也没有速度项，把它接到一个**还在自由
         行程里**的夹爪上，位置环一撤它就只有加速这一条路（2026-10-13 实测：
         0.82 rad/s → 5.12 rad/s，312 mm/s，且到 ``hold_s`` 用完仍在加速）。
@@ -1343,7 +1356,7 @@ class GripperActions:
         # 是一次位置运动，方向来自标定，未标定时拒绝。
         if not req.abort:
             _check_calibrated(gcfg)
-        st = g.get_state()
+        st = self._fresh_state()
         pos = st.position_rad
 
         if req.abort:
@@ -1464,6 +1477,40 @@ class GripperActions:
             self._emit(pos, 0.0, 0.0, kp=0.0, kd=0.0)
         return frames
 
+    def _fresh_state(self) -> GripperState:
+        """Read a status snapshot, asking the motor to speak if the bus is idle.
+
+        A DM motor answers control frames; when nothing is being sent it says
+        nothing, and ``get_state(wait=True)`` returns the cache after ~50 ms.
+        Planning a ramp from that cache is how a jaw that was moved while the
+        bus was idle made the first frame demand the whole error: on 2026-11-18
+        the cache said 78 mm, the jaws were at 26 mm, and ``open()`` left at
+        23 rad/s out of a 20 mm/s move.
+
+        ``refresh_status()`` (0xCC) is the request that makes an idle motor
+        answer.  If the bus stays silent and the cache is stale, refuse to plan
+        motion from an unknown position instead of guessing.
+        """
+        if not self._g.refresh_status():
+            st = self._g.get_state(wait=False)
+            if st.is_stale():
+                raise CommError(
+                    "状态帧请求发不出去，缓存位置也已过期（age=%s）—— 拒绝"
+                    "从过期位置规划运动；检查 CAN 链路和电机供电。"
+                    % ("无" if st.data_age_s is None
+                       else "%.1f s" % st.data_age_s))
+            return st
+        st = self._g.get_state()
+        if st.fresh:
+            return st
+        st = self._g.get_state(wait=False)
+        if st.is_stale():
+            raise CommError(
+                "电机没有回应状态帧请求，缓存位置已过期（age=%s）—— 拒绝"
+                "从过期位置规划运动。" % ("无" if st.data_age_s is None
+                                          else "%.1f s" % st.data_age_s))
+        return st
+
     def _move_to_limit(
         self,
         toward: str,
@@ -1552,7 +1599,7 @@ class GripperActions:
             target, limit, _margin_rad, _travel = limit_target(
                 gcfg, toward, cfg.margin)
 
-        before = g.get_state()
+        before = self._fresh_state()
         dist_rad = target - before.position_rad
         dist_mm = abs(dist_rad) * gcfg.rad_to_mm
         sign = 1.0 if dist_rad >= 0 else -1.0
@@ -1592,11 +1639,15 @@ class GripperActions:
         win_s = win * sample_every * interval
         win_expect_rad = speed_rad_s * win_s
         win_thresh_rad = max(cfg.stall_delta, cfg.stall_ratio * win_expect_rad)
+        # 带设定力接近段的“真停”下限：窗口平均速度低于它才算停住。
+        stall_speed_rad_s = cfg.stall_speed_mm_s / gcfg.rad_to_mm
         # 帧数上界。不带力的移动按排程走，排程跑完就是它的终止条件之一；带设定
         # 力的接近段不行 —— 领先被预算压小（见 force_approach_terms），夹爪追不
         # 追得上排程由摩擦和读数延迟定，``ramp_steps`` 到了它可能还差几十毫米。
         # 所以这一段的帧数只是兜底，上界取「按仍然算进展的最慢速度走完全程要几
-        # 帧」：比这更慢时堵转判据必然已经在 win_s 内触发，这个上界到不了。
+        # 帧」。比这根速度还慢、但窗口平均又高于 stall_speed_mm_s 的蠕动会走到
+        # 这个上界，按「既没到位也没堵转」拒夹；只有低于 stall_speed_mm_s 的
+        # 才算真停、才允许交接。
         ceiling = total_steps
         if force_n is not None:
             floor_rad_s = win_thresh_rad / win_s if win_s > 0.0 else 0.0
@@ -1737,9 +1788,16 @@ class GripperActions:
             # 夹爪到了那里就该顶着不动 —— 那里的「不动」正是我们要的堵转。而且
             # 越位量（5% 行程）往往短于一个采样窗口，只在斜坡段判会永远判不到，
             # 动作得白跑完保压段。
+            # 带设定力的接近段：窗口位移小还不够 —— 实际速度被预算/摩擦压到
+            # 指令的 20% 以下是常态，那不是停住。再看一眼窗口平均速度，低于
+            # stall_speed_mm_s 才算真停，才允许交接给纯力矩保力段。
+            moving = (force_n is not None and win_delta is not None
+                      and win_s > 0.0
+                      and win_delta / win_s > stall_speed_rad_s)
             if (judge_stall and win_delta is not None
                     and (press or in_ramp)
-                    and win_delta < win_thresh_rad):
+                    and win_delta < win_thresh_rad
+                    and not moving):
                 # 「没动」不等于「顶到工件」：带设定力时，从起点起就没挪过位的
                 # 停住也可能是这一段压不出脱离静摩擦的力矩。这一条不能当接触，
                 # 否则交接给纯力矩的保力段就是一次带力冲程（见
@@ -1763,8 +1821,9 @@ class GripperActions:
                 else:
                     stalled = True
                     log.info("堵转：最近 %d 次采样(%.2f s)净位移仅 %.5f rad "
-                             "(< %.5f)，停在 %+.5f rad",
-                             win, win_s, win_delta, win_thresh_rad, pos)
+                             "(< %.5f，平均 %.2f mm/s)，停在 %+.5f rad",
+                             win, win_s, win_delta, win_thresh_rad,
+                             win_delta / win_s * gcfg.rad_to_mm, pos)
                 break
 
             # 行进段堵转力矩保护（≈7 N）：与位置窗口判据**互补** —— 位置窗口对
@@ -1880,7 +1939,7 @@ class GripperActions:
         # 的片里就成了 4 N 一级的台阶，不是爬升。
         step_nm = cfg.force_ramp_n_s * cfg.frame_interval * UnitConversion.N_TO_NM
         cycles = 0
-        st = g.get_state()
+        st = self._fresh_state()
         pos = st.position_rad
         # 进入保力：从飞行中的力矩接着爬，交接才连续。飞行力矩已经越过设定值时
         # 直接从设定值起步（那一步是往下走到设定值，不是往上，不构成冲击）。
@@ -1916,7 +1975,7 @@ class GripperActions:
                 self._emit(pos, 0.0, tau_cmd, kp=0.0, kd=0.0)
             cycles += 1
 
-            st = g.get_state()
+            st = self._fresh_state()
             if st.error_code != 1:
                 log.warning("保力中断：状态帧 err=%d"
                             "（1=使能中；0=被禁用；其他=故障）", st.error_code)

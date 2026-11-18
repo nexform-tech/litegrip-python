@@ -989,6 +989,73 @@ class TestGraspHandsOverOnlyOnContact(unittest.TestCase):
         self.assertTrue(any(f.kp == 0.0 for f in fake.frames), "没有撤力帧")
 
 
+class TestForceApproachNeedsATrueStop(unittest.TestCase):
+    """2026-11-18 台架：5 N 接近段实际只有约 8 mm/s，0.25 s 走 2 mm。
+
+    20% 的窗口阈值把「慢」判成「顶上东西」，保力段随后在自由行程里把夹爪
+    加速到 7 rad/s，从 78 mm 冲到 26 mm 的工件上。交接前必须看到**真停**：
+    窗口平均速度低于 ``MotionConfig.stall_speed_mm_s``。
+    """
+
+    def test_a_slow_creep_is_not_handed_over_mid_travel(self):
+        object_rad = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2.0
+        motion = MotionConfig(sleep_fn=lambda _: None,
+                              monotonic_fn=tick_clock(0.1))
+        crawl_rad_s = 0.109              # ≈ 8 mm/s at RAD_TO_MM
+        g, fake = make_gripper(block_rad=object_rad, stops=True,
+                               motion=motion, speed_cap_rad_s=crawl_rad_s)
+
+        g.grasp(force_n=5.0, hold_s=0.2)
+
+        holds = [f for f in fake.frames if f.tau_ff != 0.0]
+        self.assertTrue(holds, "没有进入保力段")
+        first = holds[0].pos_after
+        self.assertLess(
+            abs(first - object_rad), g.motion_config.reach_tol,
+            "保力段在离工件 %.2f mm 处接手了 —— 又是自由行程里交接" %
+            (abs(first - object_rad) * RAD_TO_MM))
+
+    def test_a_slow_creep_without_contact_never_enters_the_hold(self):
+        """没有工件、只是被摩擦压在 8 mm/s：走到帧数上界按拒夹收尾。
+
+        这条钉的是「不交接」本身，而不只是「交接点提前」：慢速蠕动既没到位
+        也没真停，保力段一帧都不许发 —— 它是纯力矩源，接过去只会继续加速。
+        """
+        motion = MotionConfig(sleep_fn=lambda _: None,
+                              monotonic_fn=tick_clock(0.1))
+        g, fake = make_gripper(stops=True, motion=motion,
+                               speed_cap_rad_s=0.109)    # ≈ 8 mm/s
+
+        res = g.grasp(force_n=5.0, hold_s=0.2)
+
+        self.assertFalse(res.ok, res)
+        self.assertFalse(res.stalled, res)
+        self.assertFalse(res.reached, res)
+        self.assertEqual(res.cycles, 0)
+        self.assertEqual([f for f in fake.frames if f.tau_ff != 0.0], [],
+                         "慢速蠕动被交给了纯力矩的保力段")
+
+
+class TestMotionRefreshesAnIdleBus(unittest.TestCase):
+    """空闲总线上的读数只在状态帧里更新；动作不能从手扳之前的缓存起跳。"""
+
+    def test_open_does_not_start_from_a_position_read_before_the_bus_went_idle(self):
+        g, fake = make_gripper(stops=True, freeze_position_while_idle=True)
+        g.get_state()                    # 缓存停在张开侧
+        fake.delivers = False
+        actual = POS_CLOSED_RAD - 0.4    # 总线空闲时被手扳到中间
+        fake.motor.pos = actual
+
+        g.open()
+
+        first = fake.frames[0]
+        self.assertLess(
+            abs(first.q - actual), 0.01,
+            "open 从缓存位置起跳 %.1f mm（实际在 %.1f mm）" %
+            (abs(first.q - actual) * RAD_TO_MM,
+             abs(actual - fake.motor.pos) * RAD_TO_MM))
+
+
 class TestRelease(unittest.TestCase):
     """松开：跨线程结束 ``grasp()``、从交接点张余量、急停、不重复张开。
 
