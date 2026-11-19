@@ -19,7 +19,7 @@ import time
 from typing import Dict, Optional
 
 from ..exceptions import CANTimeoutError
-from .transport import CanTransport
+from .transport import CanFrame, CanTransport
 from .protocol import (
     BROADCAST_ID,
     ControlMode,
@@ -41,6 +41,11 @@ from .protocol import (
 from .motor import MotorState, MotorParams, MotorType
 
 log = logging.getLogger("litegrip.can.controller")
+
+# ``poll()`` drains the RX queue so the newest state wins.  Cap the drain so a
+# bus that never goes quiet cannot hold a caller indefinitely; the remainder
+# stays queued for the next poll.
+MAX_DRAIN_FRAMES = 256
 
 
 class MotorController:
@@ -240,17 +245,45 @@ class MotorController:
 
     # ── polling ──────────────────────────────────────────────────────────
 
-    def poll(self, timeout_s: float = 0.0) -> Optional[MotorState]:
-        """Poll for one CAN frame. If it's a status frame for a registered
-        motor, decode it and update that MotorState.
+    def poll(self, timeout_s: float = 0.0,
+             max_frames: int = MAX_DRAIN_FRAMES) -> Optional[MotorState]:
+        """Read every status frame already queued; the newest state wins.
+
+        The motor answers each control frame with a status frame.  A caller
+        that sends a burst (a force-hold slice, a ramp step) and polls once per
+        burst leaves the rest of the answers in the socket buffer; reading one
+        frame then returns an *old* position, and the age is stamped when the
+        frame is read — so the stale reading looks fresh.  On 2026-11-18 that
+        made a position ramp start from the pose the jaws had at the start of a
+        hold: the first frame demanded ~0.7 rad of error and the jaws left at
+        23 rad/s out of a 20 mm/s move.
+
+        ``timeout_s`` only applies to the wait for the first frame; the drain
+        after it is non-blocking.  Parameter responses and foreign frames are
+        discarded without stopping the drain.  At most ``max_frames`` frames
+        are drained per call (default :data:`MAX_DRAIN_FRAMES`), so a bus that
+        never goes quiet cannot hold the caller indefinitely; anything left
+        stays queued for the next poll.
 
         Returns:
-            The MotorState that was updated, or None if no relevant frame arrived.
+            The MotorState updated by the newest relevant frame, or None if no
+            relevant frame arrived.
         """
-        frame = self._transport.recv(timeout_s=timeout_s)
-        if frame is None:
-            return None
+        updated: Optional[MotorState] = None
+        first = True
+        for _ in range(max(1, int(max_frames))):
+            frame = self._transport.recv(
+                timeout_s=timeout_s if first else 0.0)
+            first = False
+            if frame is None:
+                return updated
+            motor = self._apply_status_frame(frame)
+            if motor is not None:
+                updated = motor
+        return updated
 
+    def _apply_status_frame(self, frame: CanFrame) -> Optional[MotorState]:
+        """Decode one received frame into its motor state, if it is one."""
         # Match frame.can_id against registered motors' mst_id
         motor = self._motors.get(frame.can_id)
         if motor is None:
@@ -306,14 +339,20 @@ class MotorController:
                    timeout_s: float = 1.0) -> bool:
         """Poll until at least one new status frame arrives for the given motor.
 
+        ``poll()`` drains every queued frame and reports only the motor updated
+        by the newest one.  On a bus with several registered motors that is not
+        necessarily ``motor`` — another motor's frame may be drained last — so
+        the target's ``rx_count``, not the returned motor, decides whether its
+        update was seen.
+
         Returns:
             True if a frame was received, False on timeout.
         """
         prev_rx = motor.rx_count
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            updated = self.poll(timeout_s=0.01)
-            if updated is motor and motor.rx_count > prev_rx:
+            self.poll(timeout_s=0.01)
+            if motor.rx_count > prev_rx:
                 return True
             time.sleep(0.001)
         return False
