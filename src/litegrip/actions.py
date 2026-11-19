@@ -1390,7 +1390,11 @@ class GripperActions:
         # 是一次位置运动，方向来自标定，未标定时拒绝。
         if not req.abort:
             _check_calibrated(gcfg)
-        st = self._fresh_state()
+        # 急停不要求新状态：零增益帧里 q 不产生任何力，缓存位置就够。反过来，
+        # 要求先答一帧会把撤力拖到重试之后，电机不答时甚至一帧都发不出去 ——
+        # 总线还通、电机不说话，正是急停最需要撤力的工况。
+        st = (g.get_state(wait=False) if req.abort
+              else self._fresh_state())
         pos = st.position_rad
 
         if req.abort:

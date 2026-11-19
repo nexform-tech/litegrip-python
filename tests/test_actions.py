@@ -2244,6 +2244,24 @@ class TestFreshStateRefusesAnUnansweredCache(unittest.TestCase):
             g.open()
 
 
+class TestAbortReleaseNeedsNoFreshFrame(unittest.TestCase):
+    """急停只发一帧 kp=kd=tau=0；电机不答状态帧也必须撤力。"""
+
+    def test_abort_releases_when_the_motor_does_not_answer(self):
+        g, fake = make_gripper(stops=True)
+        g.get_state()                     # 缓存里有一帧
+        fake.delivers = False             # 电机不主动开口
+        fake.refresh_status = lambda: True  # 0xCC 写成功，但电机不答
+
+        res = g.release(abort=True)
+
+        self.assertFalse(res.ok)
+        self.assertTrue(
+            any(f.kp == 0.0 and f.kd == 0.0 and f.tau_ff == 0.0
+                for f in fake.frames),
+            "急停没有发出零力矩帧 —— 最后一档力矩留在了总线上")
+
+
 class TestFinalReachUsesAFreshFrame(unittest.TestCase):
     """移动结束判 reached/ok 前必须再要一帧，不能拿循环里的缓存。"""
 
