@@ -5,13 +5,14 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from unittest import mock
 
 import _sdkpath  # noqa: F401
-from litegrip import (CommandError, GraspResult, GripperConfig, GripperState,
-                      LiteGrip, MotionConfig, ReleaseResult, UnitConversion,
-                      clamp_to_travel, closing_travel_excursion_rad,
-                      force_approach_terms, limit_target, press_target,
-                      work_limit_target)
+from litegrip import (CommError, CommandError, GraspResult, GripperConfig,
+                      GripperState, LiteGrip, MotionConfig, ReleaseResult,
+                      UnitConversion, clamp_to_travel,
+                      closing_travel_excursion_rad, force_approach_terms,
+                      limit_target, press_target, work_limit_target)
 from litegrip.actions import GripperActions, MoveResult
 
 from fake_can import (DT, POS_CLOSED_RAD, POS_OPEN_RAD, RAD_TO_MM,
@@ -987,6 +988,73 @@ class TestGraspHandsOverOnlyOnContact(unittest.TestCase):
         self.assertTrue(all(f.tau_ff == 0.0 for f in fake.frames),
                         "交接了：发出了前馈力矩帧")
         self.assertTrue(any(f.kp == 0.0 for f in fake.frames), "没有撤力帧")
+
+
+class TestForceApproachNeedsATrueStop(unittest.TestCase):
+    """2026-11-18 台架：5 N 接近段实际只有约 8 mm/s，0.25 s 走 2 mm。
+
+    20% 的窗口阈值把「慢」判成「顶上东西」，保力段随后在自由行程里把夹爪
+    加速到 7 rad/s，从 78 mm 冲到 26 mm 的工件上。交接前必须看到**真停**：
+    窗口平均速度低于 ``MotionConfig.stall_speed_mm_s``。
+    """
+
+    def test_a_slow_creep_is_not_handed_over_mid_travel(self):
+        object_rad = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2.0
+        motion = MotionConfig(sleep_fn=lambda _: None,
+                              monotonic_fn=tick_clock(0.1))
+        crawl_rad_s = 0.109              # ≈ 8 mm/s at RAD_TO_MM
+        g, fake = make_gripper(block_rad=object_rad, stops=True,
+                               motion=motion, speed_cap_rad_s=crawl_rad_s)
+
+        g.grasp(force_n=5.0, hold_s=0.2)
+
+        holds = [f for f in fake.frames if f.tau_ff != 0.0]
+        self.assertTrue(holds, "没有进入保力段")
+        first = holds[0].pos_after
+        self.assertLess(
+            abs(first - object_rad), g.motion_config.reach_tol,
+            "保力段在离工件 %.2f mm 处接手了 —— 又是自由行程里交接" %
+            (abs(first - object_rad) * RAD_TO_MM))
+
+    def test_a_slow_creep_without_contact_never_enters_the_hold(self):
+        """没有工件、只是被摩擦压在 8 mm/s：走到帧数上界按拒夹收尾。
+
+        这条钉的是「不交接」本身，而不只是「交接点提前」：慢速蠕动既没到位
+        也没真停，保力段一帧都不许发 —— 它是纯力矩源，接过去只会继续加速。
+        """
+        motion = MotionConfig(sleep_fn=lambda _: None,
+                              monotonic_fn=tick_clock(0.1))
+        g, fake = make_gripper(stops=True, motion=motion,
+                               speed_cap_rad_s=0.109)    # ≈ 8 mm/s
+
+        res = g.grasp(force_n=5.0, hold_s=0.2)
+
+        self.assertFalse(res.ok, res)
+        self.assertFalse(res.stalled, res)
+        self.assertFalse(res.reached, res)
+        self.assertEqual(res.cycles, 0)
+        self.assertEqual([f for f in fake.frames if f.tau_ff != 0.0], [],
+                         "慢速蠕动被交给了纯力矩的保力段")
+
+
+class TestMotionRefreshesAnIdleBus(unittest.TestCase):
+    """空闲总线上的读数只在状态帧里更新；动作不能从手扳之前的缓存起跳。"""
+
+    def test_open_does_not_start_from_a_position_read_before_the_bus_went_idle(self):
+        g, fake = make_gripper(stops=True, freeze_position_while_idle=True)
+        g.get_state()                    # 缓存停在张开侧
+        fake.delivers = False
+        actual = POS_CLOSED_RAD - 0.4    # 总线空闲时被手扳到中间
+        fake.motor.pos = actual
+
+        g.open()
+
+        first = fake.frames[0]
+        self.assertLess(
+            abs(first.q - actual), 0.01,
+            "open 从缓存位置起跳 %.1f mm（实际在 %.1f mm）" %
+            (abs(first.q - actual) * RAD_TO_MM,
+             abs(actual - fake.motor.pos) * RAD_TO_MM))
 
 
 class TestRelease(unittest.TestCase):
@@ -2161,6 +2229,64 @@ class TestUncalibratedConfigRefusesMotion(unittest.TestCase):
         with self.assertRaises(CommandError):
             g.goto(40.0)
         self.assertEqual(fake.frames, [])
+
+
+class TestFreshStateRefusesAnUnansweredCache(unittest.TestCase):
+    """缓存还新不等于位置可信：0xCC 没人答，就不许规划运动。"""
+
+    def test_a_recent_cache_is_not_enough_when_nothing_answers(self):
+        g, fake = make_gripper(stops=True)
+        g.get_state()                     # 先让缓存里有一帧、age 很小
+        fake.delivers = False             # 总线安静
+        fake.refresh_ok = False           # 0xCC 也发不出去
+
+        with self.assertRaises(CommError):
+            g.open()
+
+
+class TestFinalReachUsesAFreshFrame(unittest.TestCase):
+    """移动结束判 reached/ok 前必须再要一帧，不能拿循环里的缓存。"""
+
+    def test_the_end_of_a_move_requests_a_status_frame(self):
+        g, fake = make_gripper(stops=True)
+
+        res = g.open(SPEED_MM_S)
+
+        self.assertTrue(res.ok, res)
+        self.assertGreaterEqual(
+            fake.refresh_calls, 2,
+            "移动结束时没有重新要状态帧 —— reached/ok 用的是缓存")
+
+
+class TestGraspHoldCommError(unittest.TestCase):
+    """保力中途断总线：撤力、返回 ok=False，不把异常抛给调用方。"""
+
+    def test_a_mid_hold_comm_error_releases_and_reports_failure(self):
+        block = (POS_OPEN_RAD + POS_CLOSED_RAD) / 2.0
+        g, fake = make_gripper(block_rad=block)
+
+        with mock.patch.object(g._actions, "_hold_force",
+                               side_effect=CommError("bus down")):
+            res = g.grasp(force_n=5.0, hold_s=0.2)
+
+        self.assertFalse(res.ok, res)
+        self.assertEqual(res.cycles, 0)
+        self.assertTrue(res.stalled, "接近段应当先夹到工件")
+        self.assertTrue(
+            any(f.kp == 0.0 and f.kd == 0.0 and f.tau_ff == 0.0
+                for f in fake.frames),
+            "保力中断后没有撤力帧 —— 最后一档力矩留在了总线上")
+        self.assertTrue(g._actions._hold_done.is_set(),
+                        "grasp() 的 finally 没有收尾")
+
+
+class TestMotionConfigValidation(unittest.TestCase):
+
+    def test_non_finite_or_negative_stall_speed_is_rejected(self):
+        for value in (-1.0, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    MotionConfig(stall_speed_mm_s=value)
 
 
 if __name__ == "__main__":
