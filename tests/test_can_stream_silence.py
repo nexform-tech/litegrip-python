@@ -1,15 +1,15 @@
-"""``LiteGripCAN`` 的失败上报：发不出去的帧必须被算进去。
+"""``CanBus`` 的失败上报：发不出去的帧必须被算进去。
 
 ``control_mit`` 返回 ``False`` 的旧契约只区分「没连接」，而发送失败被一个裸
 ``except Exception: return False`` 吞掉；``control_mit_stream`` 更彻底 ——
 它丢弃每一帧的下发结果、无条件 ``return True``。两者合起来让一次**一帧都没
 执行**的移动在调用方眼里和走完了没有区别。
 
-真机上那次 ``goto(45.0)`` 位移 +0.000 mm 返回 True、随后 0.5 s 内冲到标定零点
+真机上那次 ``set_gripper_distance(45.0)`` 位移 +0.000 mm 返回 True、随后 0.5 s 内冲到标定零点
 外 2.75 mm，就是从这条链里长出来的。这个文件钉住新契约：失败有日志、有计数、
 一帧都没发出去就抛 ``CommError``，而不是报成功。
 
-用真 ``LiteGripCAN``，只把 controller / motor 换成假的（与
+用真 ``CanBus``，只把 controller / motor 换成假的（与
 ``test_bus_limits.py`` 同一套注入方式）。
 """
 
@@ -19,7 +19,7 @@ import unittest
 
 import _sdkpath  # noqa: F401
 from litegrip import CommandError, CommError
-from litegrip.protocols.can_bus import LiteGripCAN
+from litegrip.can.bus import CanBus
 
 #: 一帧完全合法的指令。
 GOOD = dict(q_target=0.5, kp=100.0, kd=2.0, dq_target=0.0,
@@ -49,7 +49,7 @@ class FailingController:
 
 
 def make_can(controller):
-    can = LiteGripCAN(channel="vcan0")
+    can = CanBus(channel="vcan0")
     can._motor = FakeMotor()
     can._controller = controller
     can._connected = True
@@ -62,7 +62,7 @@ class TestControlMitReportsTheReason(unittest.TestCase):
         ctrl = FailingController()
         can = make_can(ctrl)
 
-        with self.assertLogs("litegrip.can_bus", level="WARNING") as caught:
+        with self.assertLogs("litegrip.can.bus", level="WARNING") as caught:
             ok = can.control_mit(**GOOD)
 
         self.assertFalse(ok)
@@ -106,7 +106,7 @@ class TestControlMitStreamIsNotSilentlySuccessful(unittest.TestCase):
         ctrl = HalfFailingController()
         can = make_can(ctrl)
 
-        with self.assertLogs("litegrip.can_bus", level="WARNING") as caught:
+        with self.assertLogs("litegrip.can.bus", level="WARNING") as caught:
             ok = can.control_mit_stream(
                 duration_s=0.02, interval_s=0.001, **GOOD)
 

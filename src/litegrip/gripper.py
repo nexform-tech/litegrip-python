@@ -1,266 +1,101 @@
 """LiteGrip SDK — high-level gripper API.
 
-The LiteGrip class is the primary entry point.  It manages a single
-gripper motor (DM4310 by default) over CAN, exposing an intuitive
-open/close/grasp interface with automatic unit conversion.
+:class:`Gripper` is the primary entry point.  It manages a single gripper
+motor (DM4310) over CAN, exposing open/close, absolute positioning, adaptive
+grasping and calibrated feedback.
 
 Example::
 
-    from litegrip import LiteGrip
+    from litegrip import Gripper
 
-    with LiteGrip(channel="can0", can_id=0x08) as gripper:
-        gripper.load_calibration()
-        gripper.enable()          # 反复重试直到状态帧确认 err == 1
+    with Gripper(channel="can0") as gripper:
+        gripper.enable()          # retries until the status frame says err == 1
         gripper.open()
         gripper.grasp(force_n=20.0, hold_s=3.0)
-        state = gripper.get_state()
-        print(f"Position: {state.position_mm:.1f} mm, Force: {state.force_n:.1f} N")
+        print(gripper.get_motor_data())
 
-``enable()`` / ``disable()`` / ``open()`` / ``close()`` / ``grasp()`` /
-``zero()`` 都转发到 :class:`~litegrip.actions.GripperActions`（见
-:attr:`LiteGrip.actions`），运动参数在 :attr:`LiteGrip.motion_config` 上。
+All motion is blocking.  Commands return ``True`` only when the motion
+actually reached its goal; a motion that ran but failed returns ``False`` and
+logs the reason.  Invalid arguments or state raise :class:`CommandError` /
+:class:`NotInitializedError`; transport and hardware failures raise
+:class:`CommError` / :class:`HardwareError`.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import math
-import os as _os
-import select as _select_mod
-import sys
+import os
 import threading
 import time
-from datetime import datetime
-from typing import Callable, List, Optional
+from typing import Optional
 
-from .can.motor import MotorType
-from .protocols.can_bus import LiteGripCAN
 from .actions import (
-    EnableResult,
-    GraspResult,
     GripperActions,
     MotionConfig,
-    MoveProgress,
     MoveResult,
-    ReleaseResult,
     WriteZeroResult,
     _check_calibrated,
     clamp_to_travel,
 )
-from .teleop import (DEFAULT_ALIGN_SPEED_MM_S, DEFAULT_DQ_MAX,
-                     DEFAULT_FEEDBACK_DAMPING, DEFAULT_FEEDBACK_GAIN_NM_PER_N,
-                     DEFAULT_FEEDBACK_MAX_TAU_NM, DEFAULT_FEEDBACK_THRESHOLD_N,
-                     DEFAULT_FEEDBACK_TIMEOUT_S, DEFAULT_GRIP_ID,
-                     DEFAULT_GRIP_PORT, DEFAULT_LEAD_CAP_MM,
-                     DEFAULT_READY_PERIOD_S, DEFAULT_READY_TIMEOUT_S,
-                     DEFAULT_READY_TOLERANCE_MM, DEFAULT_TORQUE_LIMIT_NM,
-                     TORQUE_GUARD_HOLD)
-
-
-def _zenoh_transport(role: str, key: str, port: int, host: Optional[str],
-                     ready_key: Optional[str] = None,
-                     feedback_key: Optional[str] = None) -> "TeleopTransport":
-    """Build a point-to-point zenoh transport, or explain how to get one.
-
-    zenoh is an optional dependency, so a bare ``import`` failure is turned into
-    an actionable message rather than a ModuleNotFoundError naming a module the
-    user never asked for.
-    """
-    try:
-        from .zenoh_link import ZenohTeleopTransport
-    except ImportError as e:
-        raise ImportError(
-            "the zenoh teleoperation link needs the optional zenoh dependency — "
-            "install it with `pip install litegrip-python[zenoh]`") from e
-    return ZenohTeleopTransport(role, key, port=port, host=host,
-                                ready_key=ready_key, feedback_key=feedback_key)
-
-
-# The calibration the SDK ships for the unit it ships with.  This is the
-# *standard* value: a no-argument load_calibration() reads it and nothing else.
-# A calibration measured on the buyer's machine is never picked up by accident
-# — name it with ``path=`` or ``LITEGRIP_CALIB``.
-_FACTORY_CALIB = _os.path.join(_os.path.dirname(__file__), "factory_calibration.json")
-
-# Calibration templates kept for backward compatibility.  They are
-# **deprecated**: shipped grippers have one mounting, which the factory
-# calibration already describes, so new code uses a no-argument
-# load_calibration() or an explicit ``path=``.  Each template is a pair of
-# nominal limits whose *ordering* still declares a direction (the "normal" one
-# closes at the larger rad value); they are a labelling seed, not a per-unit
-# calibration, so run zero() to measure the real travel.
-#
-# They deliberately carry no `channel`, `can_id`, `mst_id` or gain values: a
-# template declares a *direction*, and adopting a device identity or a tuned
-# kp/kd from it would silently rewrite what the caller set.  list_templates()
-# is likewise deprecated and kept only so existing callers keep working.
-CALIB_TEMPLATES = {
-    "normal": _os.path.join(_os.path.dirname(__file__), "calibration_normal.json"),
-    "reverse": _os.path.join(_os.path.dirname(__file__), "calibration_reverse.json"),
-}
-
-# The pre-per-channel location.  A calibration saved by an older version is
-# still on disk and still loadable — but only by naming it, like any other
-# file on the machine.
-_LEGACY_CALIB_PATH = _os.path.join(
-    _os.path.expanduser("~"), ".litegrip", "litegrip_calibration.json")
-
-# The historical default calibration path, kept exported so existing imports
-# keep working.  It is NOT read by load_calibration() any more: a no-argument
-# load reads the factory file alone, and everything on this machine has to be
-# asked for by name (``path=`` or ``LITEGRIP_CALIB``).
-DEFAULT_CALIB = _os.environ.get("LITEGRIP_CALIB", _LEGACY_CALIB_PATH)
-
-
-from .models import (
-    GripperState,
-    GripperConfig,
-    GripperInfo,
-    GripperStatus,
-    CalibrationData,
-)
-from .constants import (
-    GripperGeometry,
-    GripperParams,
-    UnitConversion,
-    DefaultParams,
-    describe_error,
-)
+from .can.bus import CanBus
+from .constants import DefaultParams, GripperParams, UnitConversion, describe_error
 from .exceptions import (
     CommandError,
     ConnectError,
     HardwareError,
     NotInitializedError,
 )
-
-
-def _scale_from_travel(config: GripperConfig, travel_rad: float) -> float:
-    """A probed travel in radians → millimetres per radian.
-
-    The numerator is ``max_stroke_mm + STOP_INSET_MM`` rather than
-    ``max_stroke_mm``: the probe presses *into* the open stop to find it, so the
-    two recorded extremes span about a millimetre more than the jaws can
-    actually travel.  See :class:`~litegrip.constants.GripperGeometry`.
-
-    Deriving the scale from the jaw travel alone is a 1.2% short scale — 1 mm
-    lost per full stroke — and it is what this used to do, on top of a nominal
-    stroke (120 mm) that belonged to no gripper in this family.
-
-    Raises:
-        RuntimeError: the two stops coincide, so no scale can be derived.  A
-            calibration that cannot produce a scale must not invent one.
-    """
-    if not travel_rad > 0:
-        raise RuntimeError(
-            f"标定失败：两端止点重合成 {travel_rad:.6f} rad 的行程，推不出 "
-            "mm/rad。确认夹爪真的走完了全程，再重新标定。")
-    return ((config.max_stroke_mm + GripperGeometry.STOP_INSET_MM)
-            / travel_rad)
-
-
-def default_calib_path(channel: str = DefaultParams.CAN_CHANNEL) -> str:
-    """Where a calibration for *channel* is saved, and how to name it back.
-
-    One gripper per channel, one file per channel —
-    ``~/.litegrip/<channel>_calibration.json``.  A single shared file let two
-    grippers on one machine (``can0`` / ``can1``, both at CAN ID 0x08)
-    overwrite each other's direction and travel.
-
-    This is :meth:`LiteGrip.save_calibration`'s destination.  It is *not* what
-    a no-argument :meth:`LiteGrip.load_calibration` reads: that reads the
-    factory file alone.  Feed the saved path back explicitly, or set
-    ``LITEGRIP_CALIB`` to it.
-
-    ``LITEGRIP_CALIB``, when set, overrides this with one explicit path for
-    every channel.  ``HOME`` and the env var are read per call, so a caller
-    (or a test) can redirect them.
-    """
-    env = _os.environ.get("LITEGRIP_CALIB")
-    if env:
-        return env
-    return _os.path.join(_os.path.expanduser("~"), ".litegrip",
-                         f"{channel}_calibration.json")
-
-
-def list_templates() -> List[str]:
-    """The legacy calibration template names, in declaration order.
-
-    **Deprecated.**  Kept for backward compatibility; shipped grippers have
-    one mounting and the factory calibration already describes it.  Returns
-    the historical names so existing callers keep working.
-    """
-    return list(CALIB_TEMPLATES)
-
-
-def _resolve_template(name: str) -> str:
-    """Template *name* → path.  Unknown names are a hard error."""
-    try:
-        return CALIB_TEMPLATES[name]
-    except KeyError:
-        raise CommandError(
-            f"未知的标定模板 {name!r}；可用的是 "
-            f"{', '.join(repr(n) for n in CALIB_TEMPLATES)}"
-            f"（也可以直接给文件路径）。") from None
-
-
-def _dedupe(paths: List[str]) -> List[str]:
-    """Drop repeats, keep order — ``LITEGRIP_CALIB`` can alias several entries."""
-    seen = set()
-    out: List[str] = []
-    for p in paths:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
-
-
-def _ignored_calib_files(channel: str) -> List[str]:
-    """Calibrations on this machine that a no-argument load does not read.
-
-    A file written by :meth:`LiteGrip.save_calibration`, or the pre-per-channel
-    ``litegrip_calibration.json``, sits in ``~/.litegrip`` and no longer takes
-    part in a no-argument load.  Reporting it is the point: a machine that
-    quietly keeps running the factory calibration with a measured one next to
-    it is the failure this whole change exists to stop.
-
-    Only names that could belong to *channel* are listed — ``<channel>_...json``
-    and the legacy name — so a second gripper's file does not show up in the
-    first one's log.  Anything else in that directory is not this SDK's to
-    judge (see the README for which names are recognized at all).
-    """
-    directory = _os.path.join(_os.path.expanduser("~"), ".litegrip")
-    if not _os.path.isdir(directory):
-        return []
-    ignored = []
-    for name in sorted(_os.listdir(directory)):
-        if not name.endswith(".json"):
-            continue
-        if name == _os.path.basename(_LEGACY_CALIB_PATH) or name.startswith(f"{channel}_"):
-            ignored.append(_os.path.join(directory, name))
-    return ignored
-
-
-def _warn_ignored_local_calibrations(channel: str) -> None:
-    """Name every machine calibration a no-argument load walked past.
-
-    Silent fallback is the bug this reports on: without it the gripper keeps
-    running one calibration while a freshly measured one sits unused on disk.
-    """
-    ignored = _ignored_calib_files(channel)
-    if not ignored:
-        return
-    log.warning(
-        "Local calibration not read: %s. A no-argument load_calibration() "
-        "reads the shipped factory calibration only, so this run does not use "
-        "them. To use one, name it: load_calibration(path=%r), or set "
-        "LITEGRIP_CALIB=%s.",
-        ", ".join(ignored), ignored[0], ignored[0])
-
+from .models import CalibrationData, GripperConfig, GripperState
 
 log = logging.getLogger("litegrip")
 
+# Hard bounds for the single-frame teleoperation primitive. These are stricter
+# than the DM4310 frame ranges so a caller cannot stream an unbounded push.
+_FOLLOW_KP_MAX = 500.0        # MIT stiffness range
+_FOLLOW_KD_MAX = 5.0          # MIT damping range
+_FOLLOW_DQ_MAX_RAD_S = 10.0   # teleop velocity feed-forward ceiling
+_FOLLOW_TAU_MAX_NM = 3.5      # safety torque ceiling (same as the C++ guard)
 
-class LiteGrip:
+#: The calibration the SDK ships for the reference unit.  The constructor falls
+#: back to this file when neither ``LITEGRIP_CALIB`` nor the per-channel file
+#: exists, so distance commands work out of the box.
+_FACTORY_CALIB = os.path.join(os.path.dirname(__file__),
+                              "factory_calibration.json")
+
+#: Fields a calibration file must carry.  Everything else is optional.
+_REQUIRED_CALIB_KEYS = ("zero_position_rad", "max_position_rad", "rad_to_mm")
+
+
+def default_calibration_path(channel: str = DefaultParams.CAN_CHANNEL) -> str:
+    """Where the calibration for *channel* is saved and loaded from.
+
+    One gripper per channel, one file per channel —
+    ``~/.litegrip/<channel>_calibration.json``.  A single shared file would let
+    two grippers on one machine (``can0`` / ``can1``, both at CAN ID 0x08)
+    overwrite each other's direction and travel.
+
+    This is :meth:`Gripper.save_calibration`'s destination and the second entry
+    in :meth:`Gripper.load_calibration`'s search order.  ``HOME`` is read per
+    call, so a caller (or a test) can redirect it.
+    """
+    return os.path.join(os.path.expanduser("~"), ".litegrip",
+                        f"{channel}_calibration.json")
+
+
+def _read_calibration(path: str) -> Optional[dict]:
+    """Read one calibration file, mapping every unreadable case to ``None``."""
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        log.debug("Calibration not readable at %s: %s", path, e)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+class Gripper:
     """LiteGrip adaptive two-finger gripper.
 
     Parameters
@@ -270,30 +105,19 @@ class LiteGrip:
     can_id:
         Motor CAN ID (default 0x08).
     mst_id:
-        Motor master ID for status frames.  ``None`` = auto-detect.
-    canfd_mode:
-        ``True`` to prefer CAN FD.  ``None`` = auto-detect from interface MTU.
-    motor_type:
-        Damiao motor model (default DM4310).
-    config:
-        Full GripperConfig for advanced tuning.
+        Motor master ID for status frames (default 0x18).
     motion_config:
         Motion parameters for the high-level moves (see
-        :class:`~litegrip.actions.MotionConfig`).  Also settable at runtime
-        via the :attr:`motion_config` property.
-    disable_on_disconnect:
-        ``True`` (default) → :meth:`disconnect` sends a disable command first,
-        so the gripper goes limp when the object is released.  Set ``False``
-        to leave the motor enabled after disconnecting.
-    mount:
-        **Deprecated.**  Kept for backward compatibility.  Shipped grippers
-        have one mounting, which the factory calibration already describes;
-        leave this ``None`` (the default) and call :meth:`load_calibration`
-        yourself.
+        :class:`~litegrip.actions.MotionConfig`).
+
+    A calibration is loaded in the constructor, in this order: the file named
+    by ``LITEGRIP_CALIB``, then ``~/.litegrip/<channel>_calibration.json`` if it
+    exists, then the bundled ``factory_calibration.json``.  An explicit
+    :meth:`load_calibration` call overrides it.
 
     The gripper works as a context manager::
 
-        with LiteGrip("can0") as gripper:
+        with Gripper("can0") as gripper:
             gripper.enable()
             gripper.open()
     """
@@ -302,60 +126,43 @@ class LiteGrip:
         self,
         channel: str = DefaultParams.CAN_CHANNEL,
         can_id: int = GripperParams.CAN_ID,
-        mst_id: Optional[int] = None,
-        canfd_mode: Optional[bool] = None,
-        motor_type: MotorType = MotorType.DM4310,
-        config: Optional[GripperConfig] = None,
+        mst_id: int = GripperParams.MST_ID,
         motion_config: Optional[MotionConfig] = None,
-        disable_on_disconnect: bool = True,
-        mount: Optional[str] = None,
     ):
-        cfg = config or GripperConfig()
-        self._channel = channel if channel != DefaultParams.CAN_CHANNEL or config is None else cfg.can_channel
-        self._can_id = can_id if can_id != GripperParams.CAN_ID or config is None else cfg.can_id
-        self._mst_id = mst_id if mst_id is not None else cfg.mst_id
-        self._canfd_mode = canfd_mode if canfd_mode is not None else cfg.canfd_mode
-        self._motor_type = motor_type
-        self._config = cfg
-        self._disable_on_disconnect = disable_on_disconnect
+        if not isinstance(channel, str) or not channel:
+            raise CommandError(f"channel 必须是非空的 CAN 接口名：{channel!r}")
+        for name, value in (("can_id", can_id), ("mst_id", mst_id)):
+            if not isinstance(value, int) or not 0 <= value <= 0x7FF:
+                raise CommandError(
+                    f"{name} 必须是 11 位标准帧 ID（0..0x7FF）：{value!r}")
 
-        self._can: Optional[LiteGripCAN] = None
-        self._enabled = False
+        self._channel = channel
+        self._can_id = can_id
+        self._mst_id = mst_id
+        self._config = GripperConfig(can_channel=channel, can_id=can_id,
+                                     mst_id=mst_id)
+        self._can: Optional[CanBus] = None
         self._connected = False
+        self._enabled = False
         self._last_send_error: Optional[Exception] = None
-        self._status_flags = GripperStatus.NONE
+        # Reentrant lock around the low-level CAN I/O that a grasp thread and
+        # the caller (release, state reads) share.
+        self._io_lock = threading.RLock()
         self._actions = GripperActions(self, motion_config)
 
-        # Reentrant lock around the low-level CAN I/O that a teleop background
-        # thread shares with the caller (send/poll/get_state).  A no-op for the
-        # single-threaded use this SDK assumed before teleop existed.
-        self._io_lock = threading.RLock()
-        self._teleop: Optional["GripperTeleop"] = None
-        # Transport teleop_start built itself (as opposed to one the caller
-        # injected), so teleop_stop knows what it is allowed to close.
-        self._teleop_transport: Optional["TeleopTransport"] = None
-        # The leader's zenoh publisher endpoint, kept for the life of this
-        # gripper rather than per session — rebuilding it per session leaves the
-        # port bound and makes matching fail intermittently.
-        self._teleop_pub: Optional["TeleopTransport"] = None
+        # Leader-side haptic rendering. Off until configure_force_feedback()
+        # enables it; the defaults mirror the removed teleop module.
+        self._feedback_enabled = False
+        self._feedback_gain_nm_per_n = 0.10
+        self._feedback_threshold_n = 2.0
+        self._feedback_max_tau_nm = 1.0
+        self._feedback_damping = 0.1
+        self._feedback_timeout_s = 0.3
 
-        # One long-running session at a time.  Teleoperation and a trajectory
-        # both own the CAN I/O for their whole duration and both run in their
-        # own thread, so "is teleop running? no → start recording" is a
-        # check-then-act race that lets two loops interleave frames on one
-        # motor.  Claiming and releasing under one lock closes it.  The owner
-        # string names the session, so the refusal says who is in the way.
-        self._session_lock = threading.Lock()
-        self._session_owner: Optional[str] = None
-        self._trajectory_recorder: Optional["TrajectoryRecorder"] = None
-        self._trajectory_player: Optional["TrajectoryPlayer"] = None
-
-        # Declaring the mount is just loading the matching template, so it
-        # costs no CAN traffic and is safe this early.  The template carries
-        # only a direction and geometry, so it cannot clobber the identity
-        # arguments above or a tuned config.
-        if mount is not None:
-            self.load_template(mount)
+        # A calibration file is just data; nothing here touches the bus.  The
+        # factory file sets calibrated=true, so distance commands work before
+        # the first site calibration.
+        self.load_calibration()
 
     # ═══════════════════════════════════════════════════════════════════
     # Properties
@@ -370,7 +177,7 @@ class LiteGrip:
         return self._can_id
 
     @property
-    def mst_id(self) -> Optional[int]:
+    def mst_id(self) -> int:
         return self._mst_id
 
     @property
@@ -383,23 +190,8 @@ class LiteGrip:
 
     @property
     def config(self) -> GripperConfig:
+        """The active calibration and gains (also updated by :meth:`calibrate`)."""
         return self._config
-
-    @property
-    def mount(self) -> Optional[str]:
-        """The legacy mount label, or ``None`` while uncalibrated.
-
-        **Deprecated.**  Kept for backward compatibility.  Shipped grippers
-        have one mounting, so a calibrated unit reports ``"normal"``.  Read
-        the limits from :attr:`GripperConfig` when you need the travel.
-        """
-        return self._config.mount
-
-    @property
-    def actions(self) -> GripperActions:
-        """High-level motion API: ``open`` / ``close`` / ``grasp`` / ``zero`` /
-        ``enable`` / ``disable``."""
-        return self._actions
 
     @property
     def motion_config(self) -> MotionConfig:
@@ -411,223 +203,8 @@ class LiteGrip:
         self._actions.config = value
 
     @property
-    def disable_on_disconnect(self) -> bool:
-        return self._disable_on_disconnect
-
-    @disable_on_disconnect.setter
-    def disable_on_disconnect(self, value: bool) -> None:
-        self._disable_on_disconnect = value
-
-    # ═══════════════════════════════════════════════════════════════════
-    # Connection
-    # ═══════════════════════════════════════════════════════════════════
-
-    def connect(self) -> bool:
-        """Open CAN bus and register the gripper motor.
-
-        If *mst_id* was ``None`` at construction, it is auto-detected here.
-        """
-        if self._connected:
-            return True
-
-        try:
-            self._can = LiteGripCAN(
-                channel=self._channel,
-                canfd_mode=self._canfd_mode,  # None → auto-detect in transport
-            )
-            self._can.connect()
-
-            # Register motor; mst_id=None triggers auto-detect
-            actual_mst = self._can.register_gripper(
-                can_id=self._can_id,
-                mst_id=self._mst_id,
-                motor_type=self._motor_type,
-            )
-            if self._mst_id is None:
-                self._mst_id = actual_mst
-
-            self._connected = True
-            self._status_flags = GripperStatus.NONE
-            log.info("LiteGrip connected: %s", self)
-            return True
-        except ConnectError:
-            raise
-        except Exception as e:
-            raise ConnectError(f"连接失败: {e}")
-
-    def disconnect(self) -> None:
-        """Close the CAN transport.
-
-        Sends a disable command first unless :attr:`disable_on_disconnect`
-        is ``False`` (in which case the motor stays enabled).
-        """
-        if not self._connected:
-            return
-
-        if self._teleop is not None:
-            self.teleop_stop()
-        self._close_teleop_pub()
-        # A recording left running would keep sampling a bus that is about to
-        # close, and a replay would keep commanding one.  stop() also leaves the
-        # gripper holding rather than slack.
-        if self._trajectory_recorder is not None:
-            self._trajectory_recorder.stop()
-            self._release_session("record")
-            self._trajectory_recorder = None
-        if self._trajectory_player is not None:
-            self._trajectory_player.stop()
-            self._release_session("play")
-            self._trajectory_player = None
-
-        if self._can:
-            self._can.disconnect(disable=self._disable_on_disconnect)
-            self._can = None
-
-        self._connected = False
-        self._enabled = False
-        self._status_flags = GripperStatus.NONE
-
-    # ═══════════════════════════════════════════════════════════════════
-    # Enable / disable / fault
-    # ═══════════════════════════════════════════════════════════════════
-
-    def enable(self, retries: Optional[int] = None) -> EnableResult:
-        """Enable the gripper motor and verify it actually took.
-
-        Retries ``enable`` until a status frame reports ``err == 1`` (真使能)
-        — the frame must be read back, because ``enable`` is a one-way CAN
-        command and a dropped frame would otherwise go unnoticed.  Real
-        faults (err ∉ {0, 1}) are cleared before retrying.
-
-        Args:
-            retries: Attempts.  ``None`` = ``MotionConfig.enable_retries``.
-
-        Returns:
-            :class:`~litegrip.actions.EnableResult` — truthy when enabled.
-        """
-        result = self._actions.enable(retries)
-        # 以「回读到的状态帧」为准，而不是以某一次 initialize() 的返回值为准
-        self._enabled = result.ok
-        if result.ok:
-            self._status_flags |= GripperStatus.ENABLED
-        else:
-            self._status_flags &= ~GripperStatus.ENABLED
-        return result
-
-    def _enable_once(self) -> bool:
-        """One ``enable`` attempt: full init (disable → MIT → enable →
-        feedback).  No retry, no state-frame verification — that is
-        :meth:`actions.enable` / :meth:`enable`'s job.
-
-        Raises:
-            HardwareError: the motor did not end up enabled.
-        """
-        self._check_connected()
-
-        err = self.get_error()
-        if err not in (0, 1):
-            self.clear_fault()
-
-        try:
-            self._enabled = self._can.initialize()
-            if self._enabled:
-                self._status_flags |= GripperStatus.ENABLED
-            return self._enabled
-        except HardwareError:
-            raise
-        except Exception as e:
-            raise HardwareError(f"使能失败: {e}")
-
-    def disable(self) -> bool:
-        """Disable the gripper motor."""
-        return self._actions.disable()
-
-    def _disable_once(self) -> bool:
-        """Send a single disable command and clear the enabled flags."""
-        self._check_connected()
-        try:
-            result = self._can.disable()
-            self._enabled = False
-            self._status_flags &= ~GripperStatus.ENABLED
-            return result
-        except Exception:
-            self._enabled = False
-            return False
-
-    def clear_fault(self) -> bool:
-        """Clear latched faults (UV / OC / OT).
-
-        Sequence: disable → clear(0xFB) → enable → verify.
-        Retries up to *FAULT_CLEAR_RETRIES* times.
-        """
-        self._check_connected()
-        if self._can is None:
-            return False
-
-        cleared = self._can.clear_fault()
-        if not cleared:
-            err = self._can.get_error()
-            raise HardwareError(
-                f"故障清除失败: {describe_error(err)} (错误码 0x{err:X})",
-                error_code=err,
-            )
-        self._enabled = True
-        self._status_flags |= GripperStatus.ENABLED
-        return True
-
-    def stop(self) -> None:
-        """Emergency stop — send zero-torque MIT frame.
-
-        Does NOT disable the motor; the motor stays enabled but exerts
-        zero torque so it can be back-driven.
-        """
-        if self._can is not None and self._enabled:
-            self._can.control_mit(q_target=0, kp=0, kd=0)
-            self._can.update_state(timeout_s=0.02)
-
-    def send_mit_frame(
-        self,
-        q: float,
-        kp: float,
-        kd: float,
-        dq: float = 0.0,
-        tau: float = 0.0,
-    ) -> bool:
-        """Send a single MIT control frame — expert/low-level use.
-
-        For sustained motion use :meth:`goto_rad` or :meth:`move_at_speed`
-        instead.  This method is exposed for custom control loops that
-        manage their own timing (e.g. force-feedback monitors).
-
-        Args:
-            q: Target position in rad.
-            kp: Position stiffness.
-            kd: Velocity damping.
-            dq: Target velocity in rad/s.
-            tau: Feed-forward torque in Nm.
-
-        Returns:
-            True if the frame was sent.  A ``False`` return leaves the reason in
-            :attr:`last_send_error`.
-        """
-        if self._can is None:
-            self._last_send_error = self._not_connected_error()
-            return False
-        if not self._enabled:
-            self._last_send_error = self._not_enabled_error()
-            return False
-        with self._io_lock:
-            sent = self._can.control_mit(
-                q_target=q, kp=kp, kd=kd, dq_target=dq, tau_feedforward=tau)
-            # 鸭子类型的替身可能没有这一项；真 CAN 层永远有。取不到就是
-            # 「原因没记录」，上层据此照实报，而不是编一个。
-            self._last_send_error = (
-                None if sent else getattr(self._can, "last_send_error", None))
-            return sent
-
-    @property
     def last_send_error(self) -> Optional[Exception]:
-        """Why the last :meth:`send_mit_frame` did not send, or ``None``.
+        """Why the last low-level MIT frame did not send, or ``None``.
 
         The exception the send itself reported — a ``CommError``-family cause
         from the transport, or the ``NotInitializedError`` naming the step that
@@ -636,888 +213,129 @@ class LiteGrip:
         """
         return self._last_send_error
 
-    def poll(self, timeout_s: float = 0.0) -> bool:
-        """Poll for one CAN frame and update cached motor state.
-
-        Args:
-            timeout_s: Max wait time in seconds (0 = non-blocking).
-
-        Returns:
-            True if a status frame for this gripper was received.
-        """
-        if self._can is None:
-            return False
-        with self._io_lock:
-            return self._can.poll(timeout_s=timeout_s)
-
     # ═══════════════════════════════════════════════════════════════════
-    # Zero-gravity mode (manual back-driving)
+    # Lifecycle
     # ═══════════════════════════════════════════════════════════════════
 
-    def enter_zero_gravity(self, duration: float = 0.0) -> None:
-        """Enter zero-gravity mode — motor stays enabled but exerts no torque.
+    def connect(self) -> bool:
+        """Open the CAN bus and register the single gripper motor.
 
-        The gripper can be freely moved by hand.  Call :meth:`exit_zero_gravity`
-        or any motion command to resume normal control.
-
-        Args:
-            duration: Seconds to sustain zero-gravity.  If > 0, blocks for
-                      that duration while continuously streaming kp=0, kd=0
-                      frames.  If 0 (default), the caller must call
-                      :meth:`update_state` or poll manually to sustain the
-                      mode (single frame sent as bootstrap).
-        """
-        self._check_connected()
-        self._check_enabled()
-        if self._can is None:
-            return
-
-        if duration > 0:
-            deadline = time.monotonic() + duration
-            while time.monotonic() < deadline:
-                self._can.control_mit(q_target=0, kp=0, kd=0, tau_feedforward=0)
-                self._can.poll(timeout_s=0.0)
-                time.sleep(0.005)
-            log.info("Zero-gravity mode ended (duration=%.1fs)", duration)
-        else:
-            self._can.control_mit(q_target=0, kp=0, kd=0, tau_feedforward=0)
-            log.info("Zero-gravity mode: gripper is freely back-drivable "
-                     "(caller must poll/sustain)")
-
-    def exit_zero_gravity(self) -> None:
-        """Exit zero-gravity mode and hold current position."""
-        if self._can is not None and self._enabled:
-            self._hold_position()
-            log.info("Zero-gravity mode exited; holding position")
-
-    def _hold_position(self) -> None:
-        """Send one MIT frame holding the current position under the configured gains.
-
-        The one "hold, do not go slack" primitive in this SDK: the teleop
-        master and a stopping trajectory replay both need it, and neither wants
-        zero-gravity mode's log line.  It is one frame, not a sustained hold —
-        the motor self-locks a communication-loss fault about 100 ms after the
-        frames stop, so a caller that needs the jaws held longer has to keep
-        sending (or call a motion action).
-        """
-        if self._can is None or not self._enabled:
-            return
-        # Under the same lock as every other CAN operation: a caller normally
-        # joins its loop before holding, but a join that times out would
-        # otherwise let this frame overtake one still being written.
-        with self._io_lock:
-            current_pos = self._can.get_position()
-            self._can.control_mit(q_target=current_pos, kp=self._config.kp,
-                                  kd=self._config.kd, tau_feedforward=0)
-
-    # ═══════════════════════════════════════════════════════════════════
-    # Manual calibration (zero-gravity assisted)
-    # ═══════════════════════════════════════════════════════════════════
-
-    def calibrate_manual(
-        self,
-        duration: float = 30.0,
-        settle_time: float = 2.0,
-        sample_interval: float = 0.01,
-    ) -> CalibrationData:
-        """Calibrate by manually moving the gripper in zero-gravity mode.
-
-        The motor enters zero-torque mode so you can freely push/pull the
-        gripper jaws through their full range.  The SDK records the two
-        extremes reached — which one is "closed" depends on the mounting
-        direction declared by the current configuration (see
-        :attr:`GripperConfig.close_sign`), not on which is numerically larger.
-
-        Usage::
-
-            with LiteGrip("can0") as gripper:
-                gripper.enable()
-                result = gripper.calibrate_manual(duration=30.0)
-                print(f"行程: {result.travel_mm:.1f} mm")
-
-        **Procedure:**
-
-        1. Call this method — the gripper goes limp (zero torque).
-        2. Manually push the jaws fully closed, then fully open.
-        3. Repeat a few times to ensure limits are captured.
-        4. The method returns after *duration* seconds, or press Ctrl+C
-           to stop early and keep the best readings so far.
-
-        Args:
-            duration: Max recording time in seconds.
-            settle_time: Extra seconds at the end to hold position before
-                         exiting zero-gravity.
-            sample_interval: Polling interval in seconds (~100 Hz default).
-
-        Returns:
-            CalibrationData with zero_position, max_position, travel_range,
-            and updated rad_to_mm.  The internal :attr:`config` is also updated.
-        """
-        self._check_connected()
-        self._check_enabled()
-        if self._can is None:
-            raise NotInitializedError("未连接")
-
-        print("=" * 60)
-        print("  零重力手动标定")
-        print("=" * 60)
-        print()
-        print("  夹爪已进入零重力模式，可以自由用手掰动。")
-        print()
-        print("  操作步骤：")
-        print("    1. 将夹爪推到完全闭合位置")
-        print("    2. 将夹爪拉到完全张开位置")
-        print("    3. 反复推拉几次确保极限被抓到")
-        print()
-        print(f"  标定将持续 {duration:.0f} 秒（可按 Ctrl+C 提前结束）")
-        print("=" * 60)
-        print()
-
-        # Track the two extremes; the mounting direction (close_sign) decides
-        # which of them is the closed limit.  A normal mount closes at the
-        # larger rad value, a reverse mount at the smaller one.
-        s = self._config.close_sign
-        lo_rad = float("+inf")     # most negative rad seen
-        hi_rad = float("-inf")     # most positive rad seen
-        sample_count = 0
-
-        def _label(rad: float) -> str:
-            at_lo = rad <= lo_rad
-            if s > 0:
-                return "张开极限" if at_lo else "闭合极限"
-            return "闭合极限" if at_lo else "张开极限"
-
-        deadline = time.monotonic() + duration
-
-        try:
-            while time.monotonic() < deadline:
-                # Stream zero-torque MIT frame
-                self._can.control_mit(q_target=0, kp=0, kd=0, tau_feedforward=0)
-
-                # Poll for latest position
-                self._can.poll(timeout_s=0.0)
-
-                pos = self._can.get_position()
-                # Only count positions that look like real feedback
-                if abs(pos) < 50.0:
-                    sample_count += 1
-                    if pos < lo_rad:
-                        lo_rad = pos
-                        print(f"  ★ 新{_label(pos)}: {pos:.6f} rad")
-                    elif pos > hi_rad:
-                        hi_rad = pos
-                        print(f"  ★ 新{_label(pos)}: {pos:.6f} rad")
-
-                # Progress indicator (every ~1 second)
-                remaining = deadline - time.monotonic()
-                if sample_count % 100 == 0 and sample_count > 0:
-                    print(f"  ... 剩余 {remaining:.0f}s  |  当前 pos={pos:.4f} rad  "
-                          f"|  lo={lo_rad:.4f}  hi={hi_rad:.4f}")
-
-                time.sleep(sample_interval)
-
-        except KeyboardInterrupt:
-            print("\n  ⏎ 用户提前结束标定")
-
-        # ── Settle ──────────────────────────────────────────────────────
-        print(f"\n  保持零重力 {settle_time:.0f} 秒（稳定位置）...")
-        settle_deadline = time.monotonic() + settle_time
-        while time.monotonic() < settle_deadline:
-            self._can.control_mit(q_target=0, kp=0, kd=0, tau_feedforward=0)
-            self._can.poll(timeout_s=0.0)
-            pos = self._can.get_position()
-            lo_rad = min(lo_rad, pos)
-            hi_rad = max(hi_rad, pos)
-            time.sleep(sample_interval)
-
-        # ── Exit zero-gravity ───────────────────────────────────────────
-        self.exit_zero_gravity()
-        time.sleep(0.1)
-
-        # ── Validate ────────────────────────────────────────────────────
-        if lo_rad == float("+inf"):
-            raise RuntimeError(
-                "标定失败：未能捕获有效的位置范围。"
-                "请确保夹爪使能正常且有反馈。"
-            )
-
-        close_rad, open_rad = (hi_rad, lo_rad) if s > 0 else (lo_rad, hi_rad)
-
-        travel = abs(close_rad - open_rad)
-        if travel <= 0:
-            raise RuntimeError(
-                f"标定失败：行程异常 ({travel:.6f} rad)。"
-                "请重新标定。"
-            )
-
-        rad_to_mm = _scale_from_travel(self._config, travel)
-
-        result = CalibrationData(
-            zero_position=round(close_rad, 6),      # closed → 0 mm
-            max_position=round(open_rad, 6),        # open → max mm
-            travel_range=round(travel, 6),
-            rad_to_mm=round(rad_to_mm, 2),
-            motor_type=self._motor_type.name,
-            can_id=self._can_id,
-            mst_id=self._mst_id or 0,
-            calibration_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        )
-
-        # Update config.  The ordering the two values end up in is the
-        # direction declaration: close on the close_sign side, open on the
-        # other, whatever the mount.
-        self._config.pos_closed_rad = result.zero_position
-        self._config.pos_open_rad = result.max_position
-        self._config.rad_to_mm = result.rad_to_mm
-        self._config.calibrated = True
-
-        print(f"\n{'=' * 60}")
-        print(f"  标定完成")
-        print(f"{'=' * 60}")
-        print(f"  样本数:     {sample_count}")
-        print(f"  闭合极限:   {result.zero_position:.6f} rad  (0.0 mm)")
-        print(f"  张开极限:   {result.max_position:.6f} rad  "
-              f"({result.travel_mm:.1f} mm)")
-        print(f"  行程:       {result.travel_range:.6f} rad  "
-              f"({result.travel_mm:.1f} mm)")
-        print(f"  转换系数:   {result.rad_to_mm:.1f} mm/rad")
-        print(f"{'=' * 60}")
-
-        return result
-
-    # ═══════════════════════════════════════════════════════════════════
-    # Guided calibration (step-by-step, user confirms each limit)
-    # ═══════════════════════════════════════════════════════════════════
-
-    def calibrate_guided(
-        self,
-        kp: float = 20.0,
-        kd: float = 2.0,
-        step_rad: float = 0.05,
-        stall_delta: float = 0.0015,
-        stall_cycles: int = 5,
-        max_iter: int = 200,
-        tau_limit: Optional[float] = 2.0,
-    ) -> CalibrationData:
-        """Guided two-step calibration with user confirmation at each limit.
-
-        The gripper moves itself (low stiffness) toward each limit.  You
-        press Enter when the limit is reached.
-
-        **Procedure:**
-
-        1. Gripper steps toward the OPEN direction.  Watch the position.
-           Press Enter when fully open (or when it stalls at the hard stop).
-        2. Gripper steps toward the CLOSE direction.  Press Enter when
-           fully closed.
-        3. Calibration is saved to :attr:`config` automatically.
-
-        Args:
-            kp: Probing stiffness (low = gentle).
-            kd: Probing damping.
-            step_rad: Step size per iteration (rad).
-            stall_delta: Position delta for auto-stall detection (rad).
-            stall_cycles: Consecutive stalls to auto-confirm limit.
-            max_iter: Max steps per direction.
-            tau_limit: Torque ceiling in Nm; the probe stops when ``|tau|``
-                reaches it (``None`` disables the ceiling).  The command lead is
-                already bounded to ``step_rad`` here, so this is the second,
-                independent guard.
-
-        Returns:
-            CalibrationData; :attr:`config` is updated in-place.
-        """
-        self._check_connected()
-        self._check_enabled()
-        if self._can is None:
-            raise NotInitializedError("未连接")
-
-        print("=" * 60)
-        print("  引导式标定")
-        print("=" * 60)
-        print()
-        print("  夹爪将自动缓慢移动。到达极限时按 Enter 确认。")
-
-        s = self._config.close_sign
-        print(f"  方向：闭合时 rad {'增大' if s > 0 else '减小'}（由当前标定限位推出）")
-        print()
-
-        def _step_to_limit(direction: str, sign: float, label: str) -> float:
-            """Step in *direction* until user presses Enter or stall."""
-            print(f"  [{direction}] 正在{label}...")
-            print(f"    按 Enter 确认到达{label}，或等待自动检测堵转")
-            print()
-
-            self._can.update_state(timeout_s=0.05)
-            current = self._can.get_position()
-            stall = 0
-
-            for i in range(max_iter):
-                target = current + sign * step_rad
-                self._can.control_mit_stream(
-                    target, kp, kd, duration_s=0.3, interval_s=0.005)
-                self._can.update_state(timeout_s=0.1)
-
-                new_pos = self._can.get_position()
-                delta = abs(new_pos - current)
-                tau = self._can.get_torque()
-
-                # Non-blocking keyboard check
-                hit_enter = False
-                if sys.stdin.isatty():
-                    r, _, _ = _select_mod.select([sys.stdin], [], [], 0)
-                    if r:
-                        sys.stdin.readline()
-                        hit_enter = True
-
-                print(f"    [{i}] pos={new_pos:.4f} rad  d={delta:.5f}  "
-                      f"tau={tau:+.3f}  stall={stall}", end="")
-                if hit_enter:
-                    print("  ← 用户确认")
-                    return new_pos
-
-                if tau_limit is not None and abs(tau) >= tau_limit:
-                    print(f"  ← 力矩达到上限 {tau_limit:.2f} Nm（{tau:+.3f}）")
-                    print(f"    → 停止推进并保持: {new_pos:.6f} rad")
-                    return new_pos
-
-                if delta < stall_delta:
-                    stall += 1
-                    print(f"  (堵转检测中)")
-                    if stall >= stall_cycles:
-                        print(f"    → 自动检测到{label}: {new_pos:.6f} rad")
-                        return new_pos
-                else:
-                    stall = 0
-                    print()
-
-                current = new_pos
-
-            print(f"    → 安全停止（达到最大步数 {max_iter}）: {current:.4f} rad")
-            return current
-
-        # ── Step 1: Open ─────────────────────────────────────────────────
-        print("━" * 60)
-        print("  第 1 步：张开")
-        print("━" * 60)
-        open_rad = _step_to_limit("open", sign=-s, label="张开极限")
-
-        # Small back-off, away from the open stop toward the close side
-        print(f"\n  回退一小段...")
-        self._can.control_mit_stream(open_rad + s * 0.15, kp=80, kd=kd,
-                                     duration_s=0.5, interval_s=0.005)
-        time.sleep(0.1)
-
-        # ── Step 2: Close ────────────────────────────────────────────────
-        print(f"\n{'━' * 60}")
-        print("  第 2 步：闭合")
-        print("━" * 60)
-        close_rad = _step_to_limit("close", sign=+s, label="闭合极限")
-
-        # ── Compute ──────────────────────────────────────────────────────
-        travel = abs(close_rad - open_rad)
-        if travel <= 0:
-            raise RuntimeError(f"行程异常: close={close_rad:.4f} == open={open_rad:.4f}")
-
-        rad_to_mm = _scale_from_travel(self._config, travel)
-
-        result = CalibrationData(
-            zero_position=round(close_rad, 6),
-            max_position=round(open_rad, 6),
-            travel_range=round(travel, 6),
-            rad_to_mm=round(rad_to_mm, 2),
-            motor_type=self._motor_type.name,
-            can_id=self._can_id,
-            mst_id=self._mst_id or 0,
-            calibration_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        )
-
-        # Update config
-        self._config.pos_closed_rad = result.zero_position
-        self._config.pos_open_rad = result.max_position
-        self._config.rad_to_mm = result.rad_to_mm
-        self._config.calibrated = True
-
-        print(f"\n{'=' * 60}")
-        print(f"  标定完成")
-        print(f"{'=' * 60}")
-        print(f"  闭合(0mm):   {result.zero_position:.6f} rad")
-        print(f"  张开({self._config.max_stroke_mm:.0f}mm): "
-              f"{result.max_position:.6f} rad")
-        print(f"  行程:        {result.travel_range:.6f} rad  "
-              f"({result.travel_mm:.1f} mm)")
-        print(f"  转换系数:    {result.rad_to_mm:.1f} mm/rad")
-        print(f"{'=' * 60}")
-
-        return result
-
-    # ═══════════════════════════════════════════════════════════════════
-    # Calibration persistence
-    # ═══════════════════════════════════════════════════════════════════
-
-    def save_calibration(self, path: Optional[str] = None) -> str:
-        """Save current calibration and settings to a JSON file.
-
-        Args:
-            path: Destination file. When omitted, saves to this channel's own
-                  path (:func:`default_calib_path`, i.e.
-                  ``~/.litegrip/<channel>_calibration.json``).  One file per
-                  channel is what keeps two grippers on one machine from
-                  overwriting each other.  The factory calibration shipped
-                  with the SDK is never overwritten; back it up separately if
-                  needed.
-
-        A no-argument :meth:`load_calibration` reads the factory calibration
-        only, so what this writes is *not* read back on its own: name it
-        (``load_calibration(path=<returned>)``) or point ``LITEGRIP_CALIB`` at
-        it.  A warning says so at save time.
-
-        Returns:
-            The absolute path the calibration was written to.
-        """
-        import json
-        if path is None:
-            path = default_calib_path(self._channel)
-        data = {
-            "channel": self._channel,
-            "can_id": self._can_id,
-            # Only stamp mst_id when it is actually known.  Writing a falsy 0
-            # would pin auto-detection: load_calibration would then install a
-            # RX filter of 0x000, every reply from the motor would be dropped,
-            # and enable() would fail after a long retry loop.  Omitting it
-            # keeps the value "unknown", which connect() reads as auto-detect.
-            "canfd_mode": self._canfd_mode or False,
-            "calibrated": True,
-            # Which of zero/max is numerically larger is what carries the
-            # mounting direction; there is no separate field for it.
-            "zero_position_rad": self._config.pos_closed_rad,
-            "max_position_rad": self._config.pos_open_rad,
-            "travel_range_rad": abs(self._config.pos_open_rad - self._config.pos_closed_rad),
-            "rad_to_mm": self._config.rad_to_mm,
-            "work_stroke_mm": self._config.work_stroke_mm,
-            "motor_type": self._motor_type.name,
-            "kp": self._config.kp,
-            "kd": self._config.kd,
-            "grasp_torque_threshold": self._config.grasp_torque_threshold,
-        }
-        if self._mst_id:
-            data["mst_id"] = self._mst_id
-        parent = _os.path.dirname(path)
-        if parent:
-            _os.makedirs(parent, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-        log.info("Calibration saved to %s", path)
-        log.warning(
-            "The factory calibration stays the standard value, so this file is "
-            "not read back on its own. To use it: load_calibration(path=%r), or "
-            "LITEGRIP_CALIB=%s.", path, path)
-        return path
-
-    def load_calibration(self, path: Optional[str] = None,
-                         template: Optional[str] = None) -> bool:
-        """Load calibration from a JSON file into :attr:`config`.
-
-        Three ways to say which file, and they are mutually exclusive:
-
-        * ``template=...`` — **deprecated**, kept for backward compatibility.
-          A name from :data:`CALIB_TEMPLATES` (:func:`list_templates`).
-          Strict: if that template cannot be read this raises instead of
-          falling back to the factory file.
-        * ``path=...`` — an explicit file, which may be anywhere (including a
-          template's path).  Falls back to the built-in factory calibration
-          if it cannot be read, and may still return True when it does.
-        * neither — the factory calibration the SDK ships, and nothing else.
-          A calibration measured on this machine is never picked up by
-          accident: name it with ``path=``, or point ``LITEGRIP_CALIB`` at it
-          (the env var is read here, ahead of the factory file).
-
-          The factory file declares ``channel: can0``, so a ``can1`` unit gets
-          nothing from a no-argument load — it fails loudly rather than
-          silently adopting ``can0``'s calibration.  Give it a calibration
-          with ``path=`` or ``LITEGRIP_CALIB``.
-
-          Any file in ``~/.litegrip`` that this load passed over is named in a
-          warning, with the call that would use it.
-
-        Call this after :meth:`connect` but before :meth:`enable`.
-
-        The limits in the file decide the direction: whichever of the two is
-        numerically larger is the closed side, and the direction a file
-        implies is logged.
-
-        Args:
-            path: JSON file path.
-            template: Template name (``"normal"`` / ``"reverse"``).
-
-        Returns:
-            True if loaded successfully.
+        Repeated calls return ``True`` without reopening the bus.
 
         Raises:
-            CommandError: both *path* and *template* given, an unknown
-                template name, or a readable-but-missing template file.
+            ConnectError: the interface is unavailable or the motor cannot be
+                registered.
         """
-        import json
+        if self._connected:
+            return True
 
-        if path is not None and template is not None:
-            raise CommandError(
-                "load_calibration() 的 path 与 template 只能给一个：path 是显式"
-                "文件，template 是 CALIB_TEMPLATES 里的名字。")
-
-        if template is not None:
-            sources = [_resolve_template(template)]
-            strict = True
-            skip_other_channels = False
-            report_ignored_local = False
-        elif path is not None:
-            sources = [path, _FACTORY_CALIB]
-            strict = False
-            skip_other_channels = False
-            report_ignored_local = False
-        else:
-            # 出厂标定是这台夹爪的标准值。本机文件一律要显式点名才读 ——
-            # 一个来路不明的遗留文件不该悄悄盖过它。
-            env = _os.environ.get("LITEGRIP_CALIB")
-            sources = _dedupe([p for p in (env, _FACTORY_CALIB) if p])
-            strict = False
-            skip_other_channels = True
-            report_ignored_local = env is None
-
-        data = None
-        loaded_from: str = ""
-        for src in sources:
+        can = CanBus(channel=self._channel)
+        try:
+            can.connect()
+            can.register_gripper(can_id=self._can_id, mst_id=self._mst_id)
+        except ConnectError:
             try:
-                with open(src, "r") as f:
-                    candidate = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                continue
-            if skip_other_channels:
-                file_channel = candidate.get("channel")
-                if file_channel and self._channel and file_channel != self._channel:
-                    log.info("跳过 %s：它声明的 channel=%s 不是本实例的 %s",
-                             src, file_channel, self._channel)
-                    continue
-            data = candidate
-            loaded_from = src
-            break
+                can.disconnect(disable=False)
+            except Exception as e:                       # noqa: BLE001
+                log.debug("close after failed connect: %s", e)
+            raise
+        except Exception as e:
+            try:
+                can.disconnect(disable=False)
+            except Exception as close_error:             # noqa: BLE001
+                log.debug("close after failed connect: %s", close_error)
+            raise ConnectError(f"连接失败: {e}") from e
 
-        if report_ignored_local:
-            _warn_ignored_local_calibrations(self._channel)
-
-        if data is None:
-            if strict:
-                raise CommandError(
-                    f"标定模板 {template!r} 读不出来（{sources[0]}）。不作出厂"
-                    f"回退 —— 出厂文件的限位方向未必与所点名的模板一致。")
-            log.warning("No calibration found (tried: %s). "
-                        "Run zero() first, or restore the factory calibration.",
-                        ", ".join(sources))
-            return False
-
-        log.info("Calibration loaded from %s", loaded_from)
-
-        self._config.pos_closed_rad = float(data["zero_position_rad"])
-        self._config.pos_open_rad = float(data["max_position_rad"])
-        self._config.rad_to_mm = float(data["rad_to_mm"])
-
-        # Optional fields (present in newer calibration files)
-        for key, attr in [
-            ("can_id", "can_id"),
-            ("mst_id", "mst_id"),
-            ("channel", "can_channel"),
-            ("canfd_mode", "canfd_mode"),
-            ("kp", "kp"),
-            ("kd", "kd"),
-            ("grasp_torque_threshold", "grasp_torque_threshold"),
-            ("work_stroke_mm", "work_stroke_mm"),
-        ]:
-            if key in data:
-                setattr(self._config, attr, data[key])
-
-        # Older calibration files predate the flag and always came from a real
-        # calibration run, so absence means calibrated.
-        self._config.calibrated = bool(data.get("calibrated", True))
-
-        # The channel is the only thing that tells two grippers apart when both
-        # sit at CAN ID 0x08, so a file that names another channel is worth
-        # flagging — but it is not fatal, since older files may omit the key.
-        file_channel = data.get("channel")
-        if file_channel and self._channel and file_channel != self._channel:
-            log.warning("标定文件的 channel=%s 与本实例的 %s 不一致 —— "
-                        "同一台电脑上多台夹爪共用 CAN ID 时，通道是唯一身份键，"
-                        "确认没有指错文件。", file_channel, self._channel)
-
-        # Also update instance-level IDs if present.  A falsy value counts as
-        # "unknown", not as ID 0: files written before this SDK started omitting
-        # an unset mst_id (and hand-edited ones) may carry ``"mst_id": 0``, which
-        # would otherwise pin the CAN RX filter to 0x000 and drop every reply.
-        if data.get("can_id"):
-            self._can_id = int(data["can_id"])
-        if data.get("mst_id"):
-            self._mst_id = int(data["mst_id"])
-
-        s = self._config.close_sign
-        log.info("Calibration loaded from %s: range=%.1f mm，方向=%s",
-                 loaded_from,
-                 abs(self._config.pos_open_rad - self._config.pos_closed_rad)
-                 * self._config.rad_to_mm,
-                 "闭合时 rad 增大" if s > 0 else "闭合时 rad 减小")
+        self._can = can
+        self._connected = True
+        log.info("Gripper connected: %s", self)
         return True
 
-    def load_template(self, name: str) -> bool:
-        """Load a legacy calibration template by name.
+    def disconnect(self) -> None:
+        """Disable the motor (zero torque), then close the bus.
 
-        **Deprecated.**  Kept for backward compatibility; shipped grippers
-        have one mounting and the factory calibration describes it.  New code
-        uses :meth:`load_calibration` with no arguments or ``path=``.
+        Idempotent and non-throwing: a disconnect must not leave the jaws
+        pressing or leak the socket.
+        """
+        self._connected = False
+        self._enabled = False
+        can, self._can = self._can, None
+        if can is None:
+            return
+        try:
+            can.disconnect(disable=True)
+        except Exception as e:                           # noqa: BLE001
+            log.warning("断开连接时出错（资源仍已释放）：%s", e)
 
-        Thin wrapper over ``load_calibration(template=name)`` so the name is
-        resolved in one place; see that method for the template's strict
-        fallback behavior.
+    def enable(self, retries: Optional[int] = None) -> bool:
+        """Enable the motor and verify it actually took.
+
+        Full init: disable → MIT mode → enable → hold.  The result is read back
+        from a fresh status frame (``err == 1``), because enable is a one-way
+        CAN command and a dropped frame would otherwise go unnoticed.  Real
+        faults are cleared before retrying.
 
         Args:
-            name: Template name.
+            retries: Attempts; ``None`` uses ``MotionConfig.enable_retries``.
 
         Returns:
-            True once loaded.
+            True only when a status frame reported ``err == 1``.
+        """
+        result = self._actions.enable(retries)
+        self._enabled = result.ok
+        if not result.ok:
+            state = result.state
+            log.warning("使能失败（%d 次尝试，err=%s）", result.tries,
+                        "无状态帧" if state is None else state.error_code)
+        return result.ok
+
+    def disable(self) -> bool:
+        """Disable the motor (torque off).  The jaws become back-drivable."""
+        return self._actions.disable()
+
+    def clear_fault(self) -> bool:
+        """Clear latched faults (UV / OC / OT) and re-enable.
 
         Raises:
-            CommandError: unknown name, or the template file is unreadable.
-        """
-        return self.load_calibration(template=name)
-
-    # ═══════════════════════════════════════════════════════════════════
-    # Motion — high-level
-    # ═══════════════════════════════════════════════════════════════════
-
-    def home(self) -> MoveResult:
-        """Ramp to the closed (zero) position and stop there.
-
-        Uses this instance's calibrated closed limit, so a reverse-mounted
-        gripper homes to the correct end.  The stop is the closed end of the
-        travel, not a squeeze: the ramp's command lead is capped at
-        :attr:`MotionConfig.max_lead_mm`, so the jaws arrive without pressing.
-
-        Raises:
-            CommandError: the configuration is uncalibrated — the "calibrated
-                closed limit" is a placeholder default in that state.  See
-                :meth:`goto_rad`.
+            HardwareError: the fault could not be cleared.
         """
         self._check_connected()
-        self._check_enabled()
-        return self.move_to(self._config.pos_closed_rad, duration=1.0)
+        if self._can is None:
+            raise NotInitializedError("未连接")
+        cleared = self._can.clear_fault()
+        if not cleared:
+            err = self._can.get_error()
+            raise HardwareError(
+                f"故障清除失败: {describe_error(err)} (错误码 0x{err:X})",
+                error_code=err,
+            )
+        self._enabled = True
+        return True
 
-    def open(
-        self,
-        speed_mm_s: Optional[float] = None,
-        *,
-        progress: Optional[Callable[[MoveProgress], None]] = None,
-    ) -> MoveResult:
-        """Open the gripper.
+    def set_zero(self) -> bool:
+        """Make the current encoder angle the motor's zero (CMD 0xFE).
 
-        By default a continuous ramp (velocity feed-forward, one frame per
-        :attr:`MotionConfig.frame_interval`) toward the open end. The command
-        lead is narrowed to :attr:`MotionConfig.stop_lead_mm` inside
-        :attr:`MotionConfig.press_zone_mm` of the limit, and every emitted
-        command position is capped at the calibrated travel, so the jaw stops
-        on the calibrated open limit and is never driven past it. That cap is
-        what makes a stale calibration, or a mechanical stop that is not where
-        the calibration says, bound the travel instead of letting the jaw run
-        on. The move ends on stall detection.
+        The jaws are left limp at their current angle, that angle is declared
+        zero, and the angle is read back to confirm (``|pos| <= 1e-3 rad``).
+        Unlike :meth:`calibrate`, this does **not** probe the end stops and
+        does not touch the calibration file: it only rewrites the encoder
+        offset, so the span already measured stays valid.
 
-        When the config carries a **work stroke** (:attr:`GripperConfig.work_stroke_mm`
-        set and smaller than the mechanical travel) it stops there instead — a
-        plain move to that position, leaving a margin at the open end.
-        ``MoveResult.ok`` is then ``reached and not stalled``.
+        The motor is disabled first because a DM4310 ignores 0xFE while
+        enabled, then re-enabled.
 
-        Args:
-            speed_mm_s: Opening speed; ``None`` = ``MotionConfig.speed_mm_s``.
-            progress: Optional callback, called with a
-                :class:`~litegrip.actions.MoveProgress` per sample.
+        .. warning:: Irreversible — the offset is written to the motor's flash.
 
         Returns:
-            :class:`~litegrip.actions.MoveResult` — with no work stroke, truthy
-            when it stalled and parked within :attr:`MotionConfig.stop_tol` of
-            the calibrated limit; stalling far from the limit means something
-            blocked the travel, and is falsy.  With a work stroke, truthy when
-            it reached the work position.
-        """
-        self._check_connected()
-        return self._actions.open(speed_mm_s, progress=progress)
-
-    def close(
-        self,
-        speed_mm_s: Optional[float] = None,
-        *,
-        progress: Optional[Callable[[MoveProgress], None]] = None,
-    ) -> MoveResult:
-        """Close the gripper.
-
-        Same ramp as :meth:`open`, toward the closed side; the emitted command
-        is capped at the calibrated travel, so the jaw stops on the calibrated
-        closed limit and is never driven past it.  Use :meth:`grasp` for a power
-        grasp (closing onto an object and squeezing) — that one stops on the
-        object, not on the empty travel end.
-
-        Args:
-            speed_mm_s: Closing speed; ``None`` = ``MotionConfig.speed_mm_s``.
-            progress: Optional progress callback.
-
-        Returns:
-            :class:`~litegrip.actions.MoveResult`.
-        """
-        self._check_connected()
-        return self._actions.close(speed_mm_s, progress=progress)
-
-    def grasp(
-        self,
-        force_n: Optional[float] = None,
-        hold_s: float = 0.0,
-        *,
-        progress: Optional[Callable[[MoveProgress], None]] = None,
-    ) -> GraspResult:
-        """Adaptive grasp — close until stall, then hold with a set force.
-
-        Blocking.  Closes on a ramp (stall detection catches the object),
-        then streams MIT frames carrying a feed-forward torque of
-        ``force_n × 0.1`` Nm and no position or velocity gain, so the grip
-        force is the same whether the object yields or holds firm.  The
-        status is re-read every ``MotionConfig.hold_interval`` to catch a
-        fault.
-
-        Args:
-            force_n: Gripping force in N; ``None`` = ``MotionConfig.force_n``.
-            hold_s: Hold time in seconds; ``0`` = hold until a fault,
-                Ctrl+C, or a :meth:`release` / :meth:`request_release` from
-                another thread.
-            progress: Optional progress callback.
-
-        Returns:
-            :class:`~litegrip.actions.GraspResult` — truthy when the hold
-            ended normally.  ``stalled=True`` with ``reached=False`` means
-            it closed onto an object, which is the expected outcome.
-            ``released=True`` means the grasp ended because a release was
-            requested: ``ok=True`` for a normal release, ``ok=False`` for
-            an abort.  ``no_bite=True`` (with ``ok=False``, ``cycles=0``)
-            means the approach never moved the jaws and its torque budget
-            was below the breakaway: the hold was **not** entered, because
-            handing a jaw with a free stroke ahead of it to the torque-only
-            hold would power it across the gap.  See
-            ``MotionConfig.no_bite_mm`` and ``.breakaway_nm``.
-        """
-        self._check_connected()
-        return self._actions.grasp(force_n, hold_s, progress=progress)
-
-    def release(
-        self,
-        clearance_mm: float = 10.0,
-        *,
-        abort: bool = False,
-        timeout_s: Optional[float] = None,
-    ) -> ReleaseResult:
-        """End an in-progress :meth:`grasp` and open the jaws — thread-safe.
-
-        Call it from any thread, including while ``grasp(hold_s=0)`` is blocked
-        in another one.  The grasp thread owns the CAN frames, so this method
-        never sends any itself while a grasp is running: it records the request
-        and waits for the grasp thread to finish releasing, then returns that
-        outcome.
-
-        With no grasp running it performs the release in the calling thread.
-
-        The jaws open from the pose where the grip was **declared** (the end of
-        the force-carrying approach), not from where the set force pressed them
-        to: a 20 N grip drives a few millimetres further in, and opening from
-        there would free that much less.  The target is
-        ``max(current, grip) + clearance_mm``, clamped to the calibrated open
-        limit, reached by the same bounded position ramp as every other move —
-        never a step command.
-
-        ``abort=True`` is the E-stop form: it drops the torque and sends no
-        opening move, returning as soon as the grasp thread has done so.
-
-        Calling it twice is safe: a second call during the same grasp joins the
-        first and returns its outcome instead of opening again.
-
-        Args:
-            clearance_mm: Extra opening beyond the grip pose, in mm; must be a
-                non-negative finite number.
-            abort: E-stop: torque off only, no opening move.
-            timeout_s: How long to wait for the grasp thread; ``None`` =
-                :attr:`MotionConfig.release_wait_s` (10 s).  On timeout the
-                result is ``ok=False`` and a warning is logged.
-
-        Returns:
-            :class:`~litegrip.actions.ReleaseResult`.
-
-        Raises:
-            CommandError: ``clearance_mm`` is not a non-negative finite number,
-                or no grasp is running and the config is uncalibrated.
-            NotInitializedError: no grasp is running and the gripper is not
-                connected/enabled.
-        """
-        self._check_connected()
-        return self._actions.release(clearance_mm, abort=abort,
-                                     timeout_s=timeout_s)
-
-    def request_release(self, clearance_mm: float = 10.0, *,
-                        abort: bool = False) -> bool:
-        """Non-blocking form of :meth:`release`; never touches the CAN bus.
-
-        Records the request if a grasp is running and returns ``True``; returns
-        ``False`` when there is no grasp to release.  Safe for a UI thread, a
-        signal handler or an E-stop callback: it takes only the release lock,
-        never ``_io_lock``, and sends no frame.  The grasp thread performs the
-        release before its next frame (within 5 ms).
-
-        Args:
-            clearance_mm: Extra opening beyond the grip pose, in mm.
-            abort: E-stop: torque off only, no opening move.
-
-        Returns:
-            True if a grasp was active and the request was recorded.
-        """
-        return self._actions.request_release(clearance_mm, abort=abort)
-
-    def zero(self) -> CalibrationData:
-        """Full calibration: probe both mechanical limits and save.
-
-        The gripper is driven against each end stop with low stiffness.
-        Make sure the travel is clear.  Writes the result to the default
-        user calibration path (see :meth:`save_calibration`).
-
-        Returns:
-            :class:`CalibrationData`.
-        """
-        self._check_connected()
-        self._check_enabled()
-        return self._actions.zero()
-
-    def write_zero(self) -> WriteZeroResult:
-        """Make the current encoder angle the motor's zero, in place (CMD 0xFE).
-
-        The jaws are left limp at whatever angle they are at, that angle is
-        declared zero, and the angle is read back to confirm (~0).  Unlike
-        :meth:`zero`, this does **not** probe the end stops or touch the
-        calibration file: it only rewrites the encoder offset, so the span
-        already measured stays valid.  ⚠ Irreversible — it writes the offset
-        into the motor's flash.
-
-        A Damiao motor ignores 0xFE while it is enabled, so the motor is
-        disabled first and re-enabled after (the order ``examples/zero_closed.py``
-        uses).
-
-        Returns:
-            :class:`~litegrip.actions.WriteZeroResult` — truthy when the
-            read-back came back ~0.
+            True when the read-back came back ~0.
         """
         self._check_connected()
         self._check_enabled()
         if self._can is None:
-            raise HardwareError("未连接")
+            raise NotInitializedError("未连接")
 
-        # 1. Limp at the current angle, so the jaws stay exactly where the
-        #    operator put them, then read the pose we are about to zero.
+        # 1. Limp at the current angle, so the jaws stay where the operator put
+        #    them, then read the pose we are about to zero.
         before = self._can.get_position()
         self._can.control_mit_stream(q_target=before, kp=0.0, kd=0.0,
                                      duration_s=0.3)
@@ -1532,528 +350,661 @@ class LiteGrip:
         time.sleep(0.05)
 
         # 3. Re-enable, force fresh frames, read the new zero back.
-        self.enable()
+        enabled = self.enable()
         self._can.control_mit_stream(q_target=0.0, kp=0.0, kd=0.0,
                                      duration_s=0.2)
         self._can.update_state(timeout_s=0.3)
         after = self._can.get_position()
-        return WriteZeroResult(before_rad=before, after_rad=after)
+        result = WriteZeroResult(before_rad=before, after_rad=after)
+        if not enabled:
+            log.warning("置零后重新使能失败 —— 夹爪留在失能态，set_zero 返回 False")
+            return False
+        if not result.ok:
+            log.warning(
+                "置零回读不是 0：写入前 %.6f rad，重新使能后 %.6f rad"
+                "（容差 %.0e rad）—— 电机可能忽略了 0xFE",
+                before, after, result.tolerance_rad)
+        return result.ok
 
-    # ═══════════════════════════════════════════════════════════════════
-    # Motion — mid-level
-    # ═══════════════════════════════════════════════════════════════════
+    def calibrate(self) -> CalibrationData:
+        """Probe both mechanical limits with low stiffness and save the result.
 
-    def goto(
-        self,
-        position_mm: float,
-        kp: Optional[float] = None,
-        kd: Optional[float] = None,
-        duration: float = 0.5,
-    ) -> MoveResult:
-        """Ramp to an absolute position in millimetres.
-
-        The target is one point on the closed-to-open travel; the move itself is
-        the bounded ramp described in :meth:`goto_rad`.
-
-        Raises:
-            CommandError: ``position_mm`` is not a finite number, or the
-                configuration is uncalibrated — see :meth:`goto_rad`.  A NaN has
-                no position on the travel; letting it through would press the
-                jaws onto one of the stops (the clamp below turns it into an end
-                of the calibrated range), which is a move nobody asked for.
-        """
-        self._check_connected()
-        self._check_enabled()
-        if not math.isfinite(position_mm):
-            raise CommandError(
-                f"目标位置不是有限数：position_mm={position_mm!r}。"
-                "拒绝下发：NaN 落在下面的限位 clamp 里会变成量程的一端，"
-                "也就是一个调用方没要过的真实位置。")
-        # Opening may increase or decrease the motor rad count depending on the
-        # mount; close_sign carries that, so this works for both.
-        position_rad = (self._config.pos_closed_rad
-                        - self._config.close_sign * position_mm
-                        / self._config.rad_to_mm)
-        return self.goto_rad(position_rad, kp=kp, kd=kd, duration=duration)
-
-    def goto_rad(
-        self,
-        position_rad: float,
-        kp: Optional[float] = None,
-        kd: Optional[float] = None,
-        dq_target: float = 0.0,
-        tau_feedforward: float = 0.0,
-        duration: float = 0.5,
-    ) -> MoveResult:
-        """Ramp to an absolute position in radians.
-
-        One linear ramp over ``duration`` seconds: the speed is the measured
-        distance divided by it, every frame carries the matching velocity
-        feed-forward, and each frame's command leads the measured position by at
-        most :attr:`MotionConfig.max_lead_mm`.  The first frame is one ramp step,
-        never a step command to the target — at the shipped ``kp`` of 100 Nm/rad
-        any error past ~0.1 rad saturates the DM4310's ±10 Nm frame range, and a
-        saturated frame overshoots the target instead of stopping on it.
-
-        The target is clamped into the calibrated range.  Arrival is decided
-        after the ramp, while the jaws hold the target for
-        :attr:`MotionConfig.settle_s`, so a call takes about ``duration`` plus
-        that hold.
+        Blocking; the jaws move against each end stop.  **Make sure the travel
+        is clear first.**  The direction comes from the existing calibration's
+        limit ordering (both stops look the same to a stall detector), and the
+        result is written to the per-channel file
+        (:func:`default_calibration_path`).
 
         Returns:
-            :class:`MoveResult`.  ``ok`` means the jaws arrived inside
-            :attr:`MotionConfig.reach_tol` without stalling.  A call whose frames
-            never went out, or that was blocked on the way, comes back ``False``:
-            running the command and moving +0.000 mm is not success, whatever the
-            screen said before (measured on 2026-10-12).
-
-        Raises:
-            CommandError: ``position_rad`` is not a finite number, ``duration``
-                is not a positive finite number, ``dq_target`` or
-                ``tau_feedforward`` is not 0, or the configuration is
-                uncalibrated.  The finiteness check is deliberately *above* the
-                clamp: ``min`` / ``max`` compare false against a NaN, so the
-                clamp would answer it with one of the calibrated limits — a real
-                position that was never asked for.
-
-                The calibration check is there because the clamp below is not a
-                safety net while ``pos_closed_rad`` / ``pos_open_rad`` are still
-                the placeholder defaults — it is arithmetic on numbers that
-                describe no real travel, and it produces a real target.  On the
-                defaults ``goto(40.0)`` lands at ``+0.61 rad``, past this unit's
-                closed stop at ``+0.05 rad``, so the jaws are driven into it and
-                press there.  Every other motion already refuses through
-                ``_check_calibrated``; this was the way around it.
-
-                ``dq_target`` / ``tau_feedforward`` are refused rather than
-                ignored: the ramp derives its velocity feed-forward from the
-                schedule, and silently dropping a value the caller passed is
-                worse than saying no.
-        """
-        if dq_target != 0.0:
-            raise CommandError(
-                f"goto_rad 不再接受 dq_target={dq_target!r}：定位走的是按帧排程"
-                "的斜坡，速度前馈由斜坡自己按「距离 ÷ 时长」给，再给一个会和它"
-                "打架。")
-        if tau_feedforward != 0.0:
-            raise CommandError(
-                f"goto_rad 不再接受 tau_feedforward={tau_feedforward!r}：斜坡"
-                "不带前馈力矩。要出力请用 grasp()。")
-        if not math.isfinite(duration) or duration <= 0.0:
-            raise CommandError(
-                f"duration 必须是正的有限数：{duration!r}。整段斜坡的时长就是"
-                "它，速度由实测距离除以它反推 —— 0 或负数没有对应的斜坡（旧实现"
-                "在这个时长里一帧都不发，却返回成功）。")
-        return self._ramp_to_rad(position_rad, duration_s=duration,
-                                 kp=kp, kd=kd)
-
-    def move_to(
-        self,
-        target_rad: float,
-        kp: Optional[float] = None,
-        kd: Optional[float] = None,
-        tau_feedforward: float = 0.0,
-        duration: float = 1.0,
-    ) -> MoveResult:
-        """Ramp to a target position (longer default duration).
-
-        The same move as :meth:`goto_rad`; only the default duration differs.
-
-        Raises:
-            CommandError: the configuration is uncalibrated, or a field is
-                refused — see :meth:`goto_rad`.
-        """
-        return self.goto_rad(target_rad, kp=kp, kd=kd,
-                             tau_feedforward=tau_feedforward,
-                             duration=duration)
-
-    def _ramp_to_rad(
-        self,
-        target_rad: float,
-        *,
-        speed_mm_s: float = 0.0,
-        duration_s: Optional[float] = None,
-        kp: Optional[float] = None,
-        kd: Optional[float] = None,
-    ) -> MoveResult:
-        """定位的共用入口：闸门 + clamp + 交给引擎。
-
-        :meth:`goto` / :meth:`goto_rad` / :meth:`move_to` / :meth:`home` /
-        :meth:`move_at_speed` / :meth:`move_at_speed_rad` 六条路径都走这里。它们
-        本来就只差三件事：目标怎么给（mm 还是 rad）、给速度还是给时长、以及各自
-        的输入校验；运动本身必须是同一条，见
-        :meth:`GripperActions.ramp_to`。
+            :class:`~litegrip.models.CalibrationData` with the measured limits,
+            travel and conversion factor.
         """
         self._check_connected()
         self._check_enabled()
-        _check_calibrated(self._config)
-        # 非有限值必须在 clamp 之前拦下：min/max 与 NaN 的比较全为假，clamp 会
-        # 把它折成量程的一端 —— 一个没人要过的真实位置。
-        if not math.isfinite(target_rad):
-            raise CommandError(
-                f"目标位置不是有限数：target_rad={target_rad!r}。"
-                "拒绝下发：NaN 落在下面的限位 clamp 里会变成量程的一端，"
-                "也就是一个调用方没要过的真实位置。")
-        if self._can is None:
-            raise NotInitializedError("没有 CAN 通道 — 请先 connect()")
-        # clamp 的目标直接经 clamp_to_travel 夹进标定行程（两端谁大谁小由安装
-        # 方向决定，它用 min/max，不假设顺序）。
-        return self._actions.ramp_to(
-            clamp_to_travel(self._config, target_rad),
-            speed_mm_s, duration_s=duration_s, kp=kp, kd=kd)
+        data = self._actions.calibrate()
+        path = self.save_calibration()
+        log.info("Calibration saved to %s", path)
+        return data
 
     # ═══════════════════════════════════════════════════════════════════
-    # Moves specified by speed (the same ramp as the goto family)
+    # Calibration persistence
     # ═══════════════════════════════════════════════════════════════════
 
-    def move_at_speed(
-        self,
-        target_mm: float,
-        speed_mm_s: float = 30.0,
-        kp: Optional[float] = None,
-        kd: Optional[float] = None,
-    ) -> MoveResult:
-        """Ramp to a target position at a constant linear speed (mm/s).
+    def load_calibration(self, path: Optional[str] = None) -> bool:
+        """Load calibration into :attr:`config`.
 
-        The same bounded ramp as :meth:`goto_rad`; only the way the speed is
-        given differs — here it is mm/s, which fixes the ramp duration from the
-        measured distance.  There is no separate velocity-controlled
-        implementation any more: the old one stepped a fixed 200 Hz schedule
-        (ignoring :attr:`MotionConfig.frame_interval`), held the target for 20
-        frames regardless of where the jaws were, and dropped every frame's send
-        result.
+        Search order when *path* is omitted: ``LITEGRIP_CALIB`` if set, then
+        ``~/.litegrip/<channel>_calibration.json``, then the bundled factory
+        file.  An explicit *path* is the only source tried.  The first readable
+        file wins.
 
-        Args:
-            target_mm: Target position in mm, measured from the closed stop
-                (``0`` = closed; ``config.max_stroke_mm``, 85 mm by default,
-                = fully open).
-            speed_mm_s: Travel speed in mm/s (default 30).
-            kp: Position stiffness (default from config).
-            kd: Velocity damping.
+        A file that names another ``channel`` is loaded with a warning — the
+        channel is the identity key when two grippers share CAN ID 0x08.
 
         Returns:
-            :class:`MoveResult` — the same arrival check as :meth:`goto_rad`,
-            which the old implementation had none of (it returned ``True`` after
-            sending, whatever the jaws did).
+            True if a file was loaded, False when nothing readable was found
+            (formatted JSON errors count as unreadable).
 
         Raises:
-            CommandError: ``target_mm`` or ``speed_mm_s`` is not a finite
-                number, ``speed_mm_s`` is not positive, or the configuration is
-                uncalibrated — see :meth:`goto_rad`.  Both of the shortcuts this
-                method used to take compare false against a NaN, so it would slip
-                past them and reach the ramp arithmetic; and ``speed_mm_s <= 0``
-                used to return ``True`` — "move at 0 mm/s" reported as success.
+            CommandError: the file is readable but not a valid calibration
+                (missing required fields, or non-finite values).
         """
-        self._check_connected()
-        self._check_enabled()
-        # Before the shortcuts below: on a placeholder config even a "nothing to
-        # do" comparison is arithmetic on numbers that describe no real travel.
-        _check_calibrated(self._config)
-        for name, value in (("target_mm", target_mm),
-                            ("speed_mm_s", speed_mm_s)):
-            if not math.isfinite(value):
-                raise CommandError(
-                    f"{name} 不是有限数：{value!r}。拒绝下发。")
-        if speed_mm_s <= 0.0:
+        if path is not None:
+            sources = [os.fspath(path)]
+        else:
+            env = os.environ.get("LITEGRIP_CALIB")
+            sources = [s for s in (env, default_calibration_path(self._channel),
+                                   _FACTORY_CALIB) if s]
+
+        seen = set()
+        data = None
+        loaded_from = ""
+        for src in sources:
+            if src in seen:
+                continue
+            seen.add(src)
+            candidate = _read_calibration(src)
+            if candidate is not None:
+                data = candidate
+                loaded_from = src
+                break
+
+        if data is None:
+            log.warning("No calibration found (tried: %s). "
+                        "Run calibrate() and save_calibration(), or point "
+                        "LITEGRIP_CALIB at a file.", ", ".join(sources))
+            return False
+
+        missing = [k for k in _REQUIRED_CALIB_KEYS if k not in data]
+        if missing:
             raise CommandError(
-                f"速度必须为正：speed_mm_s={speed_mm_s!r}。速度为 0 或负的"
-                "移动没有对应的斜坡（旧实现把它当成功返回 True）。")
-
-        # close_sign handles the reverse mount, as in ``goto``.
-        target_rad = (self._config.pos_closed_rad
-                      - self._config.close_sign * target_mm
-                      / self._config.rad_to_mm)
-        return self._ramp_to_rad(target_rad, speed_mm_s=speed_mm_s,
-                                 kp=kp, kd=kd)
-
-    def move_at_speed_rad(
-        self,
-        target_rad: float,
-        speed_rad_s: float = 0.5,
-        kp: Optional[float] = None,
-        kd: Optional[float] = None,
-    ) -> MoveResult:
-        """Ramp to a target position at a constant motor speed (rad/s).
-
-        The rad/s spelling of :meth:`move_at_speed`; the ramp is the same one
-        (see :meth:`goto_rad`).
-
-        Args:
-            target_rad: Target position in rad.
-            speed_rad_s: Motor speed in rad/s (default 0.5).
-            kp: Position stiffness (default from config).
-            kd: Velocity damping.
-
-        Returns:
-            :class:`MoveResult`.
-
-        Raises:
-            CommandError: ``target_rad`` or ``speed_rad_s`` is not a finite
-                number, ``speed_rad_s`` is not positive, or the configuration is
-                uncalibrated — see :meth:`goto_rad`.  The clamp would otherwise
-                answer a NaN target with a calibrated limit.
-        """
-        self._check_connected()
-        self._check_enabled()
-        # Same as ``move_at_speed``: the check runs before the ramp arithmetic,
-        # where a NaN would quietly pick a real speed.
-        _check_calibrated(self._config)
-        for name, value in (("target_rad", target_rad),
-                            ("speed_rad_s", speed_rad_s)):
-            if not math.isfinite(value):
-                raise CommandError(
-                    f"{name} 不是有限数：{value!r}。拒绝下发。")
-        if speed_rad_s <= 0.0:
+                f"标定文件 {loaded_from} 缺少必需字段：{', '.join(missing)}")
+        try:
+            closed = float(data["zero_position_rad"])
+            opened = float(data["max_position_rad"])
+            rad_to_mm = float(data["rad_to_mm"])
+        except (TypeError, ValueError) as e:
             raise CommandError(
-                f"速度必须为正：speed_rad_s={speed_rad_s!r}。速度为 0 或负的"
-                "移动没有对应的斜坡（旧实现把它当成功返回 True）。")
+                f"标定文件 {loaded_from} 的限位/换算字段不是数字：{e}") from None
+        if not all(math.isfinite(v) for v in (closed, opened, rad_to_mm)):
+            raise CommandError(
+                f"标定文件 {loaded_from} 含非有限数值 —— 拒绝加载")
+        if rad_to_mm == 0.0:
+            raise CommandError(
+                f"标定文件 {loaded_from} 的 rad_to_mm=0 —— 无法换算开口量")
 
-        return self._ramp_to_rad(
-            target_rad,
-            speed_mm_s=speed_rad_s * self._config.rad_to_mm,
-            kp=kp, kd=kd)
+        self._config.pos_closed_rad = closed
+        self._config.pos_open_rad = opened
+        self._config.rad_to_mm = rad_to_mm
+        for key in ("kp", "kd", "work_stroke_mm"):
+            if key in data:
+                try:
+                    value = float(data[key])
+                except (TypeError, ValueError):
+                    raise CommandError(
+                        f"标定文件 {loaded_from} 的 {key} 不是数字："
+                        f"{data[key]!r}") from None
+                if not math.isfinite(value):
+                    raise CommandError(
+                        f"标定文件 {loaded_from} 的 {key} 不是有限数")
+                setattr(self._config, key, value)
 
-    # ═══════════════════════════════════════════════════════════════════
-    # Calibration
-    # ═══════════════════════════════════════════════════════════════════
+        # Older calibration files predate the flag and always came from a real
+        # calibration run, so absence means calibrated.
+        self._config.calibrated = bool(data.get("calibrated", True))
 
-    def calibrate(
-        self,
-        kp: float = 20.0,
-        kd: float = 2.0,
-        step_rad: float = 0.05,
-        stall_delta: float = 0.0015,
-        stall_cycles: int = 5,
-        max_iter: int = 200,
-        tau_limit: Optional[float] = 2.0,
-    ) -> CalibrationData:
-        """Calibrate the gripper: find close and open mechanical limits.
-
-        Process:
-        1. Back off a small amount from current position
-        2. Step toward close direction until stall → zero_position
-        3. Back off
-        4. Step toward open direction until stall → max_position
-        5. Compute travel_range and update internal conversion factors
-
-        A stall only says "something stopped me", never *which* end was hit —
-        both ends are hard stops.  So the direction is not discovered here: it
-        comes from :attr:`GripperConfig.close_sign`, and this routine
-        preserves it.
-
-        Safety: at a hard stop the encoder keeps creeping (backlash, elastic
-        deformation, micro-slip), so the position-based stall test alone can
-        never fire — the command would keep advancing and ``kp × error`` would
-        keep growing until the structure breaks.  Two independent guards are
-        therefore in place: the command lead is re-derived from the *measured*
-        position every cycle (bounded to ``step_rad``, so pressing torque is at
-        most ``kp × step_rad``), and the probe aborts the moment ``|tau|``
-        reaches ``tau_limit``.
-
-        Args:
-            kp: Probing stiffness (low = gentle).
-            kd: Probing damping.
-            step_rad: Step size per iteration (rad); also the command lead cap.
-            stall_delta: Position change threshold for stall detection (rad).
-            stall_cycles: Consecutive stalls to confirm limit.
-            max_iter: Max steps per direction (safety cap).
-            tau_limit: Torque ceiling in Nm.  The probe stops as soon as
-                ``|tau|`` reaches this; ``None`` disables the ceiling.
-
-        Returns:
-            CalibrationData with zero/max position, travel range, and
-            rad-to-mm conversion.
-        """
-        self._check_connected()
-        self._check_enabled()
-        if self._can is None:
-            raise NotInitializedError("未连接")
+        file_channel = data.get("channel")
+        # The bundled factory file names can0 because that is the reference
+        # unit's channel; using it on can1 is the documented fallback, not a
+        # mistake worth warning about.  A user file that names another channel
+        # is, so that one still speaks up.
+        if (file_channel and file_channel != self._channel
+                and loaded_from != _FACTORY_CALIB):
+            log.warning(
+                "标定文件的 channel=%s 与本实例的 %s 不一致 —— 同一台电脑上"
+                "多台夹爪共用 CAN ID 时，通道是唯一身份键，确认没有指错文件。",
+                file_channel, self._channel)
 
         s = self._config.close_sign
-        init_pos = self._can.get_position()
-        self._can.update_state(timeout_s=0.1)
-        init_pos = self._can.get_position()
-        print(f"标定开始  初始位置: {init_pos:.4f} rad  "
-              f"（方向：闭合时 rad {'增大' if s > 0 else '减小'}）")
+        log.info("Calibration loaded from %s: range=%.1f mm，方向=%s",
+                 loaded_from,
+                 abs(self._config.pos_open_rad - self._config.pos_closed_rad)
+                 * self._config.rad_to_mm,
+                 "闭合时 rad 增大" if s > 0 else "闭合时 rad 减小")
+        return True
 
-        def _find_limit(direction: str) -> float:
-            sign = s if direction == "close" else -s
-            label = "闭合限位" if direction == "close" else "张开限位"
-            print(f"  寻找{label}...")
+    def save_calibration(self, path: Optional[str] = None) -> str:
+        """Write the active calibration to a JSON file.
 
-            self._can.update_state(timeout_s=0.05)
-            current = self._can.get_position()
-            stall = 0
+        Args:
+            path: Destination; defaults to
+                ``~/.litegrip/<channel>_calibration.json`` (one file per
+                channel, so two grippers on one machine do not overwrite each
+                other).
 
-            for i in range(max_iter):
-                # Re-derive the command from the *measured* position each cycle.
-                # Accumulating a running target (``target += sign * step_rad``)
-                # lets the command lead grow without bound once the stop is
-                # reached, and the pressing torque (kp × lead) grows with it.
-                # Bounding the lead to one step caps it at kp × step_rad.
-                target = current + sign * step_rad
-                self._can.control_mit_stream(target, kp, kd, duration_s=0.3, interval_s=0.005)
-                self._can.update_state(timeout_s=0.1)
-
-                new_pos = self._can.get_position()
-                delta = abs(new_pos - current)
-                tau = self._can.get_torque()
-
-                print(f"    [{i}] tgt={target:+.3f} pos={new_pos:.4f} "
-                      f"d={delta:.5f} tau={tau:+.3f} st={stall}")
-
-                if tau_limit is not None and abs(tau) >= tau_limit:
-                    print(f"    → 力矩达到上限 {tau_limit:.2f} Nm（{tau:+.3f}），"
-                          f"停止推进并保持: {new_pos:.6f} rad")
-                    return new_pos
-
-                if delta < stall_delta:
-                    stall += 1
-                    if stall >= stall_cycles:
-                        print(f"    → 到达{label}: {new_pos:.6f} rad")
-                        return new_pos
-                else:
-                    stall = 0
-                current = new_pos
-
-            print(f"    → 安全停止（达到最大步数 {max_iter}）: {current:.4f} rad")
-            return current
-
-        def _bounded_move(target: float, label: str) -> None:
-            """Move toward *target*, guarded the same way as the probe.
-
-            The plain ``goto_rad`` streams one constant command for half a
-            second with no ceiling.  If the jaws already sit at the stop that
-            command is heading for, the pressing torque is ``kp × 0.2`` (16 Nm at
-            ``kp=80``) held for the whole duration — the same kind of unguarded
-            push that broke a jaw.  Leading by one step at a time and watching
-            ``|tau|`` bounds it to the probe's ceiling instead.
-            """
-            current = self._can.get_position()
-            sign = 1.0 if target >= current else -1.0
-            for _ in range(max_iter):        # same cap as the probe
-                if abs(target - current) <= step_rad:
-                    return
-                self._can.control_mit_stream(
-                    current + sign * step_rad, kp, kd,
-                    duration_s=0.1, interval_s=0.005)
-                self._can.update_state(timeout_s=0.1)
-                new_pos = self._can.get_position()
-                tau = self._can.get_torque()
-                if tau_limit is not None and abs(tau) >= tau_limit:
-                    print(f"    → {label}：力矩达到上限 {tau_limit:.2f} Nm"
-                          f"（{tau:+.3f}），停止")
-                    return
-                if abs(new_pos - current) < stall_delta:
-                    print(f"    → {label}：位置不再变化，停止")
-                    return
-                current = new_pos
-
-        # 1. Safe back-off (a nudge toward the close side, as before, flipped
-        #    with the mount)
-        print("  安全回退...")
-        _bounded_move(init_pos + s * 0.2, "安全回退")
-
-        # 2. Find zero (close direction)
-        zero_pos = _find_limit("close")
-
-        # 3. Back off, away from the close stop toward the open side
-        print("  回退...")
-        _bounded_move(zero_pos - s * 0.3, "回退")
-
-        # 4. Find max (open direction)
-        max_pos = _find_limit("open")
-
-        # 5. Compute results
-        # zero_pos = close limit, max_pos = open limit; which is numerically
-        # larger depends on the mount, so take the magnitude.
-        travel = abs(zero_pos - max_pos)
-        rad_to_mm = _scale_from_travel(self._config, travel)
-
-        result = CalibrationData(
-            zero_position=round(zero_pos, 6),      # closed → 0 mm
-            max_position=round(max_pos, 6),        # open → max mm
-            travel_range=round(travel, 6),
-            rad_to_mm=round(rad_to_mm, 2),
-            motor_type=self._motor_type.name,
-            can_id=self._can_id,
-            mst_id=self._mst_id or 0,
-            calibration_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        )
-
-        # Update config
-        self._config.pos_closed_rad = result.zero_position
-        self._config.pos_open_rad = result.max_position
-        self._config.rad_to_mm = result.rad_to_mm
-        self._config.calibrated = True
-
-        print(f"\n  标定结果:")
-        print(f"    闭合(0mm): {result.zero_position:.6f} rad")
-        print(f"    张开({self._config.max_stroke_mm:.0f}mm): "
-              f"{result.max_position:.6f} rad")
-        print(f"    行程:     {result.travel_range:.6f} rad  "
-              f"({result.travel_mm:.1f} mm)")
-        print(f"    转换系数: {result.rad_to_mm:.1f} mm/rad")
-
-        return result
+        Returns:
+            The path written.
+        """
+        if path is None:
+            path = default_calibration_path(self._channel)
+        path = os.fspath(path)
+        data = {
+            "channel": self._channel,
+            "can_id": self._can_id,
+            "mst_id": self._mst_id,
+            "calibrated": bool(self._config.calibrated),
+            # Which of zero/max is numerically larger carries the mounting
+            # direction; there is no separate field for it.
+            "zero_position_rad": self._config.pos_closed_rad,
+            "max_position_rad": self._config.pos_open_rad,
+            "travel_range_rad": abs(self._config.pos_open_rad
+                                    - self._config.pos_closed_rad),
+            "rad_to_mm": self._config.rad_to_mm,
+            "work_stroke_mm": self._config.work_stroke_mm,
+            "kp": self._config.kp,
+            "kd": self._config.kd,
+        }
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        log.info("Calibration saved to %s", path)
+        return path
 
     # ═══════════════════════════════════════════════════════════════════
-    # State
+    # Motion
+    # ═══════════════════════════════════════════════════════════════════
+
+    def open(self, speed_mm_s: Optional[float] = None) -> bool:
+        """Open the gripper toward the calibrated open limit.
+
+        A continuous ramp; the command is capped at the calibrated travel, so
+        the jaws can never be driven past it.  If ``work_stroke_mm`` is set and
+        smaller than the travel, the move stops there instead of pressing the
+        limit.
+
+        Args:
+            speed_mm_s: Opening speed; ``None`` uses ``MotionConfig.speed_mm_s``.
+
+        Returns:
+            True when the jaws pressed and parked near the calibrated open
+            limit (or reached the work stroke) without tripping the stall
+            guard.  False otherwise; the reason is logged.
+        """
+        self._check_connected()
+        result = self._actions.open(speed_mm_s)
+        self._report_move("open", result)
+        return result.ok
+
+    def close(self, speed_mm_s: Optional[float] = None) -> bool:
+        """Close the gripper toward the calibrated closed limit.
+
+        A continuous ramp with the command capped at the calibrated travel; the
+        jaws park on the closed limit and press lightly.  Use :meth:`grasp` to
+        close onto an object with a set force.
+
+        Args:
+            speed_mm_s: Closing speed; ``None`` uses ``MotionConfig.speed_mm_s``.
+
+        Returns:
+            True when the jaws pressed and parked near the calibrated closed
+            limit.  False otherwise; the reason is logged.
+        """
+        self._check_connected()
+        result = self._actions.close(speed_mm_s)
+        self._report_move("close", result)
+        return result.ok
+
+    def set_gripper_distance(self, distance_mm: float,
+                             speed_mm_s: Optional[float] = None) -> bool:
+        """Move to an absolute opening in millimetres (0 = fully closed).
+
+        Normal positioning between the calibrated limits: no limit press, and
+        the target is clamped into the calibrated travel.
+
+        Args:
+            distance_mm: Opening from the closed zero, in mm.
+            speed_mm_s: Travel speed; ``None`` uses
+                ``MotionConfig.speed_mm_s``.
+
+        Returns:
+            True when the jaws reached the target and did not stall.
+
+        Raises:
+            CommandError: ``distance_mm`` is not finite, or the configuration
+                is uncalibrated.
+        """
+        return self._set_position(distance_mm, speed_mm_s, distance=True)
+
+    def set_motor_angle(self, angle_rad: float,
+                        speed_mm_s: Optional[float] = None) -> bool:
+        """Move to an absolute motor angle in radians.
+
+        Normal positioning between the calibrated limits: no limit press, and
+        the target is clamped into the calibrated travel.
+
+        Args:
+            angle_rad: Target motor angle in rad.
+            speed_mm_s: Travel speed; ``None`` uses
+                ``MotionConfig.speed_mm_s``.
+
+        Returns:
+            True when the jaws reached the target and did not stall.
+
+        Raises:
+            CommandError: ``angle_rad`` is not finite, or the configuration is
+                uncalibrated.
+        """
+        return self._set_position(angle_rad, speed_mm_s, distance=False)
+
+    def follow_gripper_distance(
+        self,
+        distance_mm: float,
+        kp: Optional[float] = None,
+        kd: Optional[float] = None,
+        dq: float = 0.0,
+        tau: float = 0.0,
+        force_feedback: Optional[Callable[[float], None]] = None,
+    ) -> bool:
+        """Send one MIT follow frame for teleoperation, in millimetres.
+
+        This is the streaming primitive the teleoperation loop calls at its own
+        cadence (typically 100–200 Hz), one frame per call.  It does **not**
+        ramp, settle, wait for motion, or read the bus.  The caller owns the
+        loop, the leader-side reading and the watchdog.
+
+        ``distance_mm`` is an absolute opening from the closed zero and is
+        interpreted with **this** gripper's calibration, so a leader may send
+        its own :meth:`get_gripper_distance` even when the two calibration
+        files differ in zero, direction or scale.  A follower with a shorter
+        physical stroke still clamps at its own travel; for different strokes
+        use a normalised opening in the caller.
+
+        The target is clamped into the calibrated travel, exactly like the
+        positioning commands.  The frame is refused before any bus write when
+        a value is non-finite or out of range.
+
+        Args:
+            distance_mm: Target opening from the closed zero in mm (0 = closed).
+            kp: Position stiffness; ``None`` uses ``config.kp``.
+            kd: Velocity damping; ``None`` uses ``config.kd``.
+            dq: Velocity feed-forward in rad/s, ``|dq| <= 10``.
+            tau: Torque feed-forward in Nm, ``|tau| <= 3.5``.
+            force_feedback: Optional callback called with the follower's
+                measured squeeze (N) after the frame is sent.  ``None``
+                (default) disables it.  The callback normally forwards to the
+                leader's :meth:`render_force_feedback`; it runs on the caller's
+                thread and its exceptions propagate.
+
+        Returns:
+            True when the frame was sent.  A ``False`` return leaves the
+            transport cause in :attr:`last_send_error`; it does not mean the
+            motor accepted the frame — the bus is one-way for commands.
+
+        Raises:
+            NotInitializedError: not connected or not enabled.
+            CommandError: uncalibrated, a non-finite value, or a value outside
+                the bounds above.
+
+        Example::
+
+            while running:
+                leader_mm = leader.get_gripper_distance()   # or a Pika Sense
+                follower.follow_gripper_distance(leader_mm)
+                time.sleep(0.005)
+        """
+        self._check_connected()
+        self._check_enabled()
+        _check_calibrated(self._config)
+
+        kp_v = self._config.kp if kp is None else float(kp)
+        kd_v = self._config.kd if kd is None else float(kd)
+        dq_v = float(dq)
+        tau_v = float(tau)
+
+        values = (("distance_mm", float(distance_mm)), ("kp", kp_v),
+                  ("kd", kd_v), ("dq", dq_v), ("tau", tau_v))
+        for name, value in values:
+            if not math.isfinite(value):
+                raise CommandError(
+                    f"follow_gripper_distance 的 {name} 不是有限数：{value!r}")
+        if not 0.0 <= kp_v <= _FOLLOW_KP_MAX:
+            raise CommandError(
+                f"follow_gripper_distance 的 kp 必须在 "
+                f"0..{_FOLLOW_KP_MAX}：{kp_v!r}")
+        if not 0.0 <= kd_v <= _FOLLOW_KD_MAX:
+            raise CommandError(
+                f"follow_gripper_distance 的 kd 必须在 "
+                f"0..{_FOLLOW_KD_MAX}：{kd_v!r}")
+        if abs(dq_v) > _FOLLOW_DQ_MAX_RAD_S:
+            raise CommandError(
+                f"follow_gripper_distance 的 |dq| 不能超过 "
+                f"{_FOLLOW_DQ_MAX_RAD_S} rad/s：{dq_v!r}")
+        if abs(tau_v) > _FOLLOW_TAU_MAX_NM:
+            raise CommandError(
+                f"follow_gripper_distance 的 |tau| 不能超过 "
+                f"{_FOLLOW_TAU_MAX_NM} Nm：{tau_v!r}")
+
+        target_rad = (self._config.pos_closed_rad
+                      - self._config.close_sign * float(distance_mm)
+                      / self._config.rad_to_mm)
+        target = clamp_to_travel(self._config, target_rad)
+        sent = self._send_mit_frame(target, kp_v, kd_v, dq_v, tau_v)
+        if sent and force_feedback is not None:
+            force_feedback(self.get_gripper_force())
+        return sent
+
+    def get_gripper_force(self) -> float:
+        """Measured squeeze in N (approximate; cached, non-blocking).
+
+        This is the follower-side value to forward to the leader's
+        :meth:`render_force_feedback`.  It is derived from motor torque
+        (about 10 N per Nm), not a fingertip force sensor.
+
+        Raises:
+            NotInitializedError: not connected.
+        """
+        return self.get_state(wait=False).force_n
+
+    def configure_force_feedback(
+        self,
+        enabled: bool = False,
+        gain_nm_per_n: float = 0.10,
+        threshold_n: float = 2.0,
+        max_tau_nm: float = 1.0,
+        damping: float = 0.1,
+        timeout_s: float = 0.3,
+    ) -> None:
+        """Configure leader-side force-feedback rendering.
+
+        **Disabled by default.**  Call this on the leader (the gripper the
+        operator moves) before :meth:`render_force_feedback`.
+
+        Args:
+            enabled: Turn rendering on.  ``False`` (default) makes
+                :meth:`render_force_feedback` a no-op returning ``False``.
+            gain_nm_per_n: Leader torque per newton above the threshold.
+            threshold_n: Squeeze below which the leader feels nothing.
+            max_tau_nm: Ceiling on the rendered resistance, Nm (0..3.5).
+            damping: Leader velocity damping while in contact (0..5).
+            timeout_s: Feedback age beyond which rendering is dropped.
+
+        Raises:
+            CommandError: a value is non-finite or outside its range.
+        """
+        values = (("gain_nm_per_n", float(gain_nm_per_n)),
+                  ("threshold_n", float(threshold_n)),
+                  ("max_tau_nm", float(max_tau_nm)),
+                  ("damping", float(damping)),
+                  ("timeout_s", float(timeout_s)))
+        for name, value in values:
+            if not math.isfinite(value):
+                raise CommandError(
+                    f"configure_force_feedback 的 {name} 不是有限数：{value!r}")
+        if values[0][1] < 0.0:
+            raise CommandError("configure_force_feedback: gain_nm_per_n >= 0")
+        if values[1][1] < 0.0:
+            raise CommandError("configure_force_feedback: threshold_n >= 0")
+        if not 0.0 <= values[2][1] <= _FOLLOW_TAU_MAX_NM:
+            raise CommandError(
+                f"configure_force_feedback: max_tau_nm 必须在 "
+                f"0..{_FOLLOW_TAU_MAX_NM}")
+        if not 0.0 <= values[3][1] <= _FOLLOW_KD_MAX:
+            raise CommandError(
+                f"configure_force_feedback: damping 必须在 0..{_FOLLOW_KD_MAX}")
+        if values[4][1] <= 0.0:
+            raise CommandError("configure_force_feedback: timeout_s > 0")
+
+        self._feedback_enabled = bool(enabled)
+        self._feedback_gain_nm_per_n = values[0][1]
+        self._feedback_threshold_n = values[1][1]
+        self._feedback_max_tau_nm = values[2][1]
+        self._feedback_damping = values[3][1]
+        self._feedback_timeout_s = values[4][1]
+
+    def render_force_feedback(self, force_n: float,
+                              age_s: float = 0.0) -> bool:
+        """Render the follower's squeeze on the leader as one MIT frame.
+
+        Sends ``kp=0``, ``kd=damping``, ``tau=-close_sign * magnitude`` — pure
+        resistance plus viscous braking, no position hold.  This is the leader
+        side of the force-feedback pair; the follower sends its
+        :meth:`get_gripper_force` value (for example through
+        ``follow_gripper_distance(..., force_feedback=...)``).
+
+        **Disabled by default**: returns ``False`` and sends nothing until
+        :meth:`configure_force_feedback` enables it.
+
+        Args:
+            force_n: Follower squeeze in N.  Below the configured threshold
+                the frame is a free (zero-gain) frame.
+            age_s: Age of the force sample.  Older than ``timeout_s`` drops the
+                resistance and damping, so a dead link cannot pin the hand.
+
+        Returns:
+            True when a frame was sent, False when feedback is disabled or the
+            transport failed (cause in :attr:`last_send_error`).
+
+        Raises:
+            NotInitializedError: enabled but not connected/enabled.
+            CommandError: uncalibrated, or a non-finite / negative input.
+        """
+        if not self._feedback_enabled:
+            return False
+        self._check_connected()
+        self._check_enabled()
+        _check_calibrated(self._config)
+
+        force_v = float(force_n)
+        age_v = float(age_s)
+        if not math.isfinite(force_v):
+            raise CommandError(
+                f"render_force_feedback 的 force_n 不是有限数：{force_v!r}")
+        if not math.isfinite(age_v) or age_v < 0.0:
+            raise CommandError(
+                f"render_force_feedback 的 age_s 必须是有限的非负数：{age_v!r}")
+
+        tau_v = 0.0
+        kd_v = 0.0
+        if age_v <= self._feedback_timeout_s:
+            squeeze = max(0.0, force_v - self._feedback_threshold_n)
+            magnitude = min(squeeze * self._feedback_gain_nm_per_n,
+                            self._feedback_max_tau_nm)
+            if magnitude > 0.0:
+                tau_v = -self._config.close_sign * magnitude
+                kd_v = self._feedback_damping
+        return self._send_mit_frame(0.0, 0.0, kd_v, 0.0, tau_v)
+
+    def grasp(self, force_n: Optional[float] = None,
+              hold_s: float = 0.0) -> bool:
+        """Adaptive grasp — close until stall, then hold with a set force.
+
+        Blocking.  The approach carries the force budget, so hitting an object
+        never presses harder than the setpoint; after contact the motor streams
+        a pure torque feed-forward of ``force_n × 0.1 Nm`` (no position or
+        velocity gain), ramped up from the torque in flight.  ``hold_s=0``
+        holds until :meth:`release`, a fault, or Ctrl+C.
+
+        Args:
+            force_n: Gripping force in N; ``None`` uses
+                ``MotionConfig.force_n``.  The N scale is approximate
+                (10 N per Nm, not calibrated).
+            hold_s: Hold duration in seconds; ``0`` = until release/fault.
+
+        Returns:
+            True only when the hold was established and ended normally.  False
+            on no-bite, travel guard, protection, or comm failure; the reason
+            is logged.
+        """
+        self._check_connected()
+        result = self._actions.grasp(force_n, hold_s)
+        if not result.ok:
+            reason = []
+            if result.no_bite:
+                reason.append("接近段没能脱离静摩擦（未夹到东西）")
+            if result.travel_guard:
+                reason.append("保力段越出闭合侧标定限位，已撤力")
+            if result.released:
+                reason.append("被 release() 结束")
+            if not result.reached and not result.stalled and not result.no_bite:
+                reason.append("闭合段既未到位也未堵转")
+            log.warning("grasp 未成功（%s）：force=%.1f N，stalled=%s，"
+                        "reached=%s，cycles=%d",
+                        "；".join(reason) or "保力被中断",
+                        result.force_n, result.stalled, result.reached,
+                        result.cycles)
+        return result.ok
+
+    def release(self, clearance_mm: float = 10.0) -> bool:
+        """End an in-progress :meth:`grasp` and open the jaws — thread-safe.
+
+        Callable from any thread, including while ``grasp(hold_s=0)`` blocks in
+        another one.  The jaws open from the pose where the grip was declared,
+        not from where the set force pressed them, by ``clearance_mm`` clamped
+        to the calibrated open limit.
+
+        Args:
+            clearance_mm: Extra opening beyond the grip pose, in mm; must be a
+                non-negative finite number.
+
+        Returns:
+            True when the release completed.  False on timeout or a failed
+            opening move; the reason is logged.
+        """
+        self._check_connected()
+        result = self._actions.release(clearance_mm)
+        if not result.ok:
+            log.warning("release 未完成：目标 %.1f mm（%.5f rad），实测 %.1f mm",
+                        result.opened_mm, result.target_rad,
+                        result.state.position_mm)
+        return result.ok
+
+    def _set_position(self, value: float, speed_mm_s: Optional[float],
+                      *, distance: bool) -> bool:
+        """Shared path for :meth:`set_gripper_distance` / :meth:`set_motor_angle`.
+
+        The finiteness check is deliberately above the clamp: ``min`` / ``max``
+        compare false against a NaN, so the clamp would answer it with one of
+        the calibrated limits — a real position that was never asked for.
+        """
+        self._check_connected()
+        self._check_enabled()
+        _check_calibrated(self._config)
+        name = "distance_mm" if distance else "angle_rad"
+        if not math.isfinite(value):
+            raise CommandError(
+                f"{name} 不是有限数：{value!r}。拒绝下发：NaN 落在限位 clamp "
+                "里会变成量程的一端，也就是一个调用方没要过的真实位置。")
+        if speed_mm_s is None:
+            speed = self._actions.config.speed_mm_s
+        else:
+            speed = speed_mm_s
+        if not math.isfinite(speed) or speed <= 0.0:
+            raise CommandError(
+                f"速度必须是正的有限数：speed_mm_s={speed!r}。速度为 0 或负的"
+                "移动没有对应的斜坡。")
+
+        if distance:
+            # Opening may increase or decrease the motor rad count depending on
+            # the mount; close_sign carries that.
+            target_rad = (self._config.pos_closed_rad
+                          - self._config.close_sign * value
+                          / self._config.rad_to_mm)
+            toward = "open" if value > 0.0 else "close"
+        else:
+            target_rad = value
+            toward = ("close"
+                      if abs(value - self._config.pos_closed_rad)
+                      <= abs(value - self._config.pos_open_rad) else "open")
+        result = self._actions.ramp_to(clamp_to_travel(self._config, target_rad),
+                                       speed_mm_s=speed)
+        label = "set_gripper_distance" if distance else "set_motor_angle"
+        if not result.ok:
+            log.warning(
+                "%s 未到位：目标 %.5f rad（%s），停在 %.5f rad；"
+                "reached=%s stalled=%s protected=%s", label,
+                result.target_rad, toward, result.state.position_rad,
+                result.reached, result.stalled, result.protected)
+        return result.ok
+
+    @staticmethod
+    def _report_move(label: str, result: MoveResult) -> None:
+        if result.ok:
+            return
+        log.warning(
+            "%s 未完成：停在 %.5f rad（目标 %.5f，限位 %.5f）；"
+            "reached=%s stalled=%s protected=%s", label,
+            result.state.position_rad, result.target_rad, result.limit_rad,
+            result.reached, result.stalled, result.protected)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Feedback
     # ═══════════════════════════════════════════════════════════════════
 
     def get_state(self, wait: bool = True) -> GripperState:
-        """Return the current gripper state, saying how fresh it is.
+        """Return the current state snapshot, saying how fresh it is.
 
         Args:
-            wait: If True (default), waits up to 50 ms for a status frame.
-                  If False, returns immediately with the last cached state
-                  (suitable for high-frequency control loops).
+            wait: ``True`` waits up to 0.5 s for a status frame; ``False``
+                returns immediately with the cached readings (suitable for
+                high-frequency control loops).
 
         ``wait=True`` asks for a frame; it does not guarantee one.  A motor
-        answers a *control* frame, so an idle bus — one holding a pose, or
-        disabled — says nothing, and the wait ends on the cached readings.  The
-        returned snapshot says which happened: ``fresh`` is False when no frame
-        arrived, ``data_age_s`` is the age of the frame the readings did come
-        from, and ``timestamp`` is that frame's arrival time, not this call's.
-        Call :meth:`refresh_status` first when the bus has been idle.
+        answers a *control* frame, so an idle bus says nothing and the wait
+        ends on the cached readings.  Check ``fresh`` / ``data_age_s`` before
+        trusting the numbers, and call :meth:`refresh_status` when the bus has
+        been idle.
 
-        Returns:
-            GripperState snapshot.
+        Raises:
+            NotInitializedError: not connected.
         """
         self._check_connected()
         if self._can is None:
-            return GripperState()
+            raise NotInitializedError("未连接")
+        can = self._can
 
         with self._io_lock:
             if wait:
-                answered = self._can.update_state(timeout_s=0.05)
+                answered = can.update_state(timeout_s=0.5)
             else:
-                answered = self._can.poll(timeout_s=0.0)
+                answered = can.poll(timeout_s=0.0)
 
-            position_rad = self._can.get_position()
-            velocity_rad_s = self._can.get_velocity()
-            torque_nm = self._can.get_torque()
-            error_code = self._can.get_error()
-            t_mos, t_coil = self._can.get_temperature()
+            position_rad = can.get_position()
+            velocity_rad_s = can.get_velocity()
+            torque_nm = can.get_torque()
+            error_code = can.get_error()
+            t_mos, t_coil = can.get_temperature()
 
-            # Both stamps come from the frame, not from this call. A duck-typed
-            # transport need not carry them, and then there is nothing to say:
-            # None age means "no frame to date the readings by".
-            last_update = getattr(self._can, "last_update", None)
-            frame_time = getattr(self._can, "last_frame_time", None)
-            # last_update is the monotonic stamp the receive path put on the
-            # frame, so the age has to be measured on that clock.
+            # Both stamps come from the frame, not from this call.
+            last_update = getattr(can, "last_update", None)
+            frame_time = getattr(can, "last_frame_time", None)
             data_age_s = (None if last_update is None
                           else time.monotonic() - last_update)
 
-            # pos_closed_rad = closed (0 mm), pos_open_rad = open (max mm).
-            # Which way the rad count runs depends on the mount, so close_sign
-            # sets the sign; the result is 0 mm at the closed limit and +stroke
-            # at the open limit for both mountings.
             s = self._config.close_sign
             position_mm = ((self._config.pos_closed_rad - position_rad)
                            * s * self._config.rad_to_mm)
-            # Squeeze is positive force: the sign flips with the mount too.
             force_n = s * torque_nm * UnitConversion.NM_TO_N
 
             return GripperState(
@@ -2063,7 +1014,6 @@ class LiteGrip:
                 temperature_mos=t_mos,
                 temperature_coil=t_coil,
                 error_code=error_code,
-                # 0.0 = no frame ever arrived (see GripperState.timestamp).
                 timestamp=0.0 if frame_time is None else frame_time,
                 position_mm=position_mm,
                 force_n=force_n,
@@ -2072,666 +1022,157 @@ class LiteGrip:
             )
 
     def refresh_status(self) -> bool:
-        """Ask the motor for a status frame (0xCC). Does not move the jaws.
+        """Ask the motor for a status frame (0xCC) and wait briefly for it.
 
-        Use it before :meth:`get_state` on an idle bus.  A motor answers the
-        control frames it receives, so a gripper holding a pose sends nothing on
-        its own and the status link goes quiet; this request makes it speak.
+        A gripper holding a pose sends nothing on its own, so an idle bus
+        yields only cached readings.  This is the request that makes it speak;
+        it does not move the jaws.
 
         Returns:
-            True if the request went out.  False when there is no connection or
-            the write failed — the same reporting as ``enable()``, since this
-            asks rather than commands.
-        """
-        self._check_connected()
-        if self._can is None:
-            return False
-        with self._io_lock:
-            return self._can.refresh_status()
+            True when the request went out **and** a status frame answered.
+            False when there is no connection or the write/read failed.
 
-    def get_position(self) -> float:
-        """Current position in mm."""
-        return self.get_state().position_mm
-
-    def get_position_rad(self) -> float:
-        """Current position in rad."""
-        self._check_connected()
-        if self._can is None:
-            return 0.0
-        self._can.update_state(timeout_s=0.05)
-        return self._can.get_position()
-
-    def get_force(self) -> float:
-        """Estimated gripping force in N."""
-        return self.get_state().force_n
-
-    def get_torque(self) -> float:
-        """Current motor torque in Nm."""
-        self._check_connected()
-        if self._can is None:
-            return 0.0
-        self._can.update_state(timeout_s=0.05)
-        return self._can.get_torque()
-
-    def get_error(self) -> int:
-        """Motor error code (0=disabled, 1=enabled, 0x9=UV, ...)."""
-        self._check_connected()
-        if self._can is None:
-            return -1
-        self._can.update_state(timeout_s=0.05)
-        return self._can.get_error()
-
-    def get_temperature(self) -> tuple[int, int]:
-        """Return (MOS_temp, Coil_temp) in °C."""
-        self._check_connected()
-        if self._can is None:
-            return 0, 0
-        self._can.update_state(timeout_s=0.05)
-        return self._can.get_temperature()
-
-    def get_info(self) -> GripperInfo:
-        """Return device metadata."""
-        return GripperInfo(
-            motor_type=self._motor_type.name,
-            can_id=self._can_id,
-            mst_id=self._mst_id or 0,
-        )
-
-    # ═══════════════════════════════════════════════════════════════════
-    # State predicates
-    # ═══════════════════════════════════════════════════════════════════
-
-    def is_moving(self) -> bool:
-        """True if the gripper is currently in motion."""
-        state = self.get_state()
-        return state.is_moving
-
-    def is_grasped(self) -> bool:
-        """True if torque exceeds the grasp-detection threshold."""
-        state = self.get_state()
-        return abs(state.torque_nm) > self._config.grasp_torque_threshold
-
-    def wait_for_ready(self, timeout: float = 5.0) -> bool:
-        """Block until the motor is enabled and not moving."""
-        if self._can is None:
-            return False
-        start = time.time()
-        while time.time() - start < timeout:
-            self._can.update_state(timeout_s=0.05)
-            err = self._can.get_error()
-            if err == 1 and not self.is_moving():
-                return True
-            time.sleep(0.05)
-        return False
-
-    # ═══════════════════════════════════════════════════════════════════
-    # Parameter access (expert)
-    # ═══════════════════════════════════════════════════════════════════
-
-    def read_param(self, rid: int, timeout_s: float = 0.5) -> float:
-        """Read a motor register by its RID (expert use).
-
-        See :class:`litegrip.can.protocol.DM_REG` for available registers.
+        Raises:
+            NotInitializedError: not connected.
         """
         self._check_connected()
         if self._can is None:
             raise NotInitializedError("未连接")
-        return self._can.read_param(rid, timeout_s=timeout_s)
+        with self._io_lock:
+            if not self._can.refresh_status():
+                log.warning("状态帧请求下发失败（%s）", self._channel)
+                return False
+            return bool(self._can.update_state(timeout_s=0.1))
 
-    # ═══════════════════════════════════════════════════════════════════
-    # Teleoperation (leader / follower)
-    # ═══════════════════════════════════════════════════════════════════
+    def get_motor_data(self) -> dict:
+        """Motor feedback as ``{"Position": rad, "Speed": rad/s, "Torque": Nm}``.
 
-    def teleop_start(
-        self,
-        mode: str,
-        *,
-        transport: Optional["TeleopTransport"] = None,
-        link: str = "zenoh",
-        host: Optional[str] = None,
-        port: int = DEFAULT_GRIP_PORT,
-        grip_id: str = DEFAULT_GRIP_ID,
-        kp: Optional[float] = None,
-        kd: Optional[float] = None,
-        align: bool = True,
-        align_speed_mm_s: float = DEFAULT_ALIGN_SPEED_MM_S,   # [遥操对齐块]
-        watchdog_s: float = 0.2,
-        dq_max: float = DEFAULT_DQ_MAX,
-        torque_limit_nm: float = DEFAULT_TORQUE_LIMIT_NM,
-        torque_guard_action: str = TORQUE_GUARD_HOLD,
-        lead_cap_mm: float = DEFAULT_LEAD_CAP_MM,             # [遥操对齐块]
-        require_ready: bool = True,
-        ready_timeout_s: float = DEFAULT_READY_TIMEOUT_S,
-        ready_tolerance_mm: float = DEFAULT_READY_TOLERANCE_MM,
-        ready_period_s: float = DEFAULT_READY_PERIOD_S,
-        force_feedback: bool = False,
-        feedback_gain_nm_per_n: float = DEFAULT_FEEDBACK_GAIN_NM_PER_N,
-        feedback_threshold_n: float = DEFAULT_FEEDBACK_THRESHOLD_N,
-        feedback_max_tau_nm: float = DEFAULT_FEEDBACK_MAX_TAU_NM,
-        feedback_damping: float = DEFAULT_FEEDBACK_DAMPING,
-        feedback_timeout_s: float = DEFAULT_FEEDBACK_TIMEOUT_S,
-        rate_hz: float = 50.0,
-    ) -> dict:
-        """Start leader/follower teleoperation on this gripper.
-
-        ``mode="master"`` (leader) publishes the opening and, once the follower
-        reports ready, makes the motor slack — the jaws can be pushed by hand.
-        ``mode="slave"`` (follower) receives the opening, follows it, and
-        announces when it has arrived.
-
-        Both ends must agree on ``grip_id``.  Teleoperation is exclusive: the
-        background loop owns the CAN I/O until :meth:`teleop_stop`, so do not
-        drive this gripper from the caller while it runs.
-
-        Args:
-            mode: ``"master"`` or ``"slave"``.
-            transport: A :class:`~litegrip.TeleopTransport`.  When omitted, one
-                is built from ``link``.  An injected transport is never closed
-                by this class.
-            link: ``"zenoh"`` (default) builds the point-to-point zenoh link
-                used by the field teleoperation — see
-                :mod:`litegrip.zenoh_link`, needs ``pip install litegrip-python[zenoh]``.
-                ``"udp"`` builds the plain-UDP transport, for a trusted LAN.
-            host: The peer's address.  Required for a ``slave``; the master only
-                listens, so it needs no host.
-            port: TCP (zenoh) or UDP port.
-            grip_id: Topic id shared by both ends.
-            kp, kd: Follow gains (slave).  ``None`` uses the calibration's own.
-            align: Slave only — align to the first received frame before
-                following.
-            align_speed_mm_s: Slave only — speed of that align move, in mm/s of
-                jaw travel.  Must be > 0.
-            watchdog_s: Slave only — hold position after this long without a
-                fresh frame.
-            dq_max: Slave only — ceiling in rad/s on the leader velocity fed
-                forward to the follower.  ``0`` disables the feedforward.
-            torque_limit_nm: Slave only — ceiling in Nm on the follower's own
-                torque; held over it the follower acts per
-                ``torque_guard_action``.  ``0`` disables the guard.  See
-                :class:`~litegrip.GripperTeleop`.
-            torque_guard_action: Slave only — ``"hold"`` (default) keeps
-                pressing with a bounded pure-torque frame so a grasp survives;
-                ``"release"`` drops to zero stiffness and lets go, the previous
-                behaviour.
-            lead_cap_mm: Slave only — ceiling in mm on how far the *align*
-                command may lead the measured position, which bounds the align
-                torque.  The follow loop is not capped.  ``0`` disables the cap.
-            require_ready: Master only — hold the jaws under gain (not
-                hand-movable) until the follower announces it has arrived,
-                rather than going slack from the first cycle.
-            ready_timeout_s: Master only — seconds to wait for that
-                announcement before releasing the hand-back anyway with a
-                warning; ``0`` waits indefinitely.  A bounded default keeps an
-                older follower that never announces from stalling a new leader.
-            ready_tolerance_mm: Slave only — arrival tolerance for announcing
-                ready, in mm of travel.
-            ready_period_s: Slave only — how often to republish the ready state.
-            force_feedback: Send the follower's squeeze back and render it on
-                the leader as resistance.  Needs the zenoh link (the UDP master
-                is publish-only and silently runs without it).
-            feedback_gain_nm_per_n: Leader torque per newton of follower
-                squeeze above the threshold.  ``0`` disables it.
-            feedback_threshold_n: Follower squeeze below which the leader feels
-                nothing.
-            feedback_max_tau_nm: Ceiling on the leader's rendered resistance.
-            feedback_damping: Leader damping applied only during contact.
-            feedback_timeout_s: Age past which the force is ignored and both
-                torque and damping drop to zero.
-            rate_hz: Loop rate.
-
-        Returns:
-            The initial :meth:`teleop_status` snapshot.
+        Reads the cached snapshot without waiting; call :meth:`refresh_status`
+        first when the bus has been idle.  Use :meth:`get_state` when the
+        freshness flags matter.
 
         Raises:
-            TeleopNotReady: uncalibrated, zero travel, or ``rad_to_mm == 0``.
-            TeleopBusyError: teleoperation is already running.
-            NotInitializedError: not connected or not enabled.
-            ValueError: a negative ``torque_limit_nm`` / ``lead_cap_mm`` /
-                ``ready_timeout_s`` / ``ready_tolerance_mm``, a non-positive
-                ``ready_period_s``, or an ``align_speed_mm_s`` that is not
-                positive.
+            NotInitializedError: not connected.
         """
-        from .teleop import (GripperTeleop, TeleopBusyError, check_ready,
-                             feedback_topic, ready_topic, teleop_topic)
-        from .teleop import UdpTeleopTransport
+        state = self.get_state(wait=False)
+        return {
+            "Position": state.position_rad,
+            "Speed": state.velocity_rad_s,
+            "Torque": state.torque_nm,
+        }
 
+    def get_motor_status(self) -> dict:
+        """Status frame summary.
+
+        Keys: ``Status`` (hex string, e.g. ``"0x01"``), ``DriverTemp`` (°C,
+        MOS) and ``MotorTemp`` (°C, coil).  Cached and non-blocking; call
+        :meth:`refresh_status` for a fresh frame.
+
+        Raises:
+            NotInitializedError: not connected.
+        """
+        state = self.get_state(wait=False)
+        return {
+            "Status": f"0x{state.error_code:02X}",
+            "DriverTemp": int(state.temperature_mos),
+            "MotorTemp": int(state.temperature_coil),
+        }
+
+    def get_motor_position(self) -> float:
+        """Current motor angle in radians (cached, non-blocking)."""
+        return self.get_state(wait=False).position_rad
+
+    def get_motor_speed(self) -> float:
+        """Current motor speed in rad/s (cached, non-blocking)."""
+        return self.get_state(wait=False).velocity_rad_s
+
+    def get_motor_torque(self) -> float:
+        """Current motor torque in Nm (cached, non-blocking)."""
+        return self.get_state(wait=False).torque_nm
+
+    def get_gripper_distance(self) -> float:
+        """Opening in mm from the closed zero (0 = closed; cached)."""
+        return self.get_state(wait=False).position_mm
+
+    def get_driver_temp(self) -> int:
+        """MOS/driver temperature in °C (cached, non-blocking)."""
+        return int(self.get_state(wait=False).temperature_mos)
+
+    def get_motor_temp(self) -> int:
+        """Motor coil temperature in °C (cached, non-blocking)."""
+        return int(self.get_state(wait=False).temperature_coil)
+
+    def get_status_raw(self) -> str:
+        """Raw status/error code of the newest frame, as a hex string."""
+        return f"0x{self.get_state(wait=False).error_code:02X}"
+
+    def get_version(self) -> str:
+        """SDK/package version — **not** the device firmware version.
+
+        The DM4310 does not expose a firmware readout over this protocol, so
+        this reports the installed ``litegrip-python`` distribution version
+        (``"0.0.0+source"`` when running from a bare checkout).
+        """
+        from . import __version__
+        return __version__
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Internal hooks used by the motion engine
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _send_mit_frame(self, q: float, kp: float, kd: float,
+                        dq: float = 0.0, tau: float = 0.0) -> bool:
+        """Send one MIT frame; the reason for a ``False`` lands in
+        :attr:`last_send_error`."""
+        if self._can is None:
+            self._last_send_error = self._not_connected_error()
+            return False
+        if not self._enabled:
+            self._last_send_error = self._not_enabled_error()
+            return False
+        with self._io_lock:
+            sent = self._can.control_mit(
+                q_target=q, kp=kp, kd=kd, dq_target=dq, tau_feedforward=tau)
+            self._last_send_error = (
+                None if sent else getattr(self._can, "last_send_error", None))
+            return sent
+
+    def _enable_once(self) -> bool:
+        """One enable attempt: full init (disable → MIT → enable → feedback).
+
+        Raises:
+            HardwareError: the motor did not end up enabled.
+        """
         self._check_connected()
-        self._check_enabled()
-        if mode not in ("master", "slave"):
-            raise ValueError(f"mode must be 'master' or 'slave', got {mode!r}")
-        # Before anything is enabled or driven: ``send_mit_frame`` does not
-        # check ``calibrated`` itself (``goto_rad`` now does).
-        check_ready(self.config)
-        if self._teleop is not None and self._teleop.is_running:
-            raise TeleopBusyError("teleop is already running")
-        self._claim_session("teleop", TeleopBusyError)
+        if self._can is None:
+            raise NotInitializedError("未连接")
 
-        # Everything from here to the running loop is inside one try: the
-        # session was claimed above, and a transport that refuses (a bad link,
-        # a missing host, a port already bound) would otherwise leave the slot
-        # claimed for the life of the process, refusing every later teleop,
-        # record and replay in turn.
+        self._can.update_state(timeout_s=0.05)
+        err = self._can.get_error()
+        if err not in (0, 1):
+            self.clear_fault()
+
         try:
-            key = teleop_topic(grip_id)
-            ready_key = ready_topic(grip_id)
-            # Declared on every session, even with the feature off: the leader's
-            # zenoh endpoint is resident and its key set cannot change later.
-            # An unused key costs nothing and a later session that enables
-            # feedback then just works.
-            feedback_key = feedback_topic(grip_id)
-            created_transport = None
-            if transport is None:
-                if link == "zenoh":
-                    if mode == "master":
-                        # ⚠ 常驻 publisher **不登记**成 per-session transport：登记了
-                        #    `teleop_stop` 就会 close 它，而 `_teleop_pub` 仍指向这个
-                        #    已死的端点 ⇒ 此后每一轮都在往死会话里 put。（真机实测：
-                        #    第一次配对正常，之后每次从端 0 帧。）常驻端点的生命周期
-                        #    只归 `disconnect()` → `_close_teleop_pub()`。
-                        transport = self._open_teleop_pub(port, key, ready_key,
-                                                          feedback_key)
-                    else:
-                        transport = _zenoh_transport("slave", key, port, host,
-                                                     ready_key, feedback_key)
-                        created_transport = transport
-                elif link == "udp":
-                    if host is None:
-                        raise ValueError("host is required for the udp link")
-                    addr = f"{host}:{port}"
-                    if mode == "master":
-                        # Publish-only: with no bind there is no receive path, so
-                        # the readiness gate disables itself (see
-                        # ``GripperTeleop._open_ready_sub``) and the leader goes
-                        # slack as it always did.  Carrying ready over UDP would
-                        # need a second port for the reverse direction.
-                        transport = UdpTeleopTransport(pub_addr=addr)
-                    else:
-                        transport = UdpTeleopTransport(bind_addr=addr)
-                    created_transport = transport
-                else:
-                    raise ValueError(
-                        f"link must be 'zenoh' or 'udp', got {link!r}")
-
-            manager = GripperTeleop(
-                self, transport, mode, key,
-                rate_hz=rate_hz, kp=kp, kd=kd, align=align,
-                align_speed_mm_s=align_speed_mm_s,                      # [遥操对齐块]
-                watchdog_s=watchdog_s, dq_max=dq_max,
-                torque_limit_nm=torque_limit_nm, lead_cap_mm=lead_cap_mm,  # [遥操对齐块]
-                torque_guard_action=torque_guard_action,
-                ready_topic=ready_key, require_ready=require_ready,
-                ready_timeout_s=ready_timeout_s,
-                ready_tolerance_mm=ready_tolerance_mm,
-                ready_period_s=ready_period_s,
-                force_feedback=force_feedback,
-                feedback_topic=feedback_key,
-                feedback_gain_nm_per_n=feedback_gain_nm_per_n,
-                feedback_threshold_n=feedback_threshold_n,
-                feedback_max_tau_nm=feedback_max_tau_nm,
-                feedback_damping=feedback_damping,
-                feedback_timeout_s=feedback_timeout_s)
-            manager.start()
-        except BaseException:
-            self._release_session("teleop")
+            self._enabled = self._can.initialize()
+            return self._enabled
+        except HardwareError:
             raise
-        self._teleop = manager
-        self._teleop_transport = created_transport
-        return manager.status()
+        except Exception as e:
+            raise HardwareError(f"使能失败: {e}") from e
 
-    def _open_teleop_pub(self, port: int, key: str,
-                         ready_key: Optional[str] = None,
-                         feedback_key: Optional[str] = None) -> "TeleopTransport":
-        """Return the leader's resident publisher, building it on first use.
-
-        ⚠ **Resident, not per session.**  Rebuilding the zenoh listener on every
-        session leaves the port bound and makes publisher↔subscriber matching
-        fail intermittently; keeping one for the life of the gripper removes
-        both.  The consequence is that the zenoh keys are fixed by the first
-        session — a later session with a different ``grip_id`` would mismatch
-        them, which the transport reports rather than silently ignoring.
-        """
-        if self._teleop_pub is None:
-            self._teleop_pub = _zenoh_transport("master", key, port, None,
-                                                ready_key, feedback_key)
-        return self._teleop_pub
-
-    def _close_teleop_pub(self) -> None:
-        pub, self._teleop_pub = self._teleop_pub, None
-        if pub is not None:
-            try:
-                pub.close()
-            except Exception as e:  # noqa: BLE001
-                log.debug("teleop publisher close failed: %s", e)
-
-    def teleop_stop(self, timeout: float = 2.0) -> dict:
-        """Stop teleoperation and leave the gripper holding its position.
-
-        Neither side disables: the master leaves zero-gravity mode and the slave
-        sends one final frame at its current angle, so the jaws hold under gain.
-        The leader's resident publisher is **not** closed here — only the
-        per-session subscriber is.
-        """
-        manager = self._teleop
-        if manager is None:
-            return {"active": False, "mode": None}
-        manager.stop(timeout=timeout)
-        self._teleop = None
-        self._release_session("teleop")
-        if self._teleop_transport is not None:
-            try:
-                self._teleop_transport.close()
-            except Exception as e:  # noqa: BLE001
-                log.debug("teleop transport close failed: %s", e)
-            self._teleop_transport = None
-        return manager.status()
-
-    def teleop_status(self) -> dict:
-        """Snapshot of the running teleoperation, or ``{"active": False}``."""
-        if self._teleop is None:
-            return {"active": False, "mode": None}
-        return self._teleop.status()
-
-    # ═══════════════════════════════════════════════════════════════════
-    # Trajectory record and replay
-    # ═══════════════════════════════════════════════════════════════════
-    #
-    # Teach a motion once, repeat it later.  See litegrip.trajectory for what
-    # the recording stores and, importantly, what a replay does *not*
-    # reproduce (force).
-
-    def record_start(
-        self,
-        rate_hz: float = 100.0,
-        zero_gravity: bool = True,
-        max_samples: Optional[int] = None,
-    ) -> dict:
-        """Begin recording this gripper's motion, in the background.
-
-        With ``zero_gravity=True`` — the hand-teaching mode — the recorder
-        itself streams zero-torque frames so the jaws can be pushed by hand.
-        Do not drive the gripper from the caller while that runs.  With
-        ``zero_gravity=False`` the recorder only *reads* state, so the caller is
-        free to drive the gripper from another thread and capture a
-        programmatic move; only the sampling touches the bus.
-
-        Recording is exclusive with teleoperation and replay.
-
-        Args:
-            rate_hz: Samples per second (default 100).
-            zero_gravity: Stream zero-torque frames, leaving the jaws
-                back-drivable by hand.
-            max_samples: Stop by itself after this many samples; ``None``
-                records until :meth:`record_stop`.
-
-        Returns:
-            The initial :meth:`trajectory_status` snapshot.
-
-        Raises:
-            TrajectoryBusyError: another session (teleop, record, play) is running.
-            NotInitializedError: not connected or not enabled.
-            TrajectoryError: the unit is not calibrated, so the normalised
-                opening a sample stores would be a guess.
-        """
-        from .trajectory import (TrajectoryBusyError, TrajectoryError,
-                                 TrajectoryRecorder)
-
+    def _disable_once(self) -> bool:
+        """Send a single disable command and clear the enabled flag."""
         self._check_connected()
-        self._check_enabled()
-        if not self._config.calibrated:
-            raise TrajectoryError(
-                "未标定 —— 轨迹记录的是按行程归一化的张开度, 没有标定就算不出来; "
-                "先 load_calibration() 或 zero()")
-        self._claim_session("record", TrajectoryBusyError)
+        if self._can is None:
+            self._enabled = False
+            return False
         try:
-            recorder = TrajectoryRecorder(
-                self, rate_hz=rate_hz, zero_gravity=zero_gravity,
-                max_samples=max_samples)
-            recorder.start()
-        except BaseException:
-            self._release_session("record")
-            raise
-        self._trajectory_recorder = recorder
-        return recorder.status()
-
-    def record_stop(self, allow_empty: bool = False) -> "Trajectory":
-        """Stop recording and return the captured trajectory.
-
-        Args:
-            allow_empty: Return an empty trajectory instead of raising when
-                nothing was captured.  For a deliberate start-then-immediately-
-                stop; a capture that was *meant* to contain motion should be
-                allowed to raise.
-
-        Returns:
-            The recorded :class:`~litegrip.Trajectory`.
-
-        Raises:
-            TrajectoryNotActiveError: nothing is being recorded.
-            TrajectoryRecordingError: the sampling loop died — a partial
-                capture is never returned as if it were whole.
-            TrajectoryEmptyError: no samples were captured.
-        """
-        from .trajectory import TrajectoryNotActiveError
-
-        recorder = self._trajectory_recorder
-        if recorder is None:
-            raise TrajectoryNotActiveError("没有正在进行的录制")
-        recorder.stop()
-        self._trajectory_recorder = None
-        self._release_session("record")
-        return recorder.result(allow_empty=allow_empty)
-
-    def record(
-        self,
-        duration_s: float,
-        rate_hz: float = 100.0,
-        zero_gravity: bool = True,
-    ) -> "Trajectory":
-        """Hand-teach a motion: record for *duration_s* seconds, return it.
-
-        Blocking.  Zero-gravity is on, so the jaws go slack and you push them
-        through the motion by hand while the samples are taken.  The call
-        returns once the capture is complete; if it did not fill, it raises and
-        says how many samples it got rather than returning a short recording.
-
-        Args:
-            duration_s: How many seconds to record.  The gripper is slack for
-                that long — keep a hand on it, and be aware that the jaws hold
-                nothing while it is slack.
-            rate_hz: Samples per second (default 100).
-            zero_gravity: ``False`` only if something else drives the gripper
-                during the recording — see :meth:`record_start`.
-
-        Raises:
-            ValueError: ``duration_s <= 0``.
-            TrajectoryBusyError: another session is running.
-            NotInitializedError: not connected or not enabled.
-            TrajectoryError: the unit is not calibrated.
-            TrajectoryRecordingError: the capture did not fill.
-
-        Example::
-
-            with LiteGrip("can0") as gripper:
-                gripper.load_calibration()
-                gripper.enable()
-                taught = gripper.record(5.0)      # push the jaws by hand
-                taught.save("pick")               # ~/.litegrip/trajectories/pick.lgt
-                gripper.play(taught)              # repeat it
-        """
-        duration_s = float(duration_s)
-        if duration_s <= 0.0:
-            raise ValueError(f"duration_s 需 > 0 (给的是 {duration_s})")
-        target = max(1, int(round(duration_s * float(rate_hz))))
-
-        self.record_start(rate_hz=rate_hz, zero_gravity=zero_gravity,
-                          max_samples=target)
-        recorder = self._trajectory_recorder
-        try:
-            recorder.wait_for(target, timeout=duration_s * 1.5 + 3.0)
-        except BaseException:
-            # Never leave the jaws slack and the session claimed because the
-            # capture went wrong — clean up, then let the error through.
-            recorder.stop()
-            self._trajectory_recorder = None
-            self._release_session("record")
-            raise
-        return self.record_stop()
-
-    def play_start(
-        self,
-        trajectory: "Trajectory",
-        speed: float = 1.0,
-        kp: Optional[float] = None,
-        kd: Optional[float] = None,
-        loop: bool = False,
-        align: bool = True,
-    ) -> dict:
-        """Replay a trajectory in the background.
-
-        Only position is replayed: the recorded torque and velocity are
-        diagnostics, never feed-forward, so a motion recorded while gripping an
-        object replays as a position path and *not* as the same gripping force.
-        Follow it with :meth:`grasp` if the force matters.
-
-        Args:
-            trajectory: A :class:`~litegrip.Trajectory`, from :meth:`record_stop`
-                or :meth:`~litegrip.Trajectory.load`.
-            speed: Timing multiplier; ``0.5`` plays at half speed.
-            kp, kd: Gains for the replay frames; ``None`` uses the configured ones.
-            loop: Restart at the end instead of stopping.  A one-sample
-                trajectory is a pose, so looping it holds that opening.
-            align: Walk to the trajectory's first opening before following, at
-                ``motion_config.speed_mm_s`` and under its lead cap, so the first
-                frame is not a full-torque step from wherever the jaws are.
-
-        Returns:
-            The initial :meth:`trajectory_status` snapshot.
-
-        Raises:
-            TrajectoryBusyError: another session is running.
-            TrajectoryEmptyError: the trajectory has no samples.
-            ValueError: ``speed <= 0``.
-            NotInitializedError: not connected or not enabled.
-            TrajectoryError: the unit is not calibrated — the opening has to be
-                converted back through *this* gripper's travel, and with the
-                placeholder limits that conversion is a guess.
-        """
-        from .trajectory import (TrajectoryBusyError, TrajectoryError,
-                                 TrajectoryPlayer)
-
-        self._check_connected()
-        self._check_enabled()
-        if not self._config.calibrated:
-            raise TrajectoryError(
-                "未标定 —— 回放要把张开度按本机行程换算回角度, 没有标定就是瞎走; "
-                "先 load_calibration() 或 zero()")
-        self._claim_session("play", TrajectoryBusyError)
-        try:
-            player = TrajectoryPlayer(
-                self, trajectory, speed=speed, kp=kp, kd=kd, loop=loop,
-                align=align)
-            player.start()
-        except BaseException:
-            self._release_session("play")
-            raise
-        self._trajectory_player = player
-        return player.status()
-
-    def play(
-        self,
-        trajectory: "Trajectory",
-        speed: float = 1.0,
-        kp: Optional[float] = None,
-        kd: Optional[float] = None,
-        loop: bool = False,
-        align: bool = True,
-    ) -> dict:
-        """Replay a trajectory once, blocking until it finishes.
-
-        The last frame holds the final position under the configured gains, but
-        it is *one* frame: the motor self-locks a communication-loss fault about
-        100 ms after the frames stop.  Call the next action promptly, or use
-        :meth:`play_start` with ``loop=True`` for a hold that lasts until
-        :meth:`play_stop`.
-
-        Args:
-            loop: Must be ``False``.  A blocking replay of a looping trajectory
-                never returns; use :meth:`play_start` for that.
-
-        Returns:
-            The final :meth:`trajectory_status` snapshot.
-
-        Raises:
-            ValueError: ``loop`` is true, or ``speed <= 0``.
-            TrajectoryBusyError: another session is running.
-            TrajectoryEmptyError: the trajectory has no samples.
-            TrajectoryError: the unit is not calibrated, or the replay stopped
-                early — a send failed, or the sampling clock stalled.
-            NotInitializedError: not connected or not enabled.
-        """
-        from .teleop import travel_mm
-        from .trajectory import TrajectoryError
-
-        if loop:
-            raise ValueError(
-                "loop=True 的阻塞回放永远不会返回; 要循环播放用 "
-                "play_start(loop=True), 再用 play_stop() 停")
-        self.play_start(trajectory, speed=speed, kp=kp, kd=kd, loop=False,
-                        align=align)
-        player = self._trajectory_player
-        # Wall-clock pacing, plus the align walk and a margin for a slow first
-        # frame.  The align is a bounded-speed move over up to the whole travel,
-        # so budget its worst case rather than a flat second.  A stall guard of
-        # its own, so a stopped clock cannot hang here.
-        align_s = 0.0
-        align_speed_mm_s = float(getattr(self.motion_config, "speed_mm_s", 0.0) or 0.0)
-        if align and align_speed_mm_s > 0.0:
-            align_s = travel_mm(self._config) / align_speed_mm_s
-        budget = (abs(float(trajectory.duration)) / float(speed) * 1.5
-                  + align_s + 4.0)
-        try:
-            finished = player.wait(budget)
-        except BaseException:
-            # Ctrl+C during a long replay is the ordinary way out of this call.
-            # Without the stop the player keeps commanding the motor and the
-            # session stays claimed, so every later record/play is refused as
-            # busy until the process ends.
-            self.play_stop()
-            raise
-        status = self.play_stop()
-        if not finished:
-            raise TrajectoryError(
-                f"回放未在 {budget:.1f}s 内结束 (已发 {status.get('frames', 0)} 帧) "
-                f"—— 采样时钟可能停住了")
-        if status.get("error") is not None:
-            raise TrajectoryError(f"回放中止: {status['error']}")
-        return status
-
-    def play_stop(self, timeout: float = 2.0) -> dict:
-        """Stop a replay and leave the gripper holding its last target."""
-        player = self._trajectory_player
-        if player is None:
-            return {"active": False, "kind": None}
-        player.stop(timeout=timeout)
-        self._trajectory_player = None
-        self._release_session("play")
-        return player.status()
-
-    def trajectory_status(self) -> dict:
-        """Snapshot of the running recording or replay, or ``{"active": False}``.
-
-        One call for both directions: the ``kind`` key says which
-        (``"record"`` / ``"play"``), and only one of them can be running.
-        """
-        if self._trajectory_recorder is not None:
-            return self._trajectory_recorder.status()
-        if self._trajectory_player is not None:
-            return self._trajectory_player.status()
-        return {"active": False, "kind": None}
-
-    # ═══════════════════════════════════════════════════════════════════
-    # Internal
-    # ═══════════════════════════════════════════════════════════════════
+            result = self._can.disable()
+        except Exception as e:                           # noqa: BLE001
+            log.warning("失能命令下发失败：%s", e)
+            result = False
+        self._enabled = False
+        return result
 
     def _not_connected_error(self) -> NotInitializedError:
         return NotInitializedError(
@@ -2748,39 +1189,11 @@ class LiteGrip:
         if not self._enabled:
             raise self._not_enabled_error()
 
-    def _claim_session(self, owner: str, error: type) -> None:
-        """Take the single long-running session slot, or raise *error*.
-
-        Teleoperation, trajectory recording and trajectory replay all own the
-        CAN I/O for their duration.  Claiming happens under one lock, so two
-        threads starting different sessions at the same instant cannot both
-        pass the check and then both start.
-        """
-        with self._session_lock:
-            if self._session_owner is not None:
-                raise error(
-                    f"已有会话在运行 ({self._session_owner}) —— "
-                    f"teleop、录制、回放同一时刻只能有一个")
-            self._session_owner = owner
-
-    def _release_session(self, owner: str) -> None:
-        """Give the session slot back.  Harmless if *owner* no longer holds it."""
-        with self._session_lock:
-            if self._session_owner == owner:
-                self._session_owner = None
-
-    @property
-    def session(self) -> Optional[str]:
-        """Which long-running session is active: ``None``, ``"teleop"``,
-        ``"record"`` or ``"play"``.  For diagnostics and for a UI that has to
-        disable the controls that cannot run at the same time."""
-        return self._session_owner
-
     # ═══════════════════════════════════════════════════════════════════
     # Context manager
     # ═══════════════════════════════════════════════════════════════════
 
-    def __enter__(self) -> "LiteGrip":
+    def __enter__(self) -> "Gripper":
         self.connect()
         return self
 
@@ -2790,9 +1203,8 @@ class LiteGrip:
     def __repr__(self) -> str:
         status = "已连接" if self._connected else "未连接"
         enabled = "已使能" if self._enabled else "未使能"
-        mst = f"0x{self._mst_id:02X}" if self._mst_id else "auto"
-        return (f"LiteGrip(ch={self._channel}, CAN_ID=0x{self._can_id:02X}, "
-                f"MST_ID={mst}, {status}, {enabled})")
+        return (f"Gripper(ch={self._channel}, CAN_ID=0x{self._can_id:02X}, "
+                f"MST_ID=0x{self._mst_id:02X}, {status}, {enabled})")
 
     def __str__(self) -> str:
         return self.__repr__()

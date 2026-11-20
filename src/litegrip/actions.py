@@ -1,9 +1,9 @@
-"""LiteGrip 动作层 —— open / close / grasp / zero / enable / disable。
+"""LiteGrip 动作层 —— open / close / grasp / calibrate / enable / disable。
 
-高层 ``LiteGrip`` 的 ``open()`` / ``close()`` / ``grasp()`` 等方法直接转发到
-这里的 :class:`GripperActions`。单独成模块是为了让「怎么动」这套逻辑只写一遍：
-ROS 2 桥接、RPC 服务、产品代码都能直接调 :attr:`LiteGrip.actions`，而不用各自
-重写一遍斜坡和堵转判据。
+高层 :class:`~litegrip.Gripper` 的 ``open()`` / ``close()`` / ``grasp()`` 等
+方法转发到这里的 :class:`GripperActions`，并把引擎的结果折成 ``bool``。单独成
+模块是为了让「怎么动」这套逻辑只写一遍：斜坡、领先上限、堵转判据、保力预算和
+松开协调都在这一个文件里。结果类型归引擎内部使用，不属于公开 API。
 
 为什么不用 ``control_mit_stream()``
 -----------------------------------
@@ -11,9 +11,8 @@ ROS 2 桥接、RPC 服务、产品代码都能直接调 :attr:`LiteGrip.actions`
 毫秒就贴上去，剩下时间空转 —— 慢速时表现为一顿一停。这里按固定帧间隔推进一条
 线性斜坡，并给 ``dq_target`` 速度前馈，所以是匀速连续运动。
 
-``goto`` 一族（``goto`` / ``goto_rad`` / ``move_to`` / ``home``）和
-``move_at_speed`` 一族原来各自就是那个 ``control_mit_stream`` 式的硬阶跃；现在
-它们都转发到这里（:meth:`GripperActions.ramp_to`），「怎么动」只剩这一份实现。
+``set_gripper_distance`` / ``set_motor_angle`` 走
+:meth:`GripperActions.ramp_to` 这一条斜坡，「怎么动」只剩这一份实现。
 
 指令领先实测位置的部分由领先上限封顶，分两档：行进段用
 :attr:`MotionConfig.max_lead_mm`（大领先量破静摩擦），距限位
@@ -72,19 +71,20 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
-from .constants import UnitConversion
+from .constants import GripperGeometry, UnitConversion
 from .exceptions import (
     CommandError,
     CommError,
     LiteGripError,
     NotInitializedError,
 )
-from .models import CalibrationData, GripperConfig, GripperState
+from .models import STALE_AFTER_S, CalibrationData, GripperConfig, GripperState
 
 if TYPE_CHECKING:                                    # 避免运行时循环 import
-    from .gripper import LiteGrip
+    from .gripper import Gripper
 
 log = logging.getLogger("litegrip")
 
@@ -127,7 +127,7 @@ class MotionConfig:
     press_zone_mm: float = 2.0          # 距限位这么近就切到 stop_lead_mm
     stop_lead_mm: float = 0.7           # 压紧段领先上限 mm（≈ kp × 上限）
     # 停稳位置距限位多近算「顶在限位上」rad。这个数必须容得下「记录限位比
-    # 压紧能到的地方深一点」：``zero()`` 用 calib_kp × calib_step_rad（≈1.0 Nm）
+    # 压紧能到的地方深一点」：``calibrate()`` 用 calib_kp × calib_step_rad（≈1.0 Nm）
     # 探测，而 close() 按自己的刚度压，两者用力不同。台架实测缺口 0.92–1.27 mm
     # （@57.55 mm/rad 即 0.016–0.022 rad），0.02 只差 0.001 rad 就够不着，于是
     # 照文档顺序跑 stroke_test 第一遍就 exit 1。0.03 留了约 36% 余量，仍只占
@@ -190,7 +190,7 @@ class MotionConfig:
     # 保力段照着设定值压，不会跑。所以判据再收紧一层：只有预算
     # (``force_n × 0.1 × press_safety``) 低于这个值，零位移才判 ``no_bite``；
     # 否则照旧 ``stalled``。少了这一层，20 N 夹一个已经贴在张开侧的工件、或者
-    # ``release(abort=True)`` 之后原地重夹（那一次松开不发张开指令），都会被拒。
+    # ``disable()`` 之后原地重夹（那一次没有张开指令），都会被拒。
     #
     # 0.2 Nm 就是这台机器上实测的脱离力（2026-10-29：接近段 0.18 Nm 原地不动，
     # 保力段 0.20 Nm 推走 19 mm，落在 1.8–2.0 N 之间）。换成设定值：≤ 2.2 N 的
@@ -235,9 +235,6 @@ class MotionConfig:
     # 位置上」留的余量，按出厂标定的 rad_to_mm=61.01 折算约 3.05 mm。真出问题时
     # 越位量是毫米级往上走的 —— 2026-10-10 那台是 104.9 mm。
     hold_runaway_rad: float = 0.05
-    # [Deprecated] 保力不再用增益（见上）。留着只为兼容老配置，设了也不生效。
-    hold_kp: float = 150.0              # 已废弃：保力刚度
-    hold_kd: float = 2.0                # 已废弃：保力阻尼
 
     # ── 使能 ───────────────────────────────────────────────────────────
     enable_retries: int = 3             # 使能重试次数
@@ -305,7 +302,7 @@ class MoveResult:
       堵转，但离标定限位很远，``ok=False``。
     - ``grasp()`` 的闭合段：成功 = 走到空载目标且没堵转，即
       ``reached and not stalled``，与旧行为一致。
-    - 定位（``goto`` 一族、``move_at_speed`` 一族，都走
+    - 定位（``set_gripper_distance`` / ``set_motor_angle``，都走
       :meth:`GripperActions.ramp_to`）：成功 = 同上 ``reached and not
       stalled``。半路被挡住、整段一帧都没发出去、或者根本没走到，都是
       ``False`` —— 目标在行程内，「顶在限位上」不是它的成功终点。
@@ -327,7 +324,7 @@ class MoveResult:
     # 指令停在 ``实测位置 + 领先上限`` 上，留着它驱动器会按约 6.6 N·m 一直压着。
     # 只报「撤了力」，不改变 ``ok``。
     released: bool = False
-    # 这次移动被松开请求（``release()`` / ``request_release()``）从半路叫停。
+    # 这次移动被松开请求（``release()``）从半路叫停。
     # 只有 ``grasp()`` 的带力接近段会检查它：那一段走的不是用户要的终点，而是
     # 夹取的第一步，松开请求意味着「别夹了」。``grasp()`` 据此改走张开。
     release_requested: bool = False
@@ -358,7 +355,7 @@ class GraspResult:
     # 这一路守的是保力段的越位。正常夹取不会置位：夹着工件时夹爪停在工件上，
     # 空载时顶到真限位就停。置位说明闭合侧没有东西拦着它。
     travel_guard: bool = False
-    # 这次夹取是被 ``release()`` / ``request_release()`` 结束的：夹取线程收到
+    # 这次夹取是被 ``release()`` 结束的：夹取线程收到
     # 请求后先完成松开（张开到 ``max(当前, 夹取点) + 余量``），再返回。与
     # ``travel_guard`` 的区别是这不是故障 —— 松开是用户要的正常收尾。
     released: bool = False
@@ -378,16 +375,13 @@ class ReleaseResult:
 
     ``opened_mm`` 是这一次松开**指令目标**的开口量（mm，从闭合零点算起，
     与 :attr:`GripperState.position_mm` 同一个口径），不是「又张开了多少」；
-    夹爪实际停在哪看 ``state.position_mm``。``aborted=True`` 表示这是一次急停
-    （``abort=True``）：只撤力、不发张开运动，此时 ``opened_mm`` 是撤力那一刻
-    的开口量，``target_rad`` 是撤力那一刻的位置。
+    夹爪实际停在哪看 ``state.position_mm``。
     """
 
-    ok: bool                            # 松开是否完成（急停与超时为 False）
+    ok: bool                            # 松开是否完成（超时为 False）
     state: GripperState                 # 松开结束时的状态
-    opened_mm: float                    # 目标开口量 mm（急停：撤力时的开口量）
+    opened_mm: float                    # 目标开口量 mm
     target_rad: float                   # 张开斜坡的目标位置 rad
-    aborted: bool = False               # 这是急停（只撤力，不张开）
 
     def __bool__(self) -> bool:
         return self.ok
@@ -417,7 +411,6 @@ class _ReleaseRequest:
     """一条待执行的松开请求：从夹取线程之外递进来的，只由它自己消费。"""
 
     clearance_mm: float
-    abort: bool
 
 
 @dataclass
@@ -434,7 +427,7 @@ class EnableResult:
 
 @dataclass
 class WriteZeroResult:
-    """write_zero 的结果。"""
+    """set_zero 的结果。"""
 
     before_rad: float                   # 写入前的角度
     after_rad: float                    # 重新使能后回读的角度
@@ -482,7 +475,7 @@ def clamp_to_travel(config: GripperConfig, q: float) -> float:
 
     非有限值不归这里兜底：``min`` / ``max`` 与 NaN 的比较全为假，NaN 会被静默
     折到量程的一端。调用方必须在进来之前拒绝非有限值 —— CAN 层
-    :meth:`LiteGripCAN._check_motion_command` 已经在做这件事。
+    :meth:`litegrip.can.bus.CanBus._check_motion_command` 已经在做这件事。
 
     Args:
         config: 夹爪配置（用 ``pos_closed_rad`` / ``pos_open_rad``）。
@@ -708,6 +701,29 @@ def force_approach_terms(
 # 动作层
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _scale_from_travel(config: GripperConfig, travel_rad: float) -> float:
+    """A probed travel in radians → millimetres per radian.
+
+    The numerator is ``max_stroke_mm + STOP_INSET_MM`` rather than
+    ``max_stroke_mm``: the probe presses *into* the open stop to find it, so the
+    two recorded extremes span about a millimetre more than the jaws can
+    actually travel.  See :class:`~litegrip.constants.GripperGeometry`.
+
+    Deriving the scale from the jaw travel alone is a 1.2% short scale — 1 mm
+    lost per full stroke.
+
+    Raises:
+        RuntimeError: the two stops coincide, so no scale can be derived.  A
+            calibration that cannot produce a scale must not invent one.
+    """
+    if not travel_rad > 0:
+        raise RuntimeError(
+            f"标定失败：两端止点重合成 {travel_rad:.6f} rad 的行程，推不出 "
+            "mm/rad。确认夹爪真的走完了全程，再重新标定。")
+    return ((config.max_stroke_mm + GripperGeometry.STOP_INSET_MM)
+            / travel_rad)
+
+
 def _toward(value: float, target: float, step: float) -> float:
     """把 ``value`` 朝 ``target`` 挪最多 ``step``，并且**正好落在** ``target`` 上。
 
@@ -719,10 +735,10 @@ def _toward(value: float, target: float, step: float) -> float:
     return max(value - step, target)
 
 
-def _raise_send_failure(g: "LiteGrip") -> None:
-    """抛出一个带原因的异常，说明为什么 ``send_mit_frame`` 回了 ``False``。
+def _raise_send_failure(g: "Gripper") -> None:
+    """抛出一个带原因的异常，说明为什么内部帧下发回了 ``False``。
 
-    原因在 :attr:`LiteGrip.last_send_error` 里，三种情况分开报：
+    原因在 :attr:`Gripper.last_send_error` 里，三种情况分开报：
 
     - 没连上 / 没使能 —— 下层记的就是 ``NotInitializedError``，原样抛回去：
       它的消息说的是该补哪一步，重新包一层只会把那个结论弄丢。
@@ -741,21 +757,20 @@ def _raise_send_failure(g: "LiteGrip") -> None:
 
 
 class GripperActions:
-    """夹爪的七个动作：``open`` / ``close`` / ``grasp`` / ``ramp_to`` /
-    ``zero`` / ``enable`` / ``disable``。
+    """夹爪的动作引擎：``open`` / ``close`` / ``grasp`` / ``release`` /
+    ``ramp_to`` / ``calibrate`` / ``enable`` / ``disable``。
 
-    一般不直接构造，用 :attr:`LiteGrip.actions`::
+    一般不直接构造，由 :class:`~litegrip.Gripper` 持有::
 
-        with LiteGrip("can0") as g:
-            g.load_calibration()
-            g.actions.enable()
-            g.actions.open()
-            g.actions.grasp(force_n=20.0, hold_s=3.0)
+        with Gripper("can0") as g:
+            g.enable()
+            g.open()
+            g.grasp(force_n=20.0, hold_s=3.0)
 
     进度回调 ``progress`` 收到 :class:`MoveProgress`，本模块自己不打印任何东西。
     """
 
-    def __init__(self, gripper: "LiteGrip", config: Optional[MotionConfig] = None):
+    def __init__(self, gripper: "Gripper", config: Optional[MotionConfig] = None):
         self._g = gripper
         self.config = config if config is not None else MotionConfig()
 
@@ -764,9 +779,9 @@ class GripperActions:
         # 所以跨线程时调用方只**记下请求**，夹取线程在每一帧之前查一次；松开
         # 完成后夹取线程记下结果、置 ``_hold_done``，调用方据此返回。
         #
-        # 这把锁只保护下面这几个字段，**不碰 CAN**：``request_release()`` 在
-        # 调用方线程里拿它，夹取线程每 5 ms 拿一次 —— 两边都只做几次赋值。
-        # 千万别把 ``_io_lock`` 也套进来（那是帧的锁，见 LiteGrip）。
+        # 这把锁只保护下面这几个字段，**不碰 CAN**：``release()`` 在调用方
+        # 线程里拿它，夹取线程每 5 ms 拿一次 —— 两边都只做几次赋值。
+        # 千万别把 ``_io_lock`` 也套进来（那是帧的锁，见 Gripper）。
         self._release_lock = threading.Lock()
         # 「没有夹取在跑」时为 set。release() 用它判断有没有夹取可等，也用它
         # 等夹取线程把松开做完。用 Event 而不是 Condition：等待方只关心「完没
@@ -873,7 +888,7 @@ class GripperActions:
             force_n: 夹持力 N，``None`` = 用 :attr:`MotionConfig.force_n`。
                 按 SDK 近似换算 1 N = 0.1 Nm。
             hold_s: 保力时长 s。``0`` = 一直保到出错、被护栏中止、收到
-                ``release()`` / ``request_release()`` 的松开请求，或 Ctrl+C。
+                ``release()`` 的松开请求，或 Ctrl+C。
             progress: 进度回调。
 
         Returns:
@@ -997,7 +1012,7 @@ class GripperActions:
             if hold.release_requested:
                 req = self._take_release_request()
                 if req is None:                 # 兜底：请求不该凭空消失
-                    req = _ReleaseRequest(10.0, False)
+                    req = _ReleaseRequest(10.0)
                 return self._grasp_ends_with_release(
                     req, move, force, cycles=hold.cycles)
             return GraspResult(
@@ -1053,7 +1068,7 @@ class GripperActions:
     ) -> GraspResult:
         """夹取线程执行一条松开请求，并把结果折成 :class:`GraspResult`。
 
-        正常松开 ``ok=True``；急停 ``ok=False``。两者都是 ``released=True`` ——
+        松开完成 ``ok=True``、失败 ``ok=False``，两种都是 ``released=True`` ——
         夹取是被松开结束的，不是故障。结果先记进 ``_release_result`` 再让
         ``grasp()`` 的 ``finally`` 置 ``_hold_done``，等待中的 ``release()``
         因此一定拿得到它。
@@ -1073,29 +1088,20 @@ class GripperActions:
             released=True,
         )
 
-    def release(
-        self,
-        clearance_mm: float = 10.0,
-        *,
-        abort: bool = False,
-        timeout_s: Optional[float] = None,
-    ) -> ReleaseResult:
-        """松开：结束进行中的 ``grasp()`` 保力并张开夹爪。
+    def release(self, clearance_mm: float = 10.0) -> ReleaseResult:
+        """松开：结束进行中的 ``grasp()`` 保力并张开夹爪 —— 线程安全。
 
         可以从**任意线程**调用，包括 ``grasp(hold_s=0)`` 还堵在另一个线程里的
         时候。这条限制不是礼貌，是正确性：帧只能由夹取线程发 —— 两个线程各自
         往同一根 CAN 上发斜坡，各自的领先上限就都不成立了；而保力段是纯力矩
         帧，中间插进来的位置帧会把它交接时的连续爬升打断。所以：
 
-        - **有夹取在跑**：本方法只记下请求（参数取第一次那条；``abort=True``
-          会压过排队中的普通松开），然后等夹取线程做完松开。夹取线程在接近段/保力段的**每一帧之前**查请求，5 ms
-          内就能看到；它自己完成张开（或急停）并记下结果，本方法醒来返回它。
-          等满 ``timeout_s``（``None`` = :attr:`MotionConfig.release_wait_s`）
-          还没等到，返回 ``ok=False`` 并记一条 warning —— 不在这里抢着发帧。
+        - **有夹取在跑**：本方法只记下请求（参数取第一次那条），然后等夹取
+          线程做完松开。夹取线程在接近段/保力段的**每一帧之前**查请求，5 ms
+          内就能看到；它自己完成张开并记下结果，本方法醒来返回它。等满
+          :attr:`MotionConfig.release_wait_s` 还没等到，返回 ``ok=False`` 并
+          记一条 warning —— 不在这里抢着发帧。
         - **没有夹取在跑**：就在调用方线程里直接做这一次松开。
-
-        ``abort=True`` 是急停：**只撤力、不发张开运动**，尽快返回。``abort``
-        与普通松开走同一条等待路径，差别只在夹取线程做什么。
 
         连续调用是安全的：同一个夹取里第二次 ``release()`` 不会再多张开一次
         （它等到第一次的结果直接返回）；没有夹取时每次都按「当前位置 + 余量」
@@ -1109,10 +1115,11 @@ class GripperActions:
         :attr:`MotionConfig.grasp_speed_mm_s` —— 松开是夹取的收尾动作，与闭合
         段同一速度；``open()`` 的 ``speed_mm_s`` 默认值相同（都是 50 mm/s）。
 
+        急停不走这里：需要立刻卸掉力矩时用 ``disable()``（或 ``close()`` 的
+        保护性失力），那一条不等待夹取线程。
+
         Args:
             clearance_mm: 在基准位置上再张开的余量 mm，必须是非负有限数。
-            abort: 急停：只撤力，不张开。
-            timeout_s: 等待夹取线程完成的超时 s，``None`` = 配置值。
 
         Returns:
             :class:`ReleaseResult`。
@@ -1123,20 +1130,11 @@ class GripperActions:
             NotInitializedError: 没有夹取在跑、夹爪未连接或未使能 —— 原样抛出
                 底层记下的那一条。
         """
-        if timeout_s is not None and not math.isfinite(timeout_s):
-            raise CommandError(
-                f"松开等待超时必须是有限秒数：timeout_s={timeout_s!r}。"
-                "NaN 会让等待的截止时间没有意义。")
-        req = self._check_release_args(clearance_mm, abort)
+        req = self._check_release_args(clearance_mm)
         with self._release_lock:
             active = not self._hold_done.is_set()
             if active:
                 if self._release_req is None:
-                    self._release_req = req
-                elif req.abort and not self._release_req.abort:
-                    # 急停压过已经排队的一次普通松开：排队中的请求还没执行，
-                    # 换成撤力。反过来不行 —— 已经叫了急停就不要又被一次普通
-                    # 松开带回张开运动。
                     self._release_req = req
                 else:
                     # 已经有一条请求在排队：参数取第一条，第二次只是「再催
@@ -1146,12 +1144,10 @@ class GripperActions:
         if not active:
             return self._do_release(req)
 
-        wait_s = (self.config.release_wait_s
-                  if timeout_s is None else float(timeout_s))
+        wait_s = self.config.release_wait_s
         if wait_s <= 0.0 or not self._hold_done.wait(wait_s):
             log.warning("松开等待超时：%.1f s 内夹取线程没有完成松开"
-                        "（abort=%s）—— 返回 ok=False，不在这里抢着发帧。",
-                        wait_s, req.abort)
+                        "—— 返回 ok=False，不在这里抢着发帧。", wait_s)
             return self._release_timeout_result(req)
 
         with self._release_lock:
@@ -1164,29 +1160,6 @@ class GripperActions:
         # 夹取在请求落地前就自然结束了（例如 hold_s 刚好到点）：此刻已经没有
         # 夹取可等，就在本线程里把这次松开做掉，而不是把请求吞掉。
         return self._do_release(leftover if leftover is not None else req)
-
-    def request_release(self, clearance_mm: float = 10.0, *,
-                        abort: bool = False) -> bool:
-        """非阻塞版 :meth:`release`：只记请求，返回「有没有夹取可松开」。
-
-        有夹取在跑时置上请求并返回 ``True``；没有就返回 ``False``。它**从不**
-        碰 CAN，也不获取 ``_io_lock`` —— 给 UI 线程、信号处理、E-stop 回调这类
-        不能等总线的地方用。实际张开发帧由夹取线程在下一帧之前接手。
-
-        重复调用安全：已经有一条请求在排队时，保留第一条的参数；唯一的例外是
-        ``abort=True`` 会压过排队中的普通松开（急停优先）。
-
-        Raises:
-            CommandError: ``clearance_mm`` 不是非负有限数（与有没有夹取无关）。
-        """
-        req = self._check_release_args(clearance_mm, abort)
-        with self._release_lock:
-            if self._hold_done.is_set():
-                return False
-            if (self._release_req is None
-                    or (req.abort and not self._release_req.abort)):
-                self._release_req = req
-            return True
 
     def ramp_to(
         self,
@@ -1206,7 +1179,7 @@ class GripperActions:
         附近（默认 4 mm、kp=100 时约 6.6 N·m，远低于 DM4310 的 ±10 N·m 帧量程）。
 
         这个上限不是装饰。kp=100 下误差过约 0.1 rad 就把帧量程顶到饱和，而饱和
-        的那一帧会冲过目标 —— 2026-10-12 真机上 ``goto(40.0, duration=0.5)``
+        的那一帧会冲过目标 —— 2026-10-12 真机上 ``set_gripper_distance(40.0)``
         冲过目标 42.7 mm、越过标定闭合零点 2.75 mm，就是这么来的。
 
         到位判据是 :attr:`MotionConfig.reach_tol`：``ok = reached and not
@@ -1263,34 +1236,152 @@ class GripperActions:
             res.released = True
         return res
 
-    def zero(self) -> CalibrationData:
-        """完整标定：探闭合 + 张开两个限位，算出行程与换算系数，并存盘。
+    def calibrate(self) -> CalibrationData:
+        """完整标定：探闭合 + 张开两个限位，算出行程与换算系数。
 
         过程中夹爪会主动顶住两端机械限位（低刚度探测）。确保行程内无物。
         探测自带两道护栏：指令领先量不超过 ``calib_step_rad``，且 ``|tau|`` 一到
         ``calib_tau_limit`` 立即停止推进 —— 顶住限位时结构让位（背隙/弹性变形）
         会让位置读数一直在动，只靠「位置不再变化」是停不下来的。
 
-        结果落在 :func:`~litegrip.default_calib_path` 那个文件里，但无参
-        ``load_calibration()`` 只读出厂标定 —— 下次要用这份，得写
-        ``load_calibration(path=default_calib_path(channel))`` 或设
-        ``LITEGRIP_CALIB``。
+        方向不从堵转里猜（两端现象一样），沿用 :attr:`GripperConfig.close_sign`
+        声明的方向，所以正装、反装都成立。结果写回配置，落盘由
+        :meth:`Gripper.calibrate` 负责。
 
         Returns:
             :class:`CalibrationData`。
         """
         cfg = self.config
-        data = self._g.calibrate(
-            kp=cfg.calib_kp,
-            kd=cfg.calib_kd,
-            step_rad=cfg.calib_step_rad,
-            stall_delta=cfg.calib_stall_delta,
-            stall_cycles=cfg.calib_stall_cycles,
-            max_iter=cfg.calib_max_iter,
-            tau_limit=cfg.calib_tau_limit,
+        g = self._g
+        g._check_enabled()
+        can = g._can
+        if can is None:
+            raise NotInitializedError("未连接")
+        gcfg = g.config
+
+        s = gcfg.close_sign
+        can.update_state(timeout_s=0.1)
+        init_pos = can.get_position()
+        log.info("标定开始  初始位置: %.4f rad（方向：闭合时 rad %s）",
+                 init_pos, "增大" if s > 0 else "减小")
+
+        def _find_limit(direction: str) -> float:
+            sign = s if direction == "close" else -s
+            label = "闭合限位" if direction == "close" else "张开限位"
+            log.info("  寻找%s...", label)
+
+            can.update_state(timeout_s=0.05)
+            current = can.get_position()
+            stall = 0
+
+            for i in range(cfg.calib_max_iter):
+                # Re-derive the command from the *measured* position each cycle.
+                # Accumulating a running target lets the command lead grow
+                # without bound once the stop is reached, and the pressing
+                # torque (kp × lead) grows with it.  Bounding the lead to one
+                # step caps it at kp × step_rad.
+                target = current + sign * cfg.calib_step_rad
+                can.control_mit_stream(target, cfg.calib_kp, cfg.calib_kd,
+                                       duration_s=0.3, interval_s=0.005)
+                can.update_state(timeout_s=0.1)
+
+                new_pos = can.get_position()
+                delta = abs(new_pos - current)
+                tau = can.get_torque()
+                log.debug("    [%d] tgt=%+.3f pos=%.4f d=%.5f tau=%+.3f st=%d",
+                          i, target, new_pos, delta, tau, stall)
+
+                if (cfg.calib_tau_limit is not None
+                        and abs(tau) >= cfg.calib_tau_limit):
+                    log.info("    → 力矩达到上限 %.2f Nm（%+.3f），停止推进并"
+                             "保持: %.6f rad", cfg.calib_tau_limit, tau, new_pos)
+                    return new_pos
+
+                if delta < cfg.calib_stall_delta:
+                    stall += 1
+                    if stall >= cfg.calib_stall_cycles:
+                        log.info("    → 到达%s: %.6f rad", label, new_pos)
+                        return new_pos
+                else:
+                    stall = 0
+                current = new_pos
+
+            log.info("    → 安全停止（达到最大步数 %d）: %.4f rad",
+                     cfg.calib_max_iter, current)
+            return current
+
+        def _bounded_move(target: float, label: str) -> None:
+            """Move toward *target*, guarded the same way as the probe.
+
+            The plain ramp streams one constant command for half a second with
+            no ceiling.  If the jaws already sit at the stop that command is
+            heading for, the pressing torque is ``kp × 0.2`` held for the whole
+            duration — the same kind of unguarded push that broke a jaw.
+            Leading by one step at a time and watching ``|tau|`` bounds it to
+            the probe's ceiling instead.
+            """
+            current = can.get_position()
+            sign = 1.0 if target >= current else -1.0
+            for _ in range(cfg.calib_max_iter):        # same cap as the probe
+                if abs(target - current) <= cfg.calib_step_rad:
+                    return
+                can.control_mit_stream(
+                    current + sign * cfg.calib_step_rad, cfg.calib_kp,
+                    cfg.calib_kd, duration_s=0.1, interval_s=0.005)
+                can.update_state(timeout_s=0.1)
+                new_pos = can.get_position()
+                tau = can.get_torque()
+                if (cfg.calib_tau_limit is not None
+                        and abs(tau) >= cfg.calib_tau_limit):
+                    log.info("    → %s：力矩达到上限 %.2f Nm（%+.3f），停止",
+                             label, cfg.calib_tau_limit, tau)
+                    return
+                if abs(new_pos - current) < cfg.calib_stall_delta:
+                    log.info("    → %s：位置不再变化，停止", label)
+                    return
+                current = new_pos
+
+        # 1. Safe back-off (a nudge toward the close side, flipped with the mount)
+        log.info("  安全回退...")
+        _bounded_move(init_pos + s * 0.2, "安全回退")
+
+        # 2. Find zero (close direction)
+        zero_pos = _find_limit("close")
+
+        # 3. Back off, away from the close stop toward the open side
+        log.info("  回退...")
+        _bounded_move(zero_pos - s * 0.3, "回退")
+
+        # 4. Find max (open direction)
+        max_pos = _find_limit("open")
+
+        # 5. Compute results.  zero_pos = close limit, max_pos = open limit;
+        # which is numerically larger depends on the mount, so take the
+        # magnitude.
+        travel = abs(zero_pos - max_pos)
+        rad_to_mm = _scale_from_travel(gcfg, travel)
+
+        result = CalibrationData(
+            zero_position=round(zero_pos, 6),      # closed → 0 mm
+            max_position=round(max_pos, 6),        # open → max mm
+            travel_range=round(travel, 6),
+            rad_to_mm=round(rad_to_mm, 2),
+            motor_type="DM4310",
+            can_id=g.can_id,
+            mst_id=g.mst_id,
+            calibration_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
-        self._g.save_calibration()
-        return data
+
+        gcfg.pos_closed_rad = result.zero_position
+        gcfg.pos_open_rad = result.max_position
+        gcfg.rad_to_mm = result.rad_to_mm
+        gcfg.calibrated = True
+
+        log.info("标定结果: 闭合(0mm)=%.6f rad  张开=%.6f rad  行程=%.6f rad "
+                 "(%.1f mm)  换算=%.1f mm/rad",
+                 result.zero_position, result.max_position,
+                 result.travel_range, result.travel_mm, result.rad_to_mm)
+        return result
 
     def enable(self, retries: Optional[int] = None) -> EnableResult:
         """反复 enable 直到状态帧回读到 ``err == 1``（真使能）。
@@ -1344,15 +1435,14 @@ class GripperActions:
     # 引擎
     # ═══════════════════════════════════════════════════════════════════
 
-    def _check_release_args(self, clearance_mm: float,
-                            abort: bool) -> _ReleaseRequest:
+    def _check_release_args(self, clearance_mm: float) -> _ReleaseRequest:
         """校验松开参数并折成请求。NaN / 负数在这里拒绝，不是夹到 0。"""
         if not math.isfinite(clearance_mm) or clearance_mm < 0.0:
             raise CommandError(
                 f"松开的余量必须是**非负有限数**：clearance_mm="
                 f"{clearance_mm!r}。负余量是「再夹进去一点」，不是松开；NaN "
                 "进了位置算术会变成 NaN 目标。")
-        return _ReleaseRequest(float(clearance_mm), bool(abort))
+        return _ReleaseRequest(float(clearance_mm))
 
     def _release_pending(self) -> bool:
         """有没有一条还没被夹取线程消费的松开请求（只碰松开锁）。"""
@@ -1370,7 +1460,7 @@ class GripperActions:
             return req
 
     def _do_release(self, req: _ReleaseRequest) -> ReleaseResult:
-        """执行一条松开请求：急停只撤力，普通松开走有界斜坡张开。
+        """执行一条松开请求：走有界斜坡张开。
 
         基准与 console（litegrip-studio）的 BackOff 同一条：从**交接点**再张
         ``clearance_mm``，而不是从力压实后停下的位置。真机上设定力会把夹爪往
@@ -1386,31 +1476,10 @@ class GripperActions:
         cfg = self.config
         g = self._g
         gcfg = g.config
-        # 急停不要求标定：标定坏了、文件没加载，也拦不住一次撤力。普通松开
-        # 是一次位置运动，方向来自标定，未标定时拒绝。
-        if not req.abort:
-            _check_calibrated(gcfg)
-        # 急停不要求新状态：零增益帧里 q 不产生任何力，缓存位置就够。反过来，
-        # 要求先答一帧会把撤力拖到重试之后，电机不答时甚至一帧都发不出去 ——
-        # 总线还通、电机不说话，正是急停最需要撤力的工况。
-        st = (g.get_state(wait=False) if req.abort
-              else self._fresh_state())
+        # 松开是一次位置运动，方向来自标定，未标定时拒绝。
+        _check_calibrated(gcfg)
+        st = self._fresh_state()
         pos = st.position_rad
-
-        if req.abort:
-            # 急停：一帧 ``kp=kd=tau=0`` 就够停下力矩，随后立刻返回。不发张开
-            # 运动 —— 调用方按的是「别动了」，不是「张到某处」。一帧而不是
-            # _release() 的整段：那一段要 0.2 s，急停的每一毫秒都要。
-            self._emit(pos, 0.0, 0.0, kp=0.0, kd=0.0)
-            log.info("急停松开：已撤力（撤力时实测夹持力 %.1f N），不发张开运动",
-                     st.force_n)
-            return ReleaseResult(
-                ok=False,
-                state=g.get_state(wait=False),
-                opened_mm=st.position_mm,
-                target_rad=pos,
-                aborted=True,
-            )
 
         s = gcfg.close_sign
         current_mm = (gcfg.pos_closed_rad - pos) * s * gcfg.rad_to_mm
@@ -1440,7 +1509,6 @@ class GripperActions:
             state=move.state,
             opened_mm=opened_mm,
             target_rad=move.target_rad,
-            aborted=False,
         )
 
     def _release_timeout_result(self, req: _ReleaseRequest) -> ReleaseResult:
@@ -1457,7 +1525,6 @@ class GripperActions:
             state=st,
             opened_mm=st.position_mm,
             target_rad=st.position_rad,
-            aborted=req.abort,
         )
 
     def _emit(self, q: float, dq: float = 0.0, tau: float = 0.0,
@@ -1475,7 +1542,7 @@ class GripperActions:
 
         Raises:
             NotInitializedError: 夹爪没连上，或者没使能 —— 原样抛出
-                :attr:`LiteGrip.last_send_error` 里记的那一条，它说的是该补哪
+                :attr:`Gripper.last_send_error` 里记的那一条，它说的是该补哪
                 一步（``connect()`` / ``enable()``）。
             CommError: 帧没发出去，而下层给的原因是传输层失败（如
                 ``OSError``），或者什么都没给。消息里带原样的原因 —— 这一层
@@ -1484,7 +1551,7 @@ class GripperActions:
         cfg = self.config
         g = self._g
         q = clamp_to_travel(g.config, q)
-        sent = g.send_mit_frame(
+        sent = g._send_mit_frame(
             q,
             g.config.kp if kp is None else kp,
             g.config.kd if kd is None else kd,
@@ -1525,11 +1592,11 @@ class GripperActions:
         the cache said 78 mm, the jaws were at 26 mm, and ``open()`` left at
         23 rad/s out of a 20 mm/s move.
 
-        ``refresh_status()`` (0xCC) asks an idle motor to speak.  A cached
-        snapshot — even one younger than :data:`STALE_AFTER_S` — is not enough
-        to plan motion from: at 20 mm/s, half a second of silence is 10 mm of
-        unknown.  Retry the request a few times and raise :class:`CommError` if
-        no frame answered.
+        ``refresh_status()`` (0xCC) asks an idle motor to speak, and reports
+        whether a frame answered it.  A cached snapshot — even one younger than
+        :data:`STALE_AFTER_S` — is not enough to plan motion from: at 20 mm/s,
+        half a second of silence is 10 mm of unknown.  Retry the request a few
+        times and raise :class:`CommError` if no frame answered.
 
         Raises:
             CommError: the 0xCC request could not be sent, or the motor did not
@@ -1538,8 +1605,15 @@ class GripperActions:
         sent_ok = False
         last: Optional[GripperState] = None
         for _ in range(3):
-            sent_ok = self._g.refresh_status() or sent_ok
-            last = self._g.get_state()          # waits up to 50 ms for a frame
+            if self._g.refresh_status():
+                # The request itself got an answer, so the cache was just
+                # refreshed even though this read sees no *new* frame.
+                sent_ok = True
+                last = self._g.get_state(wait=False)
+                if (last.data_age_s is not None
+                        and last.data_age_s <= STALE_AFTER_S):
+                    return last
+            last = self._g.get_state()          # waits for a fresh frame
             if last.fresh:
                 return last
         age = ("无" if last is None or last.data_age_s is None
@@ -1696,7 +1770,7 @@ class GripperActions:
         # 「这一趟本来就没事可做」不判堵转。目标落在到位容差里时，夹爪原地不动
         # 就是到位，读成堵转会把一次成功的定位报成失败 —— 而它会真的发生：排程
         # 的帧数由 duration 定、不随距离缩短，间距趋近 0 时排程速度也趋近 0，
-        # 整段斜坡都是「不动」。`home()` 紧跟在 `close()` 之后（两个都瞄着闭合
+        # 整段斜坡都是「不动」。`close()` 紧跟在另一次闭合定位之后（都瞄着同一
         # 端，只剩一点点齿隙）就是这个形状。压紧路径不受影响：那里目标在限位
         # 外侧，「到了还不动」正是要判的堵转。
         # 带设定力的接近段里，这一条还留了个小口子：起点落在 ``reach_tol``
@@ -1926,8 +2000,7 @@ class GripperActions:
         立刻从前馈里扣掉一截，读数表现为「先夹到设定力，过一会儿掉到某个更小的
         值」。上一版锚在 200 ms 前的位置读数上、``kp=150``，工件以 3 mm/s 让位就能
         把 20 N 读成 5 N。所以**不要**为了「顶得更硬」把增益加回来；
-        :attr:`MotionConfig.hold_kp` / :attr:`MotionConfig.hold_kd` 已废弃，设了也不
-        生效。
+        保力帧不带增益，这是它和位置帧的区别，不是可调项。
 
         力矩不是一步跳到设定值，而是按 :attr:`MotionConfig.force_ramp_n_s`
         （N/s）从**进入保力时飞行中的力矩**爬上去，且每下发一帧走一步、正好落在

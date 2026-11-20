@@ -1,6 +1,6 @@
-"""``LiteGripCAN.initialize()`` 必须说真话：err == 0 不算使能成功。
+"""``CanBus.initialize()`` 必须说真话：err == 0 不算使能成功。
 
-用的是真 ``LiteGripCAN``，只把 transport/controller/motor 换成假的 ——
+用的是真 ``CanBus``，只把 transport/controller/motor 换成假的 ——
 所以这里验的是 can_bus 里的判定逻辑本身，而不是 actions 层的转发。
 """
 
@@ -11,7 +11,7 @@ import unittest
 import _sdkpath  # noqa: F401
 from litegrip import HardwareError
 from litegrip.can.protocol import ControlModeCode
-from litegrip.protocols.can_bus import LiteGripCAN
+from litegrip.can.bus import CanBus
 
 
 class FakeMotorState:
@@ -66,7 +66,7 @@ class FakeController:
 
 
 def make_can(err_script):
-    can = LiteGripCAN(channel="vcan0")
+    can = CanBus(channel="vcan0")
     motor = FakeMotorState()
     can._motor = motor
     can._controller = FakeController(err_script, motor)

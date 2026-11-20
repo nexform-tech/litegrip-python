@@ -10,12 +10,12 @@
 
 这个文件钉住新契约，三段分开验：
 
-- ``LiteGripCAN.control_mit`` 把原因留在 ``last_send_error``（发成功就清空）；
-- ``LiteGrip.send_mit_frame`` 原样带上去，不连/没使能时自己给出那一条；
+- ``CanBus.control_mit`` 把原因留在 ``last_send_error``（发成功就清空）；
+- ``Gripper._send_mit_frame`` 原样带上去，不连/没使能时自己给出那一条；
 - ``GripperActions._emit`` 按错误表抛 ``NotInitializedError`` / ``CommError``，
   并且**下层没给原因时不替它猜一个**。
 
-CAN 层用真 ``LiteGripCAN`` + 假 controller（与 ``test_can_stream_silence.py``
+CAN 层用真 ``CanBus`` + 假 controller（与 ``test_can_stream_silence.py``
 同一套注入方式），上面两层用 ``fake_can.make_gripper``。
 """
 
@@ -26,7 +26,7 @@ import unittest
 import _sdkpath  # noqa: F401
 from fake_can import make_gripper
 from litegrip import CommError, NotInitializedError
-from litegrip.protocols.can_bus import LiteGripCAN
+from litegrip.can.bus import CanBus
 
 #: 一帧完全合法的指令。
 GOOD = dict(q_target=0.5, kp=100.0, kd=2.0, dq_target=0.0,
@@ -60,7 +60,7 @@ class WorkingController:
 
 
 def make_can(controller=None):
-    can = LiteGripCAN(channel="vcan0")
+    can = CanBus(channel="vcan0")
     if controller is not None:
         can._motor = FakeMotor()
         can._controller = controller
@@ -73,7 +73,7 @@ class TestControlMitKeepsTheReason(unittest.TestCase):
     def test_a_transport_failure_reaches_last_send_error(self):
         can = make_can(NetworkDownController())
 
-        with self.assertLogs("litegrip.can_bus", level="WARNING"):
+        with self.assertLogs("litegrip.can.bus", level="WARNING"):
             ok = can.control_mit(**GOOD)
 
         self.assertFalse(ok)
@@ -120,14 +120,14 @@ class TestSendMitFrameCarriesTheReason(unittest.TestCase):
         g, fake = make_gripper()
         fake.send_error = OSError(100, "Network is down")
 
-        self.assertFalse(g.send_mit_frame(0.5, 100.0, 2.0))
+        self.assertFalse(g._send_mit_frame(0.5, 100.0, 2.0))
         self.assertIs(g.last_send_error, fake.send_error)
 
     def test_a_disabled_gripper_names_the_enable(self):
         g, _ = make_gripper()
         g._enabled = False
 
-        self.assertFalse(g.send_mit_frame(0.5, 100.0, 2.0))
+        self.assertFalse(g._send_mit_frame(0.5, 100.0, 2.0))
         self.assertIsInstance(g.last_send_error, NotInitializedError)
         self.assertIn("未使能", str(g.last_send_error))
 
@@ -135,17 +135,17 @@ class TestSendMitFrameCarriesTheReason(unittest.TestCase):
         g, _ = make_gripper()
         g._can = None
 
-        self.assertFalse(g.send_mit_frame(0.5, 100.0, 2.0))
+        self.assertFalse(g._send_mit_frame(0.5, 100.0, 2.0))
         self.assertIsInstance(g.last_send_error, NotInitializedError)
         self.assertIn("未连接", str(g.last_send_error))
 
     def test_a_good_frame_clears_the_previous_reason(self):
         g, fake = make_gripper()
         fake.send_error = OSError(100, "Network is down")
-        g.send_mit_frame(0.5, 100.0, 2.0)
+        g._send_mit_frame(0.5, 100.0, 2.0)
 
         fake.send_error = None
-        self.assertTrue(g.send_mit_frame(0.5, 100.0, 2.0))
+        self.assertTrue(g._send_mit_frame(0.5, 100.0, 2.0))
         self.assertIsNone(g.last_send_error)
 
 
@@ -174,10 +174,10 @@ class TestTheEngineRaisesTheTypeTheErrorTableNames(unittest.TestCase):
         g, _ = make_gripper()
         g._enabled = False
 
-        # 走 _emit 本身：公开入口（close / goto_rad）在发帧之前就 _check_enabled()
+        # 走 _emit 本身：公开入口（close / set_motor_angle）在发帧之前就 _check_enabled()
         # 了，用例会撞在那道检查上，测不到这一层对 False 的处理。
         with self.assertRaises(NotInitializedError) as ctx:
-            g.actions._emit(0.5)
+            g._actions._emit(0.5)
 
         self.assertIn("未使能", str(ctx.exception))
 
@@ -186,17 +186,17 @@ class TestTheEngineRaisesTheTypeTheErrorTableNames(unittest.TestCase):
         g._can = None
 
         with self.assertRaises(NotInitializedError) as ctx:
-            g.actions._emit(0.5)
+            g._actions._emit(0.5)
 
         self.assertIn("未连接", str(ctx.exception))
 
     def test_an_unrecorded_reason_is_reported_as_unrecorded(self):
         """替身只回 ``False`` —— 那就照实说，不替它编一个原因。"""
         g, _ = make_gripper()
-        g.send_mit_frame = lambda *args, **kwargs: False
+        g._send_mit_frame = lambda *args, **kwargs: False
 
         with self.assertRaises(CommError) as ctx:
-            g.actions._emit(0.5)
+            g._actions._emit(0.5)
 
         message = str(ctx.exception)
         self.assertIn("原因未记录", message)

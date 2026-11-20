@@ -50,12 +50,6 @@ classifiers = [
 # that this installs on a bare robot controller.
 dependencies = []
 
-[project.optional-dependencies]
-# The point-to-point zenoh link used by the field teleoperation.  Optional so
-# the base install stays stdlib + SocketCAN; only `litegrip.zenoh_link` and the
-# default `teleop_start` transport need it.
-zenoh = ["eclipse-zenoh>=1.0"]
-
 [project.urls]
 Repository = "https://github.com/nexform-tech/litegrip-python"
 Issues = "https://github.com/nexform-tech/litegrip-python/issues"
@@ -64,7 +58,6 @@ Issues = "https://github.com/nexform-tech/litegrip-python/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-# py.typed tells type checkers the annotations are real. The JSON files are the
-# read-only fallback used when a unit has never been calibrated on site: the
-# factory one, plus the legacy direction templates kept for compatibility.
+# py.typed tells type checkers the annotations are real. The JSON file is the
+# read-only fallback used when a unit has never been calibrated on site.
 litegrip = ["py.typed", "*.json"]

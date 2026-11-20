@@ -3,28 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum, IntFlag
 from typing import Optional
 
 from .constants import GripperGeometry, UnitConversion
-
-
-class GripperMode(IntEnum):
-    """Gripper control mode."""
-    MIT = 0
-    POSITION = 1
-    VELOCITY = 2
-    FORCE = 3
-
-
-class GripperStatus(IntFlag):
-    """Gripper status flags (bitmask)."""
-    NONE = 0x00
-    ENABLED = 0x01
-    MOVING = 0x02
-    AT_TARGET = 0x04
-    GRASPED = 0x08
-    ERROR = 0x10
 
 
 #: Age past which a :class:`GripperState` counts as stale, in seconds.  The same
@@ -40,7 +21,7 @@ class GripperState:
     frame arrived is what :attr:`fresh`, :attr:`data_age_s` and
     :meth:`is_stale` report — a snapshot from a bus that said nothing is not a
     measurement, and it must not look like one.  Check them before trusting the
-    numbers; :meth:`LiteGrip.refresh_status` elicits a frame when the bus is
+    numbers; :meth:`Gripper.refresh_status` elicits a frame when the bus is
     idle.
     """
 
@@ -55,7 +36,7 @@ class GripperState:
     #: every reading above is still a constructor default.
     timestamp: float = 0.0
 
-    # Convenience — computed from raw values with unit conversion
+    # Convenience — computed from raw values with unit conversion.
     position_mm: float = 0.0
     force_n: float = 0.0
 
@@ -89,29 +70,19 @@ class GripperState:
         """True if a fault is active (error_code ∉ {0, 1})."""
         return self.error_code not in (0, 1)
 
-    @property
-    def is_moving(self) -> bool:
-        """True if velocity exceeds a small threshold."""
-        return abs(self.velocity_rad_s) > 0.01
-
-    @property
-    def aperture_mm(self) -> float:
-        """Opening distance in mm (single-side displacement).
-
-        For total jaw separation multiply by 2.
-        """
-        return self.position_mm
-
 
 @dataclass
 class GripperConfig:
-    """Gripper configuration — tune these for your hardware."""
+    """Gripper configuration — tune these for your hardware.
+
+    A :class:`Gripper` loads a calibration into this object in its
+    constructor, so the fields below describe the attached unit by default.
+    """
 
     # CAN
     can_channel: str = "can0"
     can_id: int = 0x08
-    mst_id: Optional[int] = None          # None = auto-detect
-    canfd_mode: bool = False
+    mst_id: int = 0x18
 
     # Control gains (MIT mode)
     kp: float = 100.0                      # position stiffness [0, 500]
@@ -124,32 +95,27 @@ class GripperConfig:
     pos_closed_rad: float = 1.14           # closed → 0 mm
     pos_open_rad: float = 0.0              # open  → full stroke
 
-    # True once the limits above come from a real calibration (or from a
-    # calibration template) rather than from the placeholder defaults.  The
-    # motion actions refuse to run while this is False, because with the
-    # defaults still in place every direction is a guess.
+    # True once the limits above come from a real calibration rather than from
+    # the placeholder defaults.  The motion actions refuse to run while this is
+    # False, because with the defaults still in place every direction is a
+    # guess.
     calibrated: bool = False
 
     # Jaw travel (mm) — the caliper measurement of your gripper's travel.
-    # :meth:`LiteGrip.calibrate` derives ``rad_to_mm`` from it plus the probe
+    # :meth:`Gripper.calibrate` derives ``rad_to_mm`` from it plus the probe
     # inset, because the recorded extremes span that inset more than the jaws
     # actually open; see :class:`~litegrip.constants.GripperGeometry`.
     max_stroke_mm: float = GripperGeometry.JAW_TRAVEL_MM
 
-    # Working stroke (mm) — the opening the motions are allowed to reach, from
+    # Working stroke (mm) — the opening ``open()`` is allowed to reach, from
     # the closed zero.  ``0`` (or anything ≥ the jaw travel) means "no limit":
-    # :meth:`actions.open` then presses onto the open mechanical stop as before.
-    # Set it below the jaw travel to keep a margin at the open end (e.g. 80 mm on
-    # an 85 mm travel leaves 5 mm), so a plain open no longer drives into the
-    # stop.
+    # ``open()`` then presses onto the open mechanical stop.  Set it below the
+    # jaw travel to keep a margin at the open end (e.g. 80 mm on an 85 mm
+    # travel leaves 5 mm), so a plain open no longer drives into the stop.
     work_stroke_mm: float = 0.0
 
-    # Unit conversion — update after calibration
+    # Unit conversion — updated after calibration.
     rad_to_mm: float = UnitConversion.RAD_TO_MM   # rad → mm
-    nm_to_n: float = 10.0                  # Nm → N (approximate)
-
-    # Grasp detection
-    grasp_torque_threshold: float = 0.5    # Nm
 
     @property
     def close_sign(self) -> float:
@@ -162,35 +128,6 @@ class GripperConfig:
         is True.
         """
         return 1.0 if self.pos_closed_rad >= self.pos_open_rad else -1.0
-
-    @property
-    def mount(self) -> Optional[str]:
-        """Legacy mount label (``"normal"`` / ``"reverse"``), or ``None``.
-
-        **Deprecated.**  Kept for backward compatibility.  Shipped grippers
-        have one mounting; on a calibrated unit this reports ``"normal"``.
-        Read ``pos_closed_rad`` / ``pos_open_rad`` directly when you need the
-        travel.
-
-        ``None`` while :attr:`calibrated` is False: the placeholder defaults
-        also happen to order close above open, so reporting ``"normal"``
-        before a calibration has been loaded would be a claim, not a reading.
-        """
-        if not self.calibrated:
-            return None
-        return "normal" if self.close_sign > 0 else "reverse"
-
-
-@dataclass
-class GripperInfo:
-    """Static device information."""
-
-    model: str = "LiteGrip"
-    motor_type: str = "DM4310"
-    can_id: int = 0x08
-    mst_id: int = 0x18
-    firmware_version: str = ""
-    serial_number: str = ""
 
 
 @dataclass

@@ -1,4 +1,10 @@
-"""标定持久化与方向的硬件无关测试：模板、往返、通道警告、home。"""
+"""Calibration persistence and probe tests — hardware-free.
+
+Covers: the shipped factory geometry, the constructor's auto-load search
+order, per-channel files, direction preservation through a probe run, the two
+independent probe guards (command-lead cap and torque ceiling), and the
+``mst_id`` default.
+"""
 
 from __future__ import annotations
 
@@ -14,15 +20,16 @@ from unittest import mock
 
 import _sdkpath  # noqa: F401
 import litegrip.gripper as gripper_mod
-from litegrip import (CALIB_TEMPLATES, LiteGrip, CommandError, GripperConfig,
-                      GripperGeometry, default_calib_path, list_templates)
+from litegrip import (CommandError, Gripper, GripperConfig, GripperGeometry,
+                      MotionConfig, default_calibration_path)
+from litegrip.actions import _scale_from_travel
 from litegrip.gripper import _FACTORY_CALIB
 
 from fake_can import (DT, POS_CLOSED_RAD, POS_OPEN_RAD, Frame, make_gripper)
 
 
 def _capture_warnings(fn):
-    """跑 ``fn()``，返回 litegrip logger 上的 WARNING 及以上文本。"""
+    """Run ``fn()`` and return the litegrip WARNING+ texts."""
     records = []
 
     class _Sink(logging.Handler):
@@ -39,8 +46,8 @@ def _capture_warnings(fn):
     return records
 
 
-def _write_json(data, directory):
-    path = os.path.join(directory, "calib.json")
+def _write_json(data, directory, name="calib.json"):
+    path = os.path.join(directory, name)
     with open(path, "w") as f:
         json.dump(data, f)
     return path
@@ -48,69 +55,30 @@ def _write_json(data, directory):
 
 @contextlib.contextmanager
 def _patched_calib_env(home):
-    """把 ``HOME`` 指到临时目录，屏蔽真机标定，并清掉 ``LITEGRIP_CALIB``。
-
-    两者是这台机器上仅有的两个隐式来源，清掉之后无参加载只剩出厂文件。
-    ``patch.dict`` 会整份快照环境，退出时把清掉的那把键也一并还原。
-    """
+    """Point ``HOME`` at a temp dir and clear ``LITEGRIP_CALIB``."""
     with mock.patch.dict(os.environ, {"HOME": home}, clear=False):
         os.environ.pop("LITEGRIP_CALIB", None)
         yield
 
 
-class TestDirectionTemplates(unittest.TestCase):
-    """两份预制模板靠限位数值的**顺序**声明方向。"""
+class TestShippedCalibrationFile(unittest.TestCase):
+    """The bundled factory calibration is real geometry, not a made-up span.
 
-    def test_normal_template_closes_at_the_high_rad(self):
-        g = LiteGrip("can0")
-        self.assertTrue(g.load_calibration(CALIB_TEMPLATES["normal"]))
-        self.assertTrue(g.config.calibrated)
-        self.assertGreater(g.config.pos_closed_rad, g.config.pos_open_rad)
-        self.assertAlmostEqual(g.config.close_sign, 1.0)
-
-    def test_reverse_template_closes_at_the_low_rad(self):
-        g = LiteGrip("can0")
-        self.assertTrue(g.load_calibration(CALIB_TEMPLATES["reverse"]))
-        self.assertTrue(g.config.calibrated)
-        self.assertLess(g.config.pos_closed_rad, g.config.pos_open_rad)
-        self.assertAlmostEqual(g.config.close_sign, -1.0)
-
-    def test_both_templates_share_the_same_travel(self):
-        a, b = LiteGrip("can0"), LiteGrip("can0")
-        a.load_calibration(CALIB_TEMPLATES["normal"])
-        b.load_calibration(CALIB_TEMPLATES["reverse"])
-        self.assertAlmostEqual(a.config.rad_to_mm, b.config.rad_to_mm)
-        self.assertAlmostEqual(
-            abs(a.config.pos_closed_rad - a.config.pos_open_rad),
-            abs(b.config.pos_closed_rad - b.config.pos_open_rad))
-
-
-class TestShippedCalibrationFiles(unittest.TestCase):
-    """随包发布的三个标定文件必须真的是出厂几何 —— 它们曾经一起漂掉。
-
-    三份文件各自独立，曾同时停在 ``0.0 / -1.651026 / 52.69``（另一台夹爪的
-    读数），而出厂值（litegrip-cpp 的 ``calibration/factory_calibration.json``）
-    是 ``0.029564 / -1.141184 / 73.45731105242119``。这里把出厂几何钉住，并
-    检查三份文件**互相一致**：只改一半（换了 ``rad_to_mm`` 忘了
-    ``travel_range_rad``）会让 ``open()`` 的行程算错，而单看一份文件看不出来。
-
-    出厂几何换过一代：上一代是 ``0.052071 / -1.357481 / 61.01229326764816``，
-    同一段 86 mm 跨度记成 ``1.409552`` rad。两代都自洽（跨度都是 86 mm），所以
-    单看一份文件分不出哪份是错的 —— 这正是必须把绝对值钉死、不能只查自洽的原因。
+    The factory file follows litegrip-cpp's ``calibration/factory_calibration.json``:
+    ``0.029564 / -1.141184 / 73.45731105242119`` over 86 mm.
     """
 
-    # litegrip-cpp/calibration/factory_calibration.json
-    FACTORY_CLOSED_RAD = 0.029564        # zero_position_rad
-    FACTORY_OPEN_RAD = -1.141184         # max_position_rad
+    FACTORY_CLOSED_RAD = 0.029564
+    FACTORY_OPEN_RAD = -1.141184
     FACTORY_RAD_TO_MM = 73.45731105242119
     FACTORY_TRAVEL_MM = 86.0
 
-    def _load(self, path):
-        with open(path) as f:
+    def _load(self):
+        with open(_FACTORY_CALIB) as f:
             return json.load(f)
 
     def test_the_shipped_geometry_is_the_factory_geometry(self):
-        data = self._load(_FACTORY_CALIB)
+        data = self._load()
         self.assertAlmostEqual(data["zero_position_rad"], self.FACTORY_CLOSED_RAD)
         self.assertAlmostEqual(data["max_position_rad"], self.FACTORY_OPEN_RAD)
         self.assertAlmostEqual(data["rad_to_mm"], self.FACTORY_RAD_TO_MM)
@@ -118,75 +86,46 @@ class TestShippedCalibrationFiles(unittest.TestCase):
                                self.FACTORY_CLOSED_RAD - self.FACTORY_OPEN_RAD)
 
     def test_the_travel_is_the_real_86_mm(self):
-        data = self._load(_FACTORY_CALIB)
+        data = self._load()
         self.assertAlmostEqual(data["travel_range_rad"] * data["rad_to_mm"],
                                self.FACTORY_TRAVEL_MM, places=6)
 
     def test_the_work_stroke_stays_inside_the_travel(self):
-        data = self._load(_FACTORY_CALIB)
+        data = self._load()
         travel_mm = data["travel_range_rad"] * data["rad_to_mm"]
         self.assertGreater(data["work_stroke_mm"], 0.0)
         self.assertLess(data["work_stroke_mm"], travel_mm)
 
-    def test_the_factory_file_loads_with_the_factory_travel(self):
-        g = LiteGrip("can0")
-        self.assertTrue(g.load_calibration(_FACTORY_CALIB))
+    def test_the_constructor_loads_the_factory_file(self):
+        with tempfile.TemporaryDirectory() as home:
+            with _patched_calib_env(home):
+                # can1 has no per-channel file; the factory file still loads.
+                g = Gripper("can1")
         cfg = g.config
+        self.assertTrue(cfg.calibrated)
         self.assertAlmostEqual(cfg.pos_closed_rad, self.FACTORY_CLOSED_RAD)
         self.assertAlmostEqual(cfg.pos_open_rad, self.FACTORY_OPEN_RAD)
-        # 和 actions.py 里算行程的方式一致
         travel_mm = abs(cfg.pos_open_rad - cfg.pos_closed_rad) * cfg.rad_to_mm
         self.assertAlmostEqual(travel_mm, self.FACTORY_TRAVEL_MM)
-
-    def test_both_templates_carry_the_same_factory_geometry(self):
-        for name in ("normal", "reverse"):
-            with self.subTest(template=name):
-                data = self._load(CALIB_TEMPLATES[name])
-                self.assertAlmostEqual(data["rad_to_mm"], self.FACTORY_RAD_TO_MM)
-                self.assertAlmostEqual(
-                    data["travel_range_rad"],
-                    self.FACTORY_CLOSED_RAD - self.FACTORY_OPEN_RAD)
-                self.assertEqual(
-                    sorted([data["zero_position_rad"], data["max_position_rad"]]),
-                    sorted([self.FACTORY_OPEN_RAD, self.FACTORY_CLOSED_RAD]))
-
-    def test_the_factory_file_does_not_carry_its_own_stiffness(self):
-        """文档指的两条入口必须描述同一台夹爪 —— 几何一样，刚度也得一样。
-
-        ``--template normal`` 的模板不带增益，落回 :class:`GripperConfig` 的
-        默认 ``kp``/``kd``；出厂文件要是自带另一套，这两条入口压紧限位的刚度就
-        差一个倍数，而几何看起来分毫不差 —— 正是这种「只差一个字段」的不一致
-        最难看出来。``kp`` 曾经是 ``5.0``（PR #12 顺手降的，没人问过 5.0 是哪
-        台机器量出来的），实测压紧力矩因此只有 ``0.08 Nm``，连 ``zero()`` 探测
-        用的 ``1.0 Nm`` 都够不着。
-        """
-        by_template = LiteGrip("can0", mount="normal")
-        by_path = LiteGrip("can0")
-        self.assertTrue(by_path.load_calibration(_FACTORY_CALIB))
-
-        default = GripperConfig()
-        self.assertAlmostEqual(by_path.config.kp, default.kp)
-        self.assertAlmostEqual(by_path.config.kd, default.kd)
-        self.assertAlmostEqual(by_template.config.kp, by_path.config.kp)
-        self.assertAlmostEqual(by_template.config.kd, by_path.config.kd)
 
 
 class TestPersistence(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
-        self.addCleanup(lambda: os.path.exists(self.dir)
-                        and __import__("shutil").rmtree(self.dir))
+        self.addCleanup(shutil.rmtree, self.dir, True)
 
     def _path(self, name="calib.json"):
         return os.path.join(self.dir, name)
 
     def test_round_trip_preserves_direction(self):
         path = self._path()
-        g = LiteGrip("can0")
-        g.load_calibration(CALIB_TEMPLATES["reverse"])
+        g = Gripper("can0")
+        g.config.pos_closed_rad, g.config.pos_open_rad = POS_OPEN_RAD, POS_CLOSED_RAD
+        g.config.rad_to_mm = 74.19
+        g.config.calibrated = True
         g.save_calibration(path)
 
-        h = LiteGrip("can0")
+        h = Gripper("can0")
         self.assertTrue(h.load_calibration(path))
         self.assertAlmostEqual(h.config.pos_closed_rad, g.config.pos_closed_rad)
         self.assertAlmostEqual(h.config.pos_open_rad, g.config.pos_open_rad)
@@ -194,21 +133,17 @@ class TestPersistence(unittest.TestCase):
         self.assertTrue(h.config.calibrated)
         self.assertAlmostEqual(h.config.close_sign, -1.0)
 
-    def test_saved_file_records_calibrated(self):
+    def test_saved_file_records_calibrated_and_identity(self):
         path = self._path()
-        g = LiteGrip("can0")
-        g.load_calibration(CALIB_TEMPLATES["normal"])
+        g = Gripper("can1", can_id=0x0A, mst_id=0x1A)
         g.save_calibration(path)
         with open(path) as f:
-            self.assertTrue(json.load(f)["calibrated"])
+            data = json.load(f)
+        self.assertTrue(data["calibrated"])
+        self.assertEqual(data["can_id"], 0x0A)
+        self.assertEqual(data["mst_id"], 0x1A)
 
     def test_old_file_without_the_flag_counts_as_calibrated(self):
-        """老文件是 flag 之前的格式，缺键不能当未标定。
-
-        这个 fixture 自己写 ``calibrated`` 之前的字段，不再借出厂文件当例子
-        —— 出厂文件现在带 ``calibrated: true``，一旦它再改格式，这条测试就会
-        因为格式无关的原因红掉（而它在测的是**缺键**的语义，不是出厂文件的内容）。
-        """
         path = self._path()
         _write_json({"channel": "can0",
                      "zero_position_rad": 0.052071,
@@ -218,40 +153,57 @@ class TestPersistence(unittest.TestCase):
                      "work_stroke_mm": 80.0}, self.dir)
         with open(path) as f:
             self.assertNotIn("calibrated", json.load(f))
-        g = LiteGrip("can0")
+        g = Gripper("can0")
         self.assertTrue(g.load_calibration(path))
         self.assertTrue(g.config.calibrated)
 
     def test_channel_mismatch_warns(self):
-        """通道是两台同 ID 夹爪的唯一身份键 —— 指错文件要看得见。"""
         path = _write_json({"channel": "can1", "zero_position_rad": 0.1,
                             "max_position_rad": -1.5, "rad_to_mm": 74.8},
                            self.dir)
         warnings = _capture_warnings(
-            lambda: LiteGrip("can0").load_calibration(path))
+            lambda: Gripper("can0").load_calibration(path))
         self.assertTrue(any("channel" in m for m in warnings), warnings)
 
     def test_matching_channel_is_silent(self):
-        # 手动接一个 handler，既捕获 WARNING，也能断言它没有输出。
         path = _write_json({"channel": "can0", "zero_position_rad": 0.1,
                             "max_position_rad": -1.5, "rad_to_mm": 74.8},
                            self.dir)
         self.assertEqual(
-            _capture_warnings(lambda: LiteGrip("can0").load_calibration(path)),
+            _capture_warnings(lambda: Gripper("can0").load_calibration(path)),
             [])
 
     def test_missing_required_key_raises(self):
         path = _write_json({"zero_position_rad": 0.1}, self.dir)
-        with self.assertRaises(KeyError):
-            LiteGrip("can0").load_calibration(path)
+        with self.assertRaises(CommandError):
+            Gripper("can0").load_calibration(path)
+
+    def test_non_finite_values_are_refused(self):
+        path = _write_json({"zero_position_rad": 0.1,
+                            "max_position_rad": -1.5,
+                            "rad_to_mm": float("nan")}, self.dir)
+        with self.assertRaises(CommandError):
+            Gripper("can0").load_calibration(path)
+
+
+@contextlib.contextmanager
+def _home_for_calibrate():
+    """Temporary HOME so ``calibrate()`` does not write the real one."""
+    home = tempfile.mkdtemp()
+    try:
+        with _patched_calib_env(home):
+            yield home
+    finally:
+        shutil.rmtree(home, True)
 
 
 class TestCalibratePreservesDirection(unittest.TestCase):
-    """标定**不能发现**方向（两端堵转现象一样），只能沿用已声明的方向。"""
+    """Calibration cannot *discover* direction (both stops look the same); it
+    preserves the direction already in the configuration."""
 
     def _calibrate(self, reverse):
         g, fake = make_gripper(reverse=reverse, stops=True)
-        with contextlib.redirect_stdout(io.StringIO()):
+        with _home_for_calibrate(), contextlib.redirect_stdout(io.StringIO()):
             data = g.calibrate()
         return g, data
 
@@ -264,14 +216,13 @@ class TestCalibratePreservesDirection(unittest.TestCase):
 
     def test_reverse_probe_steps_down_to_the_close_stop(self):
         g, data = self._calibrate(reverse=True)
-        # 反装的「闭合」在数值小的一端 —— 探测方向跟着翻
         self.assertAlmostEqual(data.zero_position, POS_OPEN_RAD, places=4)
         self.assertAlmostEqual(data.max_position, POS_CLOSED_RAD, places=4)
         self.assertAlmostEqual(g.config.close_sign, -1.0)
         self.assertLess(g.config.pos_closed_rad, g.config.pos_open_rad)
         self.assertTrue(g.config.calibrated)
 
-    def test_travel_matches_the_template_after_calibration(self):
+    def test_the_scale_uses_the_span_with_the_probe_inset(self):
         g, data = self._calibrate(reverse=True)
         self.assertGreater(data.travel_range, 0)
         self.assertAlmostEqual(
@@ -280,16 +231,21 @@ class TestCalibratePreservesDirection(unittest.TestCase):
             / data.travel_range,
             places=2)
 
+    def test_calibrate_saves_automatically(self):
+        g, fake = make_gripper(stops=True)
+        with _home_for_calibrate() as home:
+            g.calibrate()
+            path = default_calibration_path(g.channel).replace(
+                os.path.expanduser("~"), home, 1)
+            self.assertTrue(os.path.isfile(path), path)
+            with open(path) as f:
+                self.assertTrue(json.load(f)["calibrated"])
+
 
 class TestDerivedScale(unittest.TestCase):
-    """``rad_to_mm`` 由 ``max_stroke_mm + 压入量`` 除以实测行程得来。
-
-    分子带上压入量不是笔误：标定探针压着张开限位找它，记录的跨度比两爪真正
-    能走的行程宽出约 1 mm。少算这一截，每个 mm 目标都短 1.2%（满行程丢 1 mm）。
-    """
+    """``rad_to_mm`` is (max_stroke + probe inset) over the measured travel."""
 
     def test_the_reference_scale_is_the_hand_recorded_one(self):
-        """(85 + 1) / 1.170748 必须等于出厂文件里手记的那一个。"""
         self.assertAlmostEqual(
             (GripperGeometry.JAW_TRAVEL_MM + GripperGeometry.STOP_INSET_MM)
             / 1.170748,
@@ -297,26 +253,13 @@ class TestDerivedScale(unittest.TestCase):
             places=9)
 
     def test_re_running_the_probe_on_a_shipped_unit_reproduces_its_scale(self):
-        """照出厂几何重跑一次标定，推出来的比例要和出厂文件自带的一样。
-
-        这是「新手照文档走一遍不会得到另一套数字」的那条不变量：默认
-        ``max_stroke_mm`` 与出厂文件的行程，必须把这台机器手记的比例重新推出来。
-        """
         with open(_FACTORY_CALIB) as f:
             data = json.load(f)
         self.assertAlmostEqual(
-            gripper_mod._scale_from_travel(GripperConfig(),
-                                           data["travel_range_rad"]),
-            data["rad_to_mm"],
-            places=9)
+            _scale_from_travel(GripperConfig(), data["travel_range_rad"]),
+            data["rad_to_mm"], places=9)
 
     def test_deriving_from_the_jaw_travel_alone_would_be_short(self):
-        """反例：只除 85 mm 得到的比例矮了一截 —— 钉住分子里有压入量。
-
-        缺口正好是 ``压入量 / 行程``，不是一个粗差上限：出厂几何换过一代
-        （``1.409552`` → ``1.170748`` rad），缺口从 ``0.71`` 涨到 ``0.85``
-        mm/rad，写死的上限会随每次重新标定失效，等式不会。
-        """
         with open(_FACTORY_CALIB) as f:
             travel_rad = json.load(f)["travel_range_rad"]
         short = GripperGeometry.JAW_TRAVEL_MM / travel_rad
@@ -327,113 +270,21 @@ class TestDerivedScale(unittest.TestCase):
             places=9)
 
     def test_a_coincident_travel_refuses_instead_of_inventing_a_scale(self):
-        """两端止点重合时抛错，绝不再写一个凭空的 105.26 比例。"""
         for travel in (0.0, -1.0):
             with self.assertRaises(RuntimeError) as ctx:
-                gripper_mod._scale_from_travel(GripperConfig(), travel)
+                _scale_from_travel(GripperConfig(), travel)
             self.assertIn("推不出", str(ctx.exception))
 
     def test_the_helper_uses_the_configured_stroke(self):
-        """比例的分子跟着 ``max_stroke_mm`` 走，不是硬编码的 85。"""
         cfg = GripperConfig()
         cfg.max_stroke_mm = 40.0
         self.assertAlmostEqual(
-            gripper_mod._scale_from_travel(cfg, 0.5),
+            _scale_from_travel(cfg, 0.5),
             (40.0 + GripperGeometry.STOP_INSET_MM) / 0.5)
 
 
-class TestHomeDirection(unittest.TestCase):
-    """``home()`` 走的是**本实例**标定出的闭合侧，不是模块常量。"""
-
-    def _home_target(self, reverse):
-        g, fake = make_gripper(reverse=reverse, stops=True)
-        # ``home`` 现在返回 ``MoveResult``，它自己报出这次真正要走的目标
-        # （经 clamp_to_travel 夹过），不必再从帧里倒推。
-        return g, g.home().target_rad
-
-    def test_normal_home_goes_to_the_high_rad(self):
-        g, target = self._home_target(reverse=False)
-        self.assertAlmostEqual(target, POS_CLOSED_RAD)
-
-    def test_reverse_home_goes_to_the_low_rad(self):
-        g, target = self._home_target(reverse=True)
-        self.assertAlmostEqual(target, POS_OPEN_RAD)
-        self.assertAlmostEqual(target, g.config.pos_closed_rad)
-
-
-class TestTemplateSelection(unittest.TestCase):
-    """按名字选模板：四个入口互相同义，装法读得回来。"""
-
-    def test_list_templates_names_and_order(self):
-        self.assertEqual(list_templates(), ["normal", "reverse"])
-
-    def test_load_template_equals_load_calibration_kwarg(self):
-        by_method = LiteGrip("can0")
-        by_method.load_template("reverse")
-        by_kwarg = LiteGrip("can0")
-        by_kwarg.load_calibration(template="reverse")
-        self.assertAlmostEqual(by_method.config.close_sign, -1.0)
-        self.assertAlmostEqual(by_kwarg.config.close_sign, -1.0)
-
-    def test_constructor_declares_the_mount(self):
-        g = LiteGrip("can1", mount="reverse")
-        self.assertEqual(g.mount, "reverse")
-        self.assertEqual(g.config.mount, "reverse")
-
-    def test_mount_is_none_until_calibrated(self):
-        g = LiteGrip("can0")
-        self.assertIsNone(g.mount)
-        self.assertIsNone(g.config.mount)
-
-    def test_mount_reads_back_each_template(self):
-        normal, reverse = LiteGrip("can0"), LiteGrip("can0")
-        normal.load_template("normal")
-        reverse.load_template("reverse")
-        self.assertEqual(normal.config.mount, "normal")
-        self.assertEqual(reverse.config.mount, "reverse")
-
-    def test_unknown_name_lists_the_valid_ones(self):
-        with self.assertRaises(CommandError) as ctx:
-            LiteGrip("can0").load_template("sideways")
-        msg = str(ctx.exception)
-        self.assertIn("normal", msg)
-        self.assertIn("reverse", msg)
-
-    def test_path_and_template_are_mutually_exclusive(self):
-        with self.assertRaises(CommandError):
-            LiteGrip("can0").load_calibration("/tmp/x.json", template="reverse")
-
-
-class TestTemplateDoesNotClobber(unittest.TestCase):
-    """模板只带方向与几何 —— 声明装法不能改写身份或调好的增益。"""
-
-    def test_explicit_can_id_survives(self):
-        self.assertEqual(LiteGrip("can1", can_id=0x0A, mount="reverse").can_id,
-                         0x0A)
-
-    def test_auto_master_id_is_not_pinned(self):
-        """``mst_id=None`` 仍走自动探测；模板里没有这个键就不该被写死。"""
-        self.assertIsNone(LiteGrip("can1", mount="reverse").mst_id)
-
-    def test_tuned_gains_survive(self):
-        cfg = GripperConfig()
-        cfg.kp, cfg.kd = 321.0, 4.5
-        g = LiteGrip("can1", config=cfg, mount="reverse")
-        self.assertAlmostEqual(g.config.kp, 321.0)
-        self.assertAlmostEqual(g.config.kd, 4.5)
-
-    def test_unreadable_template_is_strict(self):
-        """模板读不出来时**不得**回退到正装的出厂文件。"""
-        with mock.patch.dict(CALIB_TEMPLATES,
-                             {"reverse": os.path.join("no", "such.json")}):
-            g = LiteGrip("can0")
-            with self.assertRaises(CommandError):
-                g.load_template("reverse")
-        self.assertFalse(g.config.calibrated)
-
-
 class TestPerChannelPaths(unittest.TestCase):
-    """一台电脑两台夹爪：标定各存各的，自动加载按通道认领。"""
+    """One gripper per channel: per-channel file wins over the factory file."""
 
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -448,145 +299,76 @@ class TestPerChannelPaths(unittest.TestCase):
 
     def test_default_path_is_per_channel(self):
         with _patched_calib_env(self.dir):
-            self.assertTrue(default_calib_path("can1").endswith(
+            self.assertTrue(default_calibration_path("can1").endswith(
                 os.path.join(".litegrip", "can1_calibration.json")))
 
-    def test_env_override_wins_over_the_channel_file(self):
-        with _patched_calib_env(self.dir):
-            with mock.patch.dict(os.environ, {"LITEGRIP_CALIB": "/tmp/x.json"}):
-                self.assertEqual(default_calib_path("can1"), "/tmp/x.json")
-
-    def test_no_arg_save_lands_in_the_channel_file(self):
-        with _patched_calib_env(self.dir):
-            g = LiteGrip("can1")
-            g.load_template("reverse")
-            written = g.save_calibration()
-            self.assertTrue(written.endswith("can1_calibration.json"))
-            self.assertTrue(os.path.exists(written))
-
-    def test_a_can0_unit_with_no_local_file_gets_the_factory(self):
-        """#44 的核心承诺：干净机器上的无参加载 = 出厂标定。"""
-        with _patched_calib_env(self.dir):
-            g = LiteGrip("can0")
-            warnings = _capture_warnings(lambda: g.load_calibration())
-            self.assertTrue(g.config.calibrated)
-            self._assert_factory_geometry(g)
-            # 机器上一个本机文件都没有，就不该有「没用上」的告警。
-            self.assertFalse([m for m in warnings if "not read" in m], warnings)
-
-    def test_auto_load_reads_the_factory_not_the_local_file(self):
-        """本机文件不再隐式生效 —— 出厂文件才是标准值；显式点名仍拿得到它。"""
-        local = self._seed(os.path.join(".litegrip", "can0_calibration.json"), {
-            "channel": "can0", "calibrated": True,
-            "zero_position_rad": 0.114, "max_position_rad": -1.491,
-            "rad_to_mm": 74.8})
-        with _patched_calib_env(self.dir):
-            g = LiteGrip("can0")
-            self.assertTrue(g.load_calibration())
-            self.assertNotAlmostEqual(g.config.pos_closed_rad, 0.114)
-            self._assert_factory_geometry(g)
-            # 同一个文件显式点名就生效：它只是不再隐式，不是不可达。
-            self.assertTrue(g.load_calibration(path=local))
-            self.assertAlmostEqual(g.config.pos_closed_rad, 0.114)
-            self.assertAlmostEqual(g.config.rad_to_mm, 74.8)
-
-    def test_auto_load_skips_another_channels_file(self):
+    def test_constructor_auto_loads_the_channel_file(self):
         self._seed(os.path.join(".litegrip", "can0_calibration.json"), {
             "channel": "can0", "calibrated": True,
             "zero_position_rad": 0.114, "max_position_rad": -1.491,
             "rad_to_mm": 74.8})
         with _patched_calib_env(self.dir):
-            self.assertFalse(LiteGrip("can1").load_calibration())
+            g = Gripper("can0")
+        self.assertAlmostEqual(g.config.pos_closed_rad, 0.114)
+        self.assertAlmostEqual(g.config.rad_to_mm, 74.8)
 
-    def test_an_unrecognized_name_is_never_a_candidate(self):
-        """#45 台架上那份 ``can0_08_calibration.json`` 连候选都不是。
-
-        无参加载只认 ``<channel>_calibration.json`` 这一个名字，所以一台标定
-        躺在 ``~/.litegrip/`` 里、夹爪却跑在出厂值上。它声明了 ``channel: can0``
-        也不管用 —— README 里承诺的就是这条。文件本身没问题，点名它就能加载。
-        """
-        path = self._seed(os.path.join(".litegrip", "can0_08_calibration.json"), {
-            "schema_version": 1, "device_key": "can0_08", "channel": "can0",
-            "can_id": 8, "calibrated": True, "kp": 20,
-            "zero_position_rad": 0.114, "max_position_rad": -1.491,
-            "rad_to_mm": 63.42})
-        with _patched_calib_env(self.dir):
-            g = LiteGrip("can0")
-            warnings = _capture_warnings(lambda: g.load_calibration())
-            self._assert_factory_geometry(g)
-            # 躺在那里就该被点出来，否则用户以为它正在生效。
-            self.assertTrue(any(path in m for m in warnings), warnings)
-            self.assertTrue(g.load_calibration(path))
-            self.assertAlmostEqual(g.config.rad_to_mm, 63.42)
-
-    def test_isolated_home_finds_nothing_and_says_so(self):
-        # 空 HOME 只是背景。真正让 can1 取不到的是出厂文件声明了
-        # ``channel: can0`` —— 宁可大声失败，也不静默采纳别的通道的方向。
-        with _patched_calib_env(self.dir):
-            g = LiteGrip("can1")
-            warnings = _capture_warnings(lambda: g.load_calibration())
-            self.assertTrue(any("No calibration found" in m for m in warnings),
-                            warnings)
-            self.assertFalse(g.config.calibrated)
-
-    def test_env_var_still_beats_the_factory(self):
-        """显式指定是唯一的隐式来源例外 —— 环境变量必须压过出厂文件。"""
-        local = self._seed(os.path.join(".litegrip", "can0_calibration.json"), {
+    def test_env_override_wins_over_the_channel_file(self):
+        env_path = self._seed("env.json", {
+            "channel": "can0", "calibrated": True,
+            "zero_position_rad": 0.2, "max_position_rad": -1.4,
+            "rad_to_mm": 70.0})
+        self._seed(os.path.join(".litegrip", "can0_calibration.json"), {
             "channel": "can0", "calibrated": True,
             "zero_position_rad": 0.114, "max_position_rad": -1.491,
             "rad_to_mm": 74.8})
         with _patched_calib_env(self.dir):
-            with mock.patch.dict(os.environ, {"LITEGRIP_CALIB": local}):
-                g = LiteGrip("can0")
-                warnings = _capture_warnings(lambda: g.load_calibration())
-                self.assertTrue(g.config.calibrated)
-                self.assertAlmostEqual(g.config.pos_closed_rad, 0.114)
-                self.assertAlmostEqual(g.config.rad_to_mm, 74.8)
-                # 环境变量指的就是它，没有「被跳过」这回事。
-                self.assertFalse([m for m in warnings if "not read" in m],
-                                 warnings)
+            with mock.patch.dict(os.environ, {"LITEGRIP_CALIB": env_path}):
+                g = Gripper("can0")
+        self.assertAlmostEqual(g.config.pos_closed_rad, 0.2)
+        self.assertAlmostEqual(g.config.rad_to_mm, 70.0)
 
-    def test_machine_file_is_named_when_passed_over(self):
-        """沉默的回退才是 bug：被跳过的本机文件必须在日志里点名。"""
-        path = self._seed(os.path.join(".litegrip", "can0_calibration.json"), {
-            "channel": "can0", "calibrated": True,
-            "zero_position_rad": 0.114, "max_position_rad": -1.491,
-            "rad_to_mm": 74.8})
+    def test_no_channel_file_falls_back_to_the_factory(self):
         with _patched_calib_env(self.dir):
-            g = LiteGrip("can0")
-            warnings = _capture_warnings(lambda: g.load_calibration())
-            named = [m for m in warnings if path in m]
-            self.assertTrue(named, warnings)
-            # 告警必须给出逃生口，光说「没用上」等于让用户自己猜。
-            self.assertIn("path=", named[0])
-            self.assertIn("LITEGRIP_CALIB", named[0])
-
-    def test_save_warns_that_it_will_not_be_read_back(self):
-        with _patched_calib_env(self.dir):
-            g = LiteGrip("can1")
-            g.load_template("reverse")
-            written = g.save_calibration()
-            # 先落盘，再加载：加载时的「被跳过」告警不能替这条保存告警顶包。
-            records = _capture_warnings(lambda: g.save_calibration())
-            self.assertTrue([m for m in records if written in m], records)
-
-    def _assert_factory_geometry(self, g):
+            g = Gripper("can1")
         with open(_FACTORY_CALIB) as f:
             factory = json.load(f)
+        self.assertTrue(g.config.calibrated)
         self.assertAlmostEqual(g.config.pos_closed_rad,
                                factory["zero_position_rad"])
-        self.assertAlmostEqual(g.config.pos_open_rad,
-                               factory["max_position_rad"])
         self.assertAlmostEqual(g.config.rad_to_mm, factory["rad_to_mm"])
 
+    def test_no_readable_file_returns_false(self):
+        with _patched_calib_env(self.dir):
+            g = Gripper("can0")
+            with mock.patch.object(gripper_mod, "_FACTORY_CALIB",
+                                   os.path.join(self.dir, "missing.json")):
+                warnings = _capture_warnings(lambda: g.load_calibration())
+        self.assertTrue(any("No calibration found" in m for m in warnings),
+                        warnings)
+        self.assertFalse(g.load_calibration(
+            os.path.join(self.dir, "missing.json")))
+
+    def test_an_unrecognized_name_is_not_a_candidate(self):
+        weird = self._seed(os.path.join(".litegrip", "can0_08_calibration.json"),
+                           {"channel": "can0", "calibrated": True,
+                            "zero_position_rad": 0.114,
+                            "max_position_rad": -1.491, "rad_to_mm": 63.42})
+        with _patched_calib_env(self.dir):
+            g = Gripper("can0")
+            with open(_FACTORY_CALIB) as f:
+                factory = json.load(f)
+            self.assertAlmostEqual(g.config.rad_to_mm, factory["rad_to_mm"])
+            # Naming it explicitly still works.
+            self.assertTrue(g.load_calibration(weird))
+            self.assertAlmostEqual(g.config.rad_to_mm, 63.42)
+
     def test_explicit_mismatch_still_warns_and_loads(self):
-        """显式指定文件是调用方的主动覆盖，语义仍是「警告但加载」。"""
         path = self._seed("other.json", {
             "channel": "can1", "calibrated": True,
             "zero_position_rad": 0.1, "max_position_rad": -1.5,
             "rad_to_mm": 74.8})
         with _patched_calib_env(self.dir):
-            g = LiteGrip("can0")
+            g = Gripper("can0")
             warnings = _capture_warnings(lambda: g.load_calibration(path))
             self.assertTrue(any("channel" in m for m in warnings), warnings)
             self.assertTrue(g.config.calibrated)
@@ -594,21 +376,17 @@ class TestPerChannelPaths(unittest.TestCase):
 
 
 class TestCalibrateCommandLeadIsBounded(unittest.TestCase):
-    """探测指令只能领先实测位置一步 —— 这是力矩有界的前提。
-
-    2026-09-29 的事故：``_find_limit`` 用 ``target += sign * step_rad`` 累加，
-    顶到硬限位后目标仍每拍外推一步，``kp × (target − pos)`` 随之线性上涨，
-    直到结构崩掉。改成 ``target = pos + sign * step_rad`` 后，顶住的力矩上限
-    就是 ``kp × step_rad``。
-    """
+    """The probe command may lead the measured position by one step at most."""
 
     def test_probe_never_leads_the_measured_position_by_more_than_one_step(self):
         step, kp = 0.1, 100.0
         g, fake = make_gripper(stops=True, start_rad=POS_OPEN_RAD)
-        with contextlib.redirect_stdout(io.StringIO()):
-            g.calibrate(kp=kp, step_rad=step, tau_limit=None,
-                        stall_cycles=5, max_iter=40)
-        # 只看探测段：回退用 kp=80，探测段才是 kp=kp
+        g.motion_config = MotionConfig(
+            sleep_fn=lambda _: None,
+            calib_kp=kp, calib_step_rad=step, calib_tau_limit=None,
+            calib_stall_cycles=5, calib_max_iter=40)
+        with _home_for_calibrate(), contextlib.redirect_stdout(io.StringIO()):
+            g.calibrate()
         probe = [f for f in fake.frames if f.kp == kp]
         self.assertTrue(probe, "探测段一帧都没发？")
         worst = max(abs(f.q - f.pos_after) for f in probe)
@@ -616,30 +394,31 @@ class TestCalibrateCommandLeadIsBounded(unittest.TestCase):
 
 
 class TestCalibrateTorqueCeiling(unittest.TestCase):
-    """力矩上限是**独立于**堵转判据的第二道护栏。
+    """The torque ceiling is an independent second guard.
 
-    真机顶到限位时让位的是结构（背隙、弹性变形、微滑），编码器一直在读到
-    位移，「位置不再变化」的判据永远凑不满计数。这里让假电机复现这种行为：
-    顶住之后每拍仍让位 ``CREEP × step``，于是位置式堵转**永远不成立**，
-    只有力矩上限能停住探测。
+    At a stop the structure yields (backlash, elastic deformation), so the
+    encoder keeps reading movement and the position-stall test never fills its
+    counter.  Only the torque ceiling can stop the probe.
     """
 
-    # 每帧让位 CREEP × step = 1e-3 rad。太小则位置式判据会成立（delta 顶穿
-    # stall_delta），太大则一拍就让位超过指令领先量、力矩反而缩回去。
     CREEP = 0.01
     STEP = 0.1
     KP = 100.0
 
     def _calibrate(self, tau_limit, max_iter=40, stall_cycles=5):
         g, fake = make_gripper(stops=True, start_rad=POS_OPEN_RAD)
-        creep, step, kp_probe = self.CREEP, self.STEP, self.KP
+        g.motion_config = MotionConfig(
+            sleep_fn=lambda _: None,
+            calib_kp=self.KP, calib_step_rad=self.STEP,
+            calib_stall_delta=0.0015, calib_stall_cycles=stall_cycles,
+            calib_max_iter=max_iter, calib_tau_limit=tau_limit)
+        creep, step = self.CREEP, self.STEP
 
         def soft_control_mit(q_target, kp, kd, dq_target=0.0,
                              tau_feedforward=0.0):
             m = fake.motor
             if (m.limit_hi is not None and q_target > m.limit_hi
                     and m.pos >= m.limit_hi - 1e-9):
-                # 顶在限位上：结构让位，位置读数是动的（delta > stall_delta）
                 m.pos += creep * step
                 m.tau = kp * (q_target - m.pos)
             else:
@@ -650,91 +429,53 @@ class TestCalibrateTorqueCeiling(unittest.TestCase):
             return True
 
         fake.control_mit = soft_control_mit
-        with contextlib.redirect_stdout(io.StringIO()):
-            data = g.calibrate(kp=kp_probe, step_rad=step, stall_delta=0.0015,
-                               stall_cycles=stall_cycles, max_iter=max_iter,
-                               tau_limit=tau_limit)
-        return data
+        with _home_for_calibrate(), contextlib.redirect_stdout(io.StringIO()):
+            return g.calibrate()
 
     def test_stall_counter_alone_would_not_stop_this_probe(self):
-        # 没有力矩上限时位置式判据永远不成立 ⇒ 一路顶到步数上限，
-        # 假结构一直让位，闭合端读数被推到限位之外很远。
         data = self._calibrate(tau_limit=None)
         self.assertGreater(data.zero_position, POS_CLOSED_RAD + 0.5)
 
     def test_torque_ceiling_aborts_the_probe_the_counter_cannot(self):
-        # 一顶住，kp × (领先量) = 100 × 0.07 = 7 Nm ≥ 2 Nm ⇒ 当帧就停，
-        # 只让位了一拍结构形变（0.03 rad），远没被推穿。
         data = self._calibrate(tau_limit=2.0)
         self.assertAlmostEqual(data.zero_position, POS_CLOSED_RAD, delta=0.1)
 
     def test_ceiling_is_independent_of_the_stall_count(self):
-        """把 stall_cycles 抬到探测步数都够不着，力矩上限仍要停下它。"""
         data = self._calibrate(tau_limit=2.0, max_iter=40,
                                stall_cycles=10 ** 6)
         self.assertAlmostEqual(data.zero_position, POS_CLOSED_RAD, delta=0.1)
 
 
-class TestMasterIdIsNotPinned(unittest.TestCase):
-    """``mst_id`` 未知时不能被写成 0 —— 0 会被当成「就用 0x00」。
-
-    写死的 0 会把 CAN 接收过滤设成 ``0x000``，电机所有应答都被丢掉，
-    ``enable()`` 于是在长重试里空转（2026-09-29 真机复现：40 秒后失败、
-    指示灯红绿交替）。
-    """
+class TestMasterId(unittest.TestCase):
+    """``mst_id`` defaults to 0x18 and calibration files do not move it."""
 
     def setUp(self):
         self.dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.dir, True)
-        self.path = os.path.join(self.dir, "can1_calibration.json")
 
-    def test_save_omits_an_unknown_master_id(self):
-        g = LiteGrip("can1")
-        g.load_template("normal")
-        g.save_calibration(self.path)
-        with open(self.path) as f:
-            self.assertNotIn("mst_id", json.load(f))
+    def test_default_is_0x18(self):
+        g = Gripper("can1")
+        self.assertEqual(g.mst_id, 0x18)
 
-    def test_save_keeps_a_known_master_id(self):
-        g = LiteGrip("can1")
-        g.load_template("normal")
-        g._mst_id = 0x18
-        g.save_calibration(self.path)
-        with open(self.path) as f:
-            self.assertEqual(json.load(f)["mst_id"], 0x18)
+    def test_explicit_master_id_survives_auto_load(self):
+        with open(_FACTORY_CALIB) as f:
+            factory_declares = json.load(f).get("mst_id")
+        g = Gripper("can1", mst_id=0x1A)
+        self.assertEqual(g.mst_id, 0x1A)
+        self.assertNotEqual(g.mst_id, factory_declares)
 
-    def _seed(self, **extra):
-        data = {"channel": "can1", "can_id": 8, "calibrated": True,
-                "zero_position_rad": 0.114, "max_position_rad": -1.491,
-                "rad_to_mm": 74.8}
-        data.update(extra)
-        with open(self.path, "w") as f:
-            json.dump(data, f)
-        return self.path
-
-    def test_zero_master_id_in_a_file_keeps_auto_detect(self):
-        path = self._seed(mst_id=0)
-        g = LiteGrip("can1")
-        self.assertTrue(g.load_calibration(path))
-        self.assertIsNone(g.mst_id)
-
-    def test_zero_can_id_in_a_file_keeps_the_default(self):
-        path = self._seed(can_id=0)
-        g = LiteGrip("can1")
-        self.assertTrue(g.load_calibration(path))
-        self.assertNotEqual(g.can_id, 0)
-
-    def test_round_trip_through_a_real_save_keeps_master_id_unknown(self):
-        first = LiteGrip("can1")
-        first.load_template("normal")
-        first.save_calibration(self.path)
-        second = LiteGrip("can1")
-        self.assertTrue(second.load_calibration(self.path))
-        self.assertIsNone(second.mst_id)
+    def test_saving_records_the_identity(self):
+        path = os.path.join(self.dir, "calib.json")
+        g = Gripper("can1", can_id=0x0A, mst_id=0x1A)
+        g.save_calibration(path)
+        with open(path) as f:
+            data = json.load(f)
+        self.assertEqual(data["mst_id"], 0x1A)
+        self.assertEqual(data["can_id"], 0x0A)
 
 
 class TestLibraryDoesNotSilenceItsOwnLogs(unittest.TestCase):
-    """库不得装 NullHandler：通道不一致这类 WARNING 是安全信号，必须可见。"""
+    """The library installs no NullHandler: channel warnings must be visible."""
 
     def test_no_handler_is_installed_on_the_package_logger(self):
         self.assertEqual(logging.getLogger("litegrip").handlers, [])

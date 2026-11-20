@@ -17,38 +17,31 @@ from ..can.motor import MotorState, MotorType
 from ..can.protocol import (
     ControlMode,
     ControlModeCode,
-    DM_REG,
 )
 from ..constants import GripperParams, DefaultParams
 from ..exceptions import (CommandError, CommError, ConnectError, HardwareError,
                           NotInitializedError)
 
-log = logging.getLogger("litegrip.can_bus")
+log = logging.getLogger("litegrip.can.bus")
 
 
-class LiteGripCAN:
+class CanBus:
     """LiteGrip CAN communication client.
 
     Manages a single gripper motor (DM4310 by default) over SocketCAN.
-    Entirely self-contained — does NOT import damiao_socketcan or any
-    arm-specific library.
+    Internal to the SDK; :class:`litegrip.Gripper` owns one.
 
     Typical usage::
 
-        can = LiteGripCAN(channel="can0")
+        can = CanBus(channel="can0")
         can.connect()
         can.register_gripper(can_id=0x08)
         can.initialize()
         can.control_mit_stream(target_position, kp=100, kd=2, duration_s=1.0)
     """
 
-    def __init__(
-        self,
-        channel: str = DefaultParams.CAN_CHANNEL,
-        canfd_mode: bool = DefaultParams.CANFD_MODE,
-    ):
+    def __init__(self, channel: str = DefaultParams.CAN_CHANNEL):
         self._channel = channel
-        self._canfd_mode = canfd_mode
         self._transport: Optional[CanTransport] = None
         self._controller: Optional[MotorController] = None
         self._motor: Optional[MotorState] = None
@@ -62,22 +55,23 @@ class LiteGripCAN:
     # ═══════════════════════════════════════════════════════════════════
 
     def connect(self) -> bool:
-        """Open the CAN transport. Auto-detects CAN/CAN-FD mode."""
+        """Open the CAN transport.
+
+        Classic CAN is requested; the transport upgrades itself when the
+        interface reports an FD MTU, so no mode is exposed here.
+        """
         if self._connected:
             return True
 
-        # None → let CanTransport auto-detect via interface MTU
-        mode = TransportMode.CANFD if self._canfd_mode else TransportMode.CAN
-
         try:
-            self._transport = CanTransport(self._channel, mode)
+            self._transport = CanTransport(self._channel, TransportMode.CAN)
             self._transport.open()
         except OSError as e:
             raise ConnectError(f"CAN 接口 '{self._channel}' 不可用: {e}")
 
         self._controller = MotorController(self._transport)
         self._connected = True
-        log.info("LiteGripCAN connected on %s (mode=%s)",
+        log.info("CanBus connected on %s (mode=%s)",
                  self._channel, self._transport.mode.name)
         return True
 
@@ -115,18 +109,18 @@ class LiteGripCAN:
     def register_gripper(
         self,
         can_id: int = GripperParams.CAN_ID,
-        mst_id: Optional[int] = None,
+        mst_id: int = GripperParams.MST_ID,
         motor_type: MotorType = MotorType.DM4310,
     ) -> int:
         """Register the gripper motor.
 
         Args:
             can_id: Motor CAN ID (usually 0x08).
-            mst_id: Master ID. None = auto-detect via register read / scan.
+            mst_id: Master ID (status frames; default 0x18).
             motor_type: Motor model (default DM4310).
 
         Returns:
-            The actual (possibly auto-detected) MST_ID.
+            The registered MST_ID.
         """
         if not self._connected or self._controller is None:
             raise CommError("CAN 未连接")
@@ -271,10 +265,6 @@ class LiteGripCAN:
     # Fault handling
     # ═══════════════════════════════════════════════════════════════════
 
-    def _clear_fault(self) -> bool:
-        """[Deprecated] Use :meth:`clear_fault` instead."""
-        return self.clear_fault()
-
     def clear_fault(self) -> bool:
         """Clear latched fault and re-enable the motor.
 
@@ -330,8 +320,8 @@ class LiteGripCAN:
                               tau_feedforward: float) -> None:
         """拒收一帧 MIT 不该承载的指令（见 :meth:`control_mit`）。
 
-        这一层是**所有**下发的必经之路 —— 引擎的每一帧、``goto_rad`` 的整段
-        流、teleop 的连续帧，最后都落在这里 —— 所以数值边界放在这里一次
+        这一层是**所有**下发的必经之路 —— 引擎的每一帧、定位斜坡的整段
+        流，最后都落在这里 —— 所以数值边界放在这里一次
         就够。上层的判据（领先上限、保力预算）管的是「走多快、压多硬」，这里
         管的是「这一帧本身是不是一个指令」。
         """
@@ -600,13 +590,6 @@ class LiteGripCAN:
             return 0, 0
         return self._motor.t_mos, self._motor.t_coil
 
-    def read_param(self, rid: int, timeout_s: float = 0.5) -> float:
-        """Read a motor register by RID."""
-        if self._controller is None or self._motor is None:
-            raise NotInitializedError("未连接或未注册")
-        return self._controller.read_param(self._motor, DM_REG(rid),
-                                           timeout_s=timeout_s)
-
     # ═══════════════════════════════════════════════════════════════════
     # Properties
     # ═══════════════════════════════════════════════════════════════════
@@ -617,5 +600,5 @@ class LiteGripCAN:
 
     @property
     def motor(self) -> Optional[MotorState]:
-        """Direct access to the underlying MotorState (expert use)."""
+        """Direct access to the underlying MotorState (internal)."""
         return self._motor

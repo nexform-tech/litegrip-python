@@ -1,9 +1,9 @@
-"""``LiteGripCAN`` 的下发边界：帧承载不了的指令在这里被拒。
+"""``CanBus`` 的下发边界：帧承载不了的指令在这里被拒。
 
-用真 ``LiteGripCAN``，只把 controller / motor 换成假的 —— 引擎那批测试底下装的
-是 ``FakeLiteGripCAN``，它**绕过**这一层，所以「非有限值、超量程力矩」这一类判定
-必须在这里单独验。这一层是所有下发的必经之路：引擎的每一帧、``goto_rad`` 的整段
-流、teleop 的连续帧，最后都落在 ``control_mit`` / ``control_mit_stream``。
+用真 ``CanBus``，只把 controller / motor 换成假的 —— 引擎那批测试底下装的
+是 ``FakeCanBus``，它**绕过**这一层，所以「非有限值、超量程力矩」这一类判定
+必须在这里单独验。这一层是所有下发的必经之路：引擎的每一帧、定位斜坡的整段
+流，最后都落在 ``control_mit`` / ``control_mit_stream``。
 
 判据是两条：每个字段必须是有限数；力矩不得超出本型号的帧量程。位置、速度、增益的
 **超量程**仍由编码器钳位（那是既定语义，见 ``test_protocol.py``），边界不动它们 ——
@@ -17,7 +17,7 @@ import unittest
 import _sdkpath  # noqa: F401
 from litegrip import CommandError
 from litegrip.can.protocol import MotorLimits
-from litegrip.protocols.can_bus import LiteGripCAN
+from litegrip.can.bus import CanBus
 
 NON_FINITE = (float("nan"), float("inf"), float("-inf"))
 
@@ -47,7 +47,7 @@ class RecordingController:
 
 
 def make_can(tau_max: float = 10.0):
-    can = LiteGripCAN(channel="vcan0")
+    can = CanBus(channel="vcan0")
     can._motor = FakeLimitsMotor(tau_max)
     can._controller = RecordingController()
     can._connected = True
@@ -101,7 +101,7 @@ class TestControlMitBoundary(unittest.TestCase):
 
     def test_the_refusal_comes_before_the_connection_check(self):
         """没连接时也照样拒绝：那是调用方的编程错误，不该被 False 吞掉。"""
-        can = LiteGripCAN(channel="vcan0")
+        can = CanBus(channel="vcan0")
         with self.assertRaises(CommandError):
             can.control_mit(q_target=float("nan"), kp=100.0, kd=2.0)
 

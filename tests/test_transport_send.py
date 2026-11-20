@@ -3,7 +3,7 @@
 这一层是唯一碰真实 socket 的地方，也是「帧到底发没发出去」的最终事实来源。
 在它下面没有别的东西兜底：丢掉一帧之后，上层拿到的只是一个 ``None``，而
 ``None`` 和「发出去了」长得一模一样 —— 2026-10-12 真机上那次
-「``goto`` 位移 0.000 mm 却返回 True」就是这么来的。
+「``set_gripper_distance`` 位移 0.000 mm 却返回 True」就是这么来的。
 
 所以这里钉住三条：未打开 → ``RuntimeError``；classic 帧超 8 字节 →
 ``ValueError``；发送缓冲一直满超过 ``timeout`` → ``TimeoutError``（``OSError``

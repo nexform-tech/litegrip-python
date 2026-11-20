@@ -10,7 +10,7 @@
 和阈值比；以及给调用方一条出路 —— ``refresh_status()`` 发 0xCC 主动要一帧，
 空闲总线上这是唯一让夹爪开口的办法（C++ 侧有，这边之前没有）。
 
-CAN 层用真 ``LiteGripCAN`` + 假 controller，夹爪层用 ``fake_can.make_gripper``
+CAN 层用真 ``CanBus`` + 假 controller，夹爪层用 ``fake_can.make_gripper``
 （``delivers=False`` 就是「总线安静」）。
 """
 
@@ -22,7 +22,7 @@ import unittest
 import _sdkpath  # noqa: F401
 from fake_can import make_gripper
 from litegrip import NotInitializedError, STALE_AFTER_S, GripperState
-from litegrip.protocols.can_bus import LiteGripCAN
+from litegrip.can.bus import CanBus
 
 
 class FakeMotor:
@@ -43,7 +43,7 @@ class RecordingController:
 
 
 def make_can(controller=None):
-    can = LiteGripCAN(channel="vcan0")
+    can = CanBus(channel="vcan0")
     if controller is not None:
         can._motor = FakeMotor()
         can._controller = controller
@@ -129,7 +129,7 @@ class TestRefreshStatusElicitsAFrame(unittest.TestCase):
     def test_a_failed_write_reports_false(self):
         can = make_can(RecordingController(fail=True))
 
-        with self.assertLogs("litegrip.can_bus", level="WARNING"):
+        with self.assertLogs("litegrip.can.bus", level="WARNING"):
             self.assertFalse(can.refresh_status())
 
     def test_a_disconnected_gripper_raises(self):
@@ -145,8 +145,13 @@ class TestRefreshStatusElicitsAFrame(unittest.TestCase):
         self.assertTrue(g.refresh_status())
         self.assertEqual(fake.refresh_calls, 1)
 
-    def test_a_refresh_gives_an_idle_bus_something_to_answer(self):
-        """请求 → 再读：空闲总线上那唯一的出路要真的走得通。"""
+    def test_a_refresh_gives_an_idle_bus_a_fresh_reading(self):
+        """请求 → 再读：refresh_status() 本身证明电机答了一帧。
+
+        帧已经被 refresh_status() 的等待读走，所以随后的 ``get_state()`` 在
+        安静的 bus 上不会再看到新帧（``fresh=False``），但读数的 age 是刚刚
+        刷新过的 —— 这正是「空闲总线上唯一让夹爪开口」的语义。
+        """
         g, fake = make_gripper()
         g.get_state()
         fake.delivers = False
@@ -155,9 +160,10 @@ class TestRefreshStatusElicitsAFrame(unittest.TestCase):
 
         self.assertTrue(g.refresh_status())
 
-        s = g.get_state(wait=True)
-        self.assertTrue(s.fresh)
+        s = g.get_state(wait=False)
         self.assertFalse(s.is_stale())
+        self.assertIsNotNone(s.data_age_s)
+        self.assertLess(s.data_age_s, STALE_AFTER_S)
 
     def test_the_request_sends_no_control_frame(self):
         g, fake = make_gripper()

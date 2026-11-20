@@ -1,11 +1,9 @@
-"""每个示例都要能从仓库根直接跑起来：不装包、不设 PYTHONPATH（#47）。
+"""每个示例都要能从仓库根直接跑起来：不装包、不设 PYTHONPATH。
 
-``trajectory.py`` 曾经是六个脚本里唯一没有 ``sys.path`` 引导的那个，而 README 把它
-列进「都能从仓库根跑」那张表，还把 ``--list`` 当作不需要硬件的第一步来推荐，于是
-照文档敲下去得到 ``ModuleNotFoundError``。
-
-``-S`` 关掉 site-packages，``PYTHONPATH`` 也清掉，所以 ``import litegrip`` 只可能来自
-脚本自己插进去的那个 ``src/`` —— 这正是要断言的事。
+示例脚本都在文件头把仓库的 ``src/`` 插进 ``sys.path``，所以 ``--help`` 不需要
+安装、也不需要硬件。``-S`` 关掉 site-packages，``PYTHONPATH`` 也清掉，于是
+``import litegrip`` 只可能来自脚本自己插进去的那个 ``src/`` —— 这正是要断言的
+事。任何一个示例漏掉引导，或者顶层 import 了需要硬件的模块，这里都会红。
 """
 
 from __future__ import annotations

@@ -6,17 +6,6 @@ damiao_socketcan or any arm library.
 
 from typing import Final
 
-from .can.motor import MotorType
-from .can.protocol import ControlMode as _ControlMode
-
-
-# ═════════════════════════════════════════════════════════════════════════
-# Re-export DM protocol types for convenience
-# ═════════════════════════════════════════════════════════════════════════
-
-DM_Motor_Type = MotorType
-Control_Mode = _ControlMode
-
 
 # ═════════════════════════════════════════════════════════════════════════
 # LiteGrip gripper parameters
@@ -27,8 +16,6 @@ class GripperParams:
 
     CAN_ID: Final = 0x08
     MST_ID: Final = 0x18
-    MOTOR_TYPE: Final = MotorType.DM4310
-    CONTROL_MODE: Final = Control_Mode.MIT_MODE
 
     # Position limits (rad) — nominal placeholders only.  The real limits come
     # from the calibration; do not treat these as a direction convention, since
@@ -36,18 +23,8 @@ class GripperParams:
     POS_CLOSED_RAD: Final = 1.14
     POS_OPEN_RAD: Final = 0.0
 
-    # MIT quantization limits (DM4310)
-    Q_MAX: Final = 12.5      # rad
-    DQ_MAX: Final = 30.0     # rad/s
-    TAU_MAX: Final = 10.0    # Nm
-
-    # Default control gains
-    DEFAULT_KP: Final = 100.0
-    DEFAULT_KD: Final = 2.0
-
     # Fault recovery
     FAULT_CLEAR_RETRIES: Final = 5
-    FAULT_CLEAR_DELAY_S: Final = 0.02
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -99,7 +76,6 @@ class UnitConversion:
     ``calibrate()`` to get accurate per-unit values.
     """
     RAD_TO_MM: Final = GripperGeometry.SPAN_MM / 1.14   # ≈ 75.44 mm/rad
-    MM_TO_RAD: Final = 1.14 / GripperGeometry.SPAN_MM   # ≈ 0.01326 rad/mm
     NM_TO_N: Final = 10.0             # approximate N per Nm
     N_TO_NM: Final = 0.1              # approximate Nm per N
 
@@ -140,7 +116,4 @@ def describe_error(code: int) -> str:
 class DefaultParams:
     """System defaults."""
     CAN_CHANNEL: Final = "can0"
-    CAN_BITRATE: Final = 1_000_000    # 1 Mbps classic CAN
-    CANFD_MODE: Final = False
-    TIMEOUT_S: Final = 0.1
     INIT_TIMEOUT_S: Final = 2.0

@@ -24,7 +24,7 @@ import time
 from typing import List, Optional
 
 import _sdkpath  # noqa: F401  (把 src/ 插进 sys.path)
-from litegrip import LiteGrip, MotionConfig
+from litegrip import Gripper, MotionConfig
 
 # 用户真机上跑出来的标定值（正装：rad 增大 = 闭合）
 POS_CLOSED_RAD = 0.104334
@@ -201,8 +201,8 @@ class FakeMotor:
                        min(self.TAU_MAX, kp * (q - self.pos) + tau_ff))
 
 
-class FakeLiteGripCAN:
-    """鸭子类型的 ``LiteGripCAN`` —— 只实现 LiteGrip 会调到的那几个方法。"""
+class FakeCanBus:
+    """鸭子类型的 ``CanBus`` —— 只实现 ``Gripper`` 会调到的那几个方法。"""
 
     def __init__(self, pos: float = 0.0, block_rad: Optional[float] = None,
                  sticky_rad: float = 0.0, err: int = 1,
@@ -248,7 +248,7 @@ class FakeLiteGripCAN:
         #: 直接回 False，并把它记进 ``last_send_error``。真 CAN 层就是这样把
         #: 「没连上」和「总线写失败」分开报的。
         self.send_error: Optional[Exception] = None
-        #: ``LiteGripCAN.last_send_error`` 的对应物：上一次下发失败的原因。
+        #: ``CanBus.last_send_error`` 的对应物：上一次下发失败的原因。
         self.last_send_error: Optional[Exception] = None
         #: 总线上还有没有状态帧 —— False = 空闲：没被驱动，电机不主动开口，
         #: poll / update_state 都回 False，读数就是上一次缓存的那份。
@@ -405,7 +405,7 @@ def make_gripper(
     speed_cap_rad_s: Optional[float] = None,
     freeze_position_while_idle: bool = False,
 ):
-    """造一个「已连接、已使能、已标定」的 LiteGrip，底层换成 :class:`FakeLiteGripCAN`。
+    """造一个「已连接、已使能、已标定」的 Gripper，底层换成 :class:`FakeCanBus`。
 
     默认用用户真机标定值（``POS_CLOSED_RAD`` / ``POS_OPEN_RAD`` / ``RAD_TO_MM``），
     ``sleep_fn`` 置空 —— 整条斜坡瞬间跑完。
@@ -437,7 +437,7 @@ def make_gripper(
     Returns:
         ``(gripper, fake_can)``
     """
-    g = LiteGrip("vcan0", can_id=0x08)
+    g = Gripper("vcan0", can_id=0x08)
     cfg = g.config
     if reverse:
         cfg.pos_closed_rad, cfg.pos_open_rad = POS_OPEN_RAD, POS_CLOSED_RAD
@@ -445,22 +445,24 @@ def make_gripper(
         cfg.pos_closed_rad, cfg.pos_open_rad = POS_CLOSED_RAD, POS_OPEN_RAD
     cfg.rad_to_mm = RAD_TO_MM
     cfg.calibrated = True
+    # The factory file ships a work stroke; these tests drive the full travel.
+    cfg.work_stroke_mm = 0.0
 
     if start_rad is None:
         start_rad = cfg.pos_open_rad        # 张开侧
 
-    fake = FakeLiteGripCAN(pos=start_rad, block_rad=block_rad,
-                           sticky_rad=sticky_rad, err=err,
-                           initialize_results=initialize_results,
-                           limit_lo=LIMIT_LO_RAD if stops else None,
-                           limit_hi=LIMIT_HI_RAD if stops else None,
-                           yield_rad_s=yield_rad_s,
-                           yield_tau_nm=yield_tau_nm,
-                           creep_rad_s_per_nm=creep_rad_s_per_nm,
-                           report_lag_ticks=report_lag_ticks,
-                           breakaway_tau_nm=breakaway_tau_nm,
-                           speed_cap_rad_s=speed_cap_rad_s,
-                           freeze_position_while_idle=freeze_position_while_idle)
+    fake = FakeCanBus(pos=start_rad, block_rad=block_rad,
+                      sticky_rad=sticky_rad, err=err,
+                      initialize_results=initialize_results,
+                      limit_lo=LIMIT_LO_RAD if stops else None,
+                      limit_hi=LIMIT_HI_RAD if stops else None,
+                      yield_rad_s=yield_rad_s,
+                      yield_tau_nm=yield_tau_nm,
+                      creep_rad_s_per_nm=creep_rad_s_per_nm,
+                      report_lag_ticks=report_lag_ticks,
+                      breakaway_tau_nm=breakaway_tau_nm,
+                      speed_cap_rad_s=speed_cap_rad_s,
+                      freeze_position_while_idle=freeze_position_while_idle)
     g._can = fake
     g._connected = True
     g._enabled = True
