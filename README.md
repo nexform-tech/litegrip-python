@@ -142,7 +142,8 @@ while running:
     time.sleep(0.005)                                  # 200 Hz
 ```
 
-If the leader is another LiteGrip, call `leader.refresh_status()` before reading — its bus is
+The slave example defaults to `--channel can1` for a two-unit host; on a single-unit host pass
+`--channel can0`. If the leader is another LiteGrip, call `leader.refresh_status()` before reading — its bus is
 idle otherwise. Start with the leader near the follower's current pose: this primitive does no
 ramp and no alignment, so the first frame can command the full error.
 
