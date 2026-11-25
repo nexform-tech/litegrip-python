@@ -107,7 +107,7 @@ Diagnostics: `channel`, `can_id`, `mst_id`, `is_connected`, `is_enabled`, `confi
 | `disable()` | `bool` | Torque off; the jaws become back-drivable. |
 | `clear_fault()` | `bool` | Clears latched UV/OC/OT faults and re-enables. Raises `HardwareError` if it cannot. |
 | `set_zero()` | `bool` | Makes the **current encoder angle** zero via cmd 0xFE, disables first, re-enables, and requires the read-back to be within 1e-3 rad. **Irreversible** — writes the motor's flash. |
-| `calibrate()` | `CalibrationData` | Probes both mechanical limits with low stiffness, updates `config`, and saves to the per-channel path automatically. Blocking; the jaws move. |
+| `calibrate(save=True)` | `CalibrationData` | Probes both mechanical limits with low stiffness and updates `config`; `save=True` writes the per-channel path. Blocking; the jaws move. |
 | `load_calibration(path=None)` | `bool` | With `path`, that file is the only source tried (no fallback). Without it: `$LITEGRIP_CALIB`, then the per-channel file, then the factory file. `False` when nothing readable was found. |
 | `save_calibration(path=None)` | `str` | Writes the active calibration; default `~/.litegrip/<channel>_calibration.json`. Returns the path. |
 | `default_calibration_path(channel="can0")` | `str` | Module-level helper for that default path. |
@@ -124,7 +124,7 @@ All motion is blocking and requires connected + enabled + calibrated. These meth
 | `set_gripper_distance(distance_mm, speed_mm_s=None)` | Normal positioning to an absolute opening in mm (0 = closed), clamped into the calibrated travel. Reached and not stalled. No limit press. |
 | `set_motor_angle(angle_rad, speed_mm_s=None)` | Same, in motor radians. |
 | `follow_gripper_distance(distance_mm, kp=None, kd=None, dq=0.0, tau=0.0, force_feedback=None)` | One MIT follow frame was sent (teleoperation; no ramp). See [Teleoperation](#teleoperation). |
-| `grasp(force_n=None, hold_s=0.0)` | Adaptive close until stall, then a pure torque hold at `force_n × 0.1 Nm`. `hold_s=0` holds until `release()`, a fault, or Ctrl+C. False on no-bite, travel guard, protection, or a hold-phase bus failure; an approach-phase bus failure raises `CommError`. |
+| `grasp(force_n=None, hold_s=0.0)` | Adaptive close until stall, then a pure torque hold at `force_n × 0.1 Nm`. Near the closed stop, one short verification squeeze runs before hand-over; if it still moves, the stop was a free-air stiction pocket and the grasp returns false. `hold_s=0` holds until `release()`, a fault, or Ctrl+C. False on no-bite, travel guard, protection, or a hold-phase bus failure; an approach-phase bus failure raises `CommError`. |
 | `release(clearance_mm=10.0)` | Thread-safe: ends an in-progress grasp and opens `clearance_mm` beyond the declared grip pose, clamped to the calibrated open limit. Works from another thread while `grasp(hold_s=0)` blocks. Use `disable()` for an emergency torque cut. |
 
 The default speed is `MotionConfig.speed_mm_s` (50 mm/s). `None` in any speed argument selects it.
@@ -156,7 +156,8 @@ travel. Bounds: kp 0–500, kd 0–5,
 `|dq| ≤ 10 rad/s`, `|tau| ≤ 3.5 Nm`; invalid values raise `CommandError` before any bus
 write, and `False` means the transport failed (cause in `last_send_error`). The caller owns
 the leader read, loop timing, and watchdog: if the loop stops, call `disable()` or keep
-sending hold frames — the motor latches a communication-loss fault after ~900 ms of silence.
+sending hold frames — the motor latches a communication-loss fault after ~400 ms of silence
+(`TIMEOUT=8000` × 50 µs); SDK waits send 0xCC keepalives to stay under it.
 
 **Force feedback (off by default).** The leader can render the follower's measured squeeze as
 resistance:
@@ -223,6 +224,10 @@ displacement from closed), not total jaw separation.
 A calibration is two limits plus a scale: `pos_closed_rad`, `pos_open_rad` and `rad_to_mm`. Which
 limit is numerically larger declares the mounting direction, so a reverse-mounted unit needs no
 extra switch.
+
+The bundled `factory_calibration.json` is a **reference unit**, not a per-serial file. Zero,
+travel and scale vary unit to unit; calibrate each unit (or load the vendor's per-unit file)
+before relying on absolute mm accuracy or the `open()`/`close()` stop verdicts.
 
 1. Clear the travel.
 2. `gripper.calibrate()` — probes each stop with low stiffness, updates `config`, and writes

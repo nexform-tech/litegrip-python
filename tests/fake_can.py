@@ -303,6 +303,13 @@ class FakeCanBus:
     def update_state(self, timeout_s: float = 0.05) -> bool:
         return self._frame_available()
 
+    def wait_for_status(self, timeout_s: float = 0.5,
+                        keepalive_s: float = 0.1) -> bool:
+        """No real waiting: one refresh request, then one poll."""
+        if self.refresh_status():
+            return self._frame_available()
+        return self._frame_available()
+
     def _frame_available(self) -> bool:
         """读到一帧了吗 —— 被驱动时总有，空闲时只有 ``refresh_status()`` 要到过。
 

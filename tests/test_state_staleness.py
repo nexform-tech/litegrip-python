@@ -73,6 +73,7 @@ class TestGetStateSaysWhetherAFrameAnswered(unittest.TestCase):
         g, fake = make_gripper()
         g.get_state()                      # 上一帧
         fake.delivers = False              # 从这儿起没有帧了
+        fake.refresh_ok = False            # 0xCC 也没有回答
         age_the_last_frame(fake, 2.0)
 
         before = time.time()
@@ -88,6 +89,7 @@ class TestGetStateSaysWhetherAFrameAnswered(unittest.TestCase):
     def test_a_bus_that_never_spoke_has_no_frame_to_date_it_by(self):
         g, fake = make_gripper()
         fake.delivers = False              # 一帧都没有过
+        fake.refresh_ok = False            # 0xCC 也没有回答
 
         s = g.get_state(wait=True)
 
@@ -155,9 +157,11 @@ class TestRefreshStatusElicitsAFrame(unittest.TestCase):
         g, fake = make_gripper()
         g.get_state()
         fake.delivers = False
+        fake.refresh_ok = False
         age_the_last_frame(fake, 3.0)
         self.assertTrue(g.get_state(wait=True).is_stale())
 
+        fake.refresh_ok = True
         self.assertTrue(g.refresh_status())
 
         s = g.get_state(wait=False)
@@ -171,6 +175,17 @@ class TestRefreshStatusElicitsAFrame(unittest.TestCase):
         g.refresh_status()
 
         self.assertEqual(fake.frames, [], "要一帧状态不等于发一帧控制")
+
+    def test_refresh_then_wait_is_reported_fresh(self):
+        """refresh 已经拿到一帧；随后的 get_state(wait=True) 不能又等 0.5 s。"""
+        g, fake = make_gripper()
+        fake.delivers = False
+
+        self.assertTrue(g.refresh_status())
+        state = g.get_state(wait=True)
+
+        self.assertTrue(state.fresh)
+        self.assertFalse(state.is_stale())
 
 
 if __name__ == "__main__":

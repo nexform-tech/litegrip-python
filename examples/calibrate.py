@@ -98,7 +98,9 @@ def _run(args) -> int:
             print("error: enable failed — check the 24 V supply and bitrate",
                   file=sys.stderr)
             return 1
-        data = g.calibrate()          # probes and saves to the default path
+        # Probe; save only to the destination the caller asked for. The
+        # default per-channel file stays untouched when --save-to is given.
+        data = g.calibrate(save=args.save_to is None)
         if args.save_to is not None:
             path = g.save_calibration(args.save_to)
         else:

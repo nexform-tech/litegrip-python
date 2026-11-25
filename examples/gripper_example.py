@@ -128,26 +128,31 @@ def _run(args) -> int:
         print(f"  motor data   {g.get_motor_data()}")
         print(f"  motor status {g.get_motor_status()}")
 
-        ok &= g.open(args.speed)
-        print(f"open -> {'ok' if ok else 'FAILED'}; "
+        step_ok = g.open(args.speed)
+        ok &= step_ok
+        print(f"open -> {'ok' if step_ok else 'FAILED'}; "
               f"distance {g.get_gripper_distance():.1f} mm")
 
-        ok &= g.close(args.speed)
-        print(f"close -> {'ok' if ok else 'FAILED'}; "
+        step_ok = g.close(args.speed)
+        ok &= step_ok
+        print(f"close -> {'ok' if step_ok else 'FAILED'}; "
               f"distance {g.get_gripper_distance():.1f} mm")
 
-        ok &= g.set_gripper_distance(args.distance, args.speed)
+        step_ok = g.set_gripper_distance(args.distance, args.speed)
+        ok &= step_ok
         print(f"set_gripper_distance({args.distance:g}) -> "
-              f"{'ok' if ok else 'FAILED'}; "
+              f"{'ok' if step_ok else 'FAILED'}; "
               f"distance {g.get_gripper_distance():.1f} mm")
 
-        ok &= g.grasp(force_n=args.force, hold_s=args.hold_s)
+        step_ok = g.grasp(force_n=args.force, hold_s=args.hold_s)
+        ok &= step_ok
         print(f"grasp({args.force:g} N, {args.hold_s:g} s) -> "
-              f"{'ok' if ok else 'FAILED'}")
+              f"{'ok' if step_ok else 'FAILED'}")
         _print_status(g, "after grasp")
 
-        ok &= g.release(clearance_mm=10.0)
-        print(f"release -> {'ok' if ok else 'FAILED'}; "
+        step_ok = g.release(clearance_mm=10.0)
+        ok &= step_ok
+        print(f"release -> {'ok' if step_ok else 'FAILED'}; "
               f"distance {g.get_gripper_distance():.1f} mm")
     finally:
         g.disconnect()

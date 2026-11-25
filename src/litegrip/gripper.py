@@ -51,6 +51,12 @@ from .models import CalibrationData, GripperConfig, GripperState
 
 log = logging.getLogger("litegrip")
 
+# A cached status frame younger than this is treated as a measurement by
+# get_state(wait=True). It makes refresh_status() followed by get_state()
+# report fresh instead of spending another 0.5 s waiting for a frame that the
+# refresh already consumed.
+_FRESH_WINDOW_S = 0.05
+
 # Hard bounds for the single-frame teleoperation primitive. These are stricter
 # than the DM4310 frame ranges so a caller cannot stream an unbounded push.
 _FOLLOW_KP_MAX = 500.0        # MIT stiffness range
@@ -366,14 +372,16 @@ class Gripper:
                 before, after, result.tolerance_rad)
         return result.ok
 
-    def calibrate(self) -> CalibrationData:
+    def calibrate(self, save: bool = True) -> CalibrationData:
         """Probe both mechanical limits with low stiffness and save the result.
 
         Blocking; the jaws move against each end stop.  **Make sure the travel
         is clear first.**  The direction comes from the existing calibration's
-        limit ordering (both stops look the same to a stall detector), and the
-        result is written to the per-channel file
-        (:func:`default_calibration_path`).
+        limit ordering (both stops look the same to a stall detector), and by
+        default the result is written to the per-channel file
+        (:func:`default_calibration_path`).  Pass ``save=False`` to update the
+        in-memory calibration only; ``examples/calibrate.py`` uses that with
+        ``--save-to`` so the default file is not rewritten.
 
         Returns:
             :class:`~litegrip.models.CalibrationData` with the measured limits,
@@ -382,8 +390,9 @@ class Gripper:
         self._check_connected()
         self._check_enabled()
         data = self._actions.calibrate()
-        path = self.save_calibration()
-        log.info("Calibration saved to %s", path)
+        if save:
+            path = self.save_calibration()
+            log.info("Calibration saved to %s", path)
         return data
 
     # ═══════════════════════════════════════════════════════════════════
@@ -970,11 +979,11 @@ class Gripper:
                 returns immediately with the cached readings (suitable for
                 high-frequency control loops).
 
-        ``wait=True`` asks for a frame; it does not guarantee one.  A motor
-        answers a *control* frame, so an idle bus says nothing and the wait
-        ends on the cached readings.  Check ``fresh`` / ``data_age_s`` before
-        trusting the numbers, and call :meth:`refresh_status` when the bus has
-        been idle.
+        ``wait=True`` sends 0xCC keepalives while it waits, so a 0.5 s wait
+        cannot trip the motor's ~400 ms communication-loss latch.  A cached
+        frame younger than 50 ms counts as answered, which makes
+        ``refresh_status()`` followed by ``get_state()`` report ``fresh``
+        instead of waiting for a frame the refresh already consumed.
 
         Raises:
             NotInitializedError: not connected.
@@ -986,7 +995,12 @@ class Gripper:
 
         with self._io_lock:
             if wait:
-                answered = can.update_state(timeout_s=0.5)
+                last_update = getattr(can, "last_update", None)
+                if (last_update is not None
+                        and time.monotonic() - last_update <= _FRESH_WINDOW_S):
+                    answered = True
+                else:
+                    answered = can.wait_for_status(timeout_s=0.5)
             else:
                 answered = can.poll(timeout_s=0.0)
 

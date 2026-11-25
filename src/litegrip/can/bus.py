@@ -178,7 +178,17 @@ class CanBus:
                 ctrl.control_mit(m, kp=0, kd=0, q=0, dq=0, tau=0)
 
                 deadline = time.monotonic() + DefaultParams.INIT_TIMEOUT_S
+                last_keepalive = time.monotonic()
                 while time.monotonic() < deadline:
+                    now = time.monotonic()
+                    if now - last_keepalive >= 0.1:
+                        # A disabled/idle motor can take a moment to answer; a
+                        # silent 2 s wait would trip its ~400 ms comm-loss latch.
+                        try:
+                            ctrl.refresh_status(m)
+                        except Exception:
+                            pass
+                        last_keepalive = now
                     ctrl.poll(timeout_s=0.01)
                     if m.rx_count > prev_rx:
                         err = m.error
@@ -535,6 +545,31 @@ class CanBus:
         if self._controller is None or self._motor is None:
             return False
         return self._controller.poll_until(self._motor, timeout_s=timeout_s)
+
+    def wait_for_status(self, timeout_s: float = 0.5,
+                        keepalive_s: float = 0.1) -> bool:
+        """Wait for a status frame while keeping the motor's link alive.
+
+        A DM4310 latches a communication-loss fault after ~400 ms without a
+        frame, so a bare ``poll_until(0.5)`` can trip it. A 0xCC status request
+        counts as traffic, so resend one at ``keepalive_s`` intervals while
+        waiting. Returns true as soon as a frame for this motor arrives.
+        """
+        if self._controller is None or self._motor is None:
+            return False
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        last_request = None
+        while True:
+            now = time.monotonic()
+            if last_request is None or now - last_request >= keepalive_s:
+                if not self.refresh_status():
+                    return False
+                last_request = now
+            remaining = deadline - now
+            if self.poll(timeout_s=min(0.02, max(0.0, remaining))):
+                return True
+            if time.monotonic() >= deadline:
+                return False
 
     def refresh_status(self) -> bool:
         """Ask the motor for a status frame (0xCC).

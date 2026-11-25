@@ -149,6 +149,16 @@ class MotionConfig:
     # （5 N 接近段仍约 8 mm/s）。降到 0.5 mm/s 会让真接触也迟迟判不出来。
     stall_speed_mm_s: float = 2.0
 
+    # ── 交接前的接触验证 ────────────────────────────────────────────────
+    # 自由空间里的静摩擦死区可能让带力接近段中途停住，位置和力矩都像“夹到
+    # 东西”。交接前再用略高于设定值的预算闭合一小小步：真工件顶住不动，死区
+    # 会被推开。能移动超过 verify_motion_mm 就判空夹，不交接。
+    verify_contact_mm: float = 0.5      # 验证步的闭合量 mm
+    verify_motion_mm: float = 0.25      # 超过这个位移即判死区 mm
+    verify_time_s: float = 0.15         # 验证步流帧时长 s
+    verify_force_factor: float = 1.5    # 验证预算 = 设定力 × 1.5
+    verify_zone_mm: float = 5.0         # 只在离闭合限位这么近时验证
+
     # ── 力矩 / 指令上限 ────────────────────────────────────────────────
     max_lead_mm: float = 4.0            # 行进段领先上限 mm（≈ kp × 上限）
 
@@ -267,6 +277,13 @@ class MotionConfig:
                 "MotionConfig.stall_speed_mm_s 必须是非负有限数："
                 f"{self.stall_speed_mm_s!r}。负值会让窗口平均速度永远高于"
                 "门槛，接近段对任何速度都不判真停。")
+        for name in ("verify_contact_mm", "verify_motion_mm",
+                     "verify_time_s", "verify_force_factor",
+                     "verify_zone_mm"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"MotionConfig.{name} 必须是正的有限数：{value!r}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -976,6 +993,21 @@ class GripperActions:
                             move.state.position_rad, move.target_rad)
                 return self._refused_handover(move, force)
 
+            if (move.stalled and not move.reached
+                    and move.state.position_mm <= cfg.verify_zone_mm):
+                # Stopped just short of the closed stop: could be a thin
+                # workpiece, or a free-air stiction pocket that the
+                # budget-limited approach could not push through. A short
+                # squeeze above the setpoint tells them apart: a real object
+                # stays put, a pocket moves. Stops far from the closed stop are
+                # treated as objects without the extra push.
+                if not self._verify_contact(force):
+                    self._release(move.state.position_rad)
+                    log.warning(
+                        "夹取未交接：验证性再夹仍能推动夹爪（静摩擦死区）—— "
+                        "判为空夹，撤力返回 False")
+                    return self._refused_handover(move, force, no_bite=True)
+
             # 交接点：带力接近段的终点（夹爪「声明」抓住的位置），不是随后被
             # 20 N 压实后停下的位置。松开的基准取它，见 _do_release。
             # 「记交接点」和「查请求」必须在同一把锁里：否则请求可能正好落在
@@ -1033,6 +1065,35 @@ class GripperActions:
                 self._grip_rad = None
                 self._hold_done.set()
 
+    def _verify_contact(self, force_n: float) -> bool:
+        """One short squeeze above the setpoint; True when the jaws stay put.
+
+        A free-air stiction pocket can stop a budget-limited approach and look
+        exactly like a light grip. Closing by ``verify_contact_mm`` with a
+        ``verify_force_factor``-times budget either moves the jaws (pocket) or
+        is held by the object. The extra motion is bounded and only runs when
+        the approach stalled short of the closed stop.
+        """
+        cfg = self.config
+        gcfg = self._g.config
+        can = self._g._can
+        if can is None:
+            raise NotInitializedError("未连接")
+
+        start = self._g.get_state(wait=False).position_rad
+        step_rad = cfg.verify_contact_mm / gcfg.rad_to_mm
+        budget = min(3.5, force_n * UnitConversion.N_TO_NM
+                     * cfg.verify_force_factor)
+        kp = min(500.0, budget / step_rad)
+        target = clamp_to_travel(
+            gcfg, start + gcfg.close_sign * step_rad)
+        can.control_mit_stream(
+            target, kp, cfg.calib_kd,
+            duration_s=cfg.verify_time_s, interval_s=cfg.frame_interval)
+        can.update_state(timeout_s=0.05)
+        moved = abs(self._g.get_state(wait=False).position_rad - start)
+        return moved < cfg.verify_motion_mm / gcfg.rad_to_mm
+
     @staticmethod
     def _refused_handover(
         move: MoveResult,
@@ -1087,6 +1148,21 @@ class GripperActions:
             travel_guard=False,
             released=True,
         )
+
+    def _request_release(self, clearance_mm: float = 10.0) -> bool:
+        """Queue a non-blocking release request (internal/test seam).
+
+        The public API is :meth:`release`, which also waits for the grasp
+        thread. This is the "record only" half, used by the suite to land a
+        request deterministically inside the approach callback.
+        """
+        req = self._check_release_args(clearance_mm)
+        with self._release_lock:
+            if self._hold_done.is_set():
+                return False
+            if self._release_req is None:
+                self._release_req = req
+            return True
 
     def release(self, clearance_mm: float = 10.0) -> ReleaseResult:
         """松开：结束进行中的 ``grasp()`` 保力并张开夹爪 —— 线程安全。
@@ -1401,6 +1477,7 @@ class GripperActions:
         st: Optional[GripperState] = None
 
         for i in range(1, tries_max + 1):
+            attempt_started = time.time()
             try:
                 self._g._enable_once()
             except LiteGripError as e:
@@ -1408,8 +1485,15 @@ class GripperActions:
                             i, tries_max, type(e).__name__, e)
 
             st = self._g.get_state()
-            if st.error_code == 1:
+            if (st.error_code == 1 and st.fresh
+                    and st.timestamp >= attempt_started):
                 return EnableResult(ok=True, state=st, tries=i)
+            if st.error_code == 1:
+                log.warning("enable() 第 %d/%d 次读到 err==1，但没有本次尝试之后"
+                            "的新状态帧（fresh=%s, frame_age=%.3fs）—— 不当作"
+                            "已使能", i, tries_max, st.fresh,
+                            time.time() - st.timestamp
+                            if st.timestamp else float("inf"))
 
             if st.error_code not in (0, 1):
                 # 真实故障（欠压/过流/过温等）：先清故障再重试
@@ -1602,26 +1686,23 @@ class GripperActions:
             CommError: the 0xCC request could not be sent, or the motor did not
                 answer it with a status frame.
         """
-        sent_ok = False
+        can = self._g._can
+        if can is None:
+            raise NotInitializedError("未连接")
         last: Optional[GripperState] = None
         for _ in range(3):
-            if self._g.refresh_status():
-                # The request itself got an answer, so the cache was just
-                # refreshed even though this read sees no *new* frame.
-                sent_ok = True
+            # wait_for_status() sends 0xCC keepalives while it waits, so the
+            # motor's ~400 ms comm-loss latch is not tripped by this read, and
+            # a cached frame (even a recent one) is not accepted: it must be
+            # answered during this call.
+            if can.wait_for_status(timeout_s=0.5):
                 last = self._g.get_state(wait=False)
-                if (last.data_age_s is not None
-                        and last.data_age_s <= STALE_AFTER_S):
-                    return last
-            last = self._g.get_state()          # waits for a fresh frame
-            if last.fresh:
                 return last
         age = ("无" if last is None or last.data_age_s is None
                else "%.1f s" % last.data_age_s)
         raise CommError(
-            "状态帧请求%s，电机没有回应（缓存 age=%s）—— 拒绝从缓存规划运动；"
-            "检查 CAN 链路和电机供电。"
-            % ("" if sent_ok else "发不出去", age))
+            "状态帧请求没有回应（缓存 age=%s）—— 拒绝从缓存规划运动；"
+            "检查 CAN 链路和电机供电。" % age)
 
     def _move_to_limit(
         self,

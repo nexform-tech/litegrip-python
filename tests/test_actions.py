@@ -820,6 +820,28 @@ class TestGrasp(unittest.TestCase):
         self.assertEqual(res.state.error_code, 0x9)
 
 
+class TestContactVerification(unittest.TestCase):
+    """Near the closed stop, a short extra squeeze separates object from pocket."""
+
+    def test_free_air_moves_and_is_not_contact(self):
+        g, _ = make_gripper(start_rad=POS_OPEN_RAD)
+        self.assertFalse(g._actions._verify_contact(20.0))
+
+    def test_a_block_stops_the_verification_step(self):
+        g, _ = make_gripper(start_rad=-0.5, block_rad=-0.499)
+        self.assertTrue(g._actions._verify_contact(20.0))
+
+    def test_grasp_refuses_when_the_verification_step_moves(self):
+        g, _ = make_gripper(start_rad=POS_OPEN_RAD,
+                           block_rad=POS_CLOSED_RAD - 0.03)
+        with mock.patch.object(g._actions, "_verify_contact",
+                               return_value=False):
+            res = g._actions.grasp(force_n=3.0, hold_s=0.05)
+        self.assertFalse(res.ok)
+        self.assertTrue(res.no_bite)
+        self.assertEqual(res.cycles, 0)
+
+
 class TestGraspHandsOverOnlyOnContact(unittest.TestCase):
     """11b / 11c：闭合段只在**到位**或**顶上东西**时才交给保力段。
 
@@ -1080,25 +1102,20 @@ class TestRelease(unittest.TestCase):
     def test_release_during_the_approach_aborts_it(self):
         """接近途中按下松开：不再交接，改从当前位置张开。"""
         g, fake = make_gripper(motion=self._motion())
-        in_move = threading.Event()
-        outcome = {}
+        requested = False
 
         def progress(p):
-            if p.phase == "move":
-                in_move.set()
+            nonlocal requested
+            if p.phase == "move" and not requested:
+                # Queue the request from inside the approach, so it is
+                # unambiguously seen by the next frame instead of racing the
+                # approach's end on a thread scheduler.
+                self.assertTrue(g._actions._request_release(5.0))
+                requested = True
 
-        def run():
-            outcome["res"] = g._actions.grasp(
-                force_n=20.0, hold_s=0.0, progress=progress)
-
-        t = threading.Thread(target=run, daemon=True)
-        t.start()
-        self.assertTrue(in_move.wait(2.0), "接近段没有开始")
-        self.assertTrue(g.release(clearance_mm=5.0))
-        t.join(2.0)
-        self.assertFalse(t.is_alive(), "grasp 没有在松开后返回")
-
-        res = outcome["res"]
+        res = g._actions.grasp(
+            force_n=20.0, hold_s=0.0, progress=progress)
+        self.assertTrue(requested, "接近段没有开始")
         self.assertTrue(res.released, res)
         self.assertTrue(res.ok, res)
         self.assertEqual(res.cycles, 0, "接近段被中止了却还交接了保力")

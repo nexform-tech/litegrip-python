@@ -106,7 +106,7 @@ Gripper(channel="can0", can_id=0x08, mst_id=0x18, motion_config=None)
 | `disable()` | `bool` | 失能，夹爪可被手动推动。 |
 | `clear_fault()` | `bool` | 清除锁存的欠压/过流/过温故障并重新使能；清不掉抛 `HardwareError`。 |
 | `set_zero()` | `bool` | 通过 0xFE 把**当前编码器角度**记为零：先失能、再发、后重使能，并要求回读在 1e-3 rad 内。**不可逆**，会写电机 flash。 |
-| `calibrate()` | `CalibrationData` | 低刚度探测两端机械限位，更新 `config`，并自动存到本通道默认路径。阻塞；夹爪会动。 |
+| `calibrate(save=True)` | `CalibrationData` | 低刚度探测两端机械限位并更新 `config`；`save=True` 写入本通道默认路径。阻塞；夹爪会动。 |
 | `load_calibration(path=None)` | `bool` | 给了 `path` 就只读它，不回退；不给时依次找 `$LITEGRIP_CALIB`、本通道文件、出厂文件。全部读不到返回 `False`。 |
 | `save_calibration(path=None)` | `str` | 保存当前标定，默认 `~/.litegrip/<channel>_calibration.json`，返回路径。 |
 | `default_calibration_path(channel="can0")` | `str` | 模块级函数，返回该默认路径。 |
@@ -123,7 +123,7 @@ Gripper(channel="can0", can_id=0x08, mst_id=0x18, motion_config=None)
 | `set_gripper_distance(distance_mm, speed_mm_s=None)` | 以 mm 为单位的绝对开口（0 = 闭合）普通定位，目标夹进标定行程；到位且未堵转即成功，不顶限位。 |
 | `set_motor_angle(angle_rad, speed_mm_s=None)` | 同上，目标用电机弧度表示。 |
 | `follow_gripper_distance(distance_mm, kp=None, kd=None, dq=0.0, tau=0.0, force_feedback=None)` | 已发出一帧 MIT 跟随帧（遥操用，不走斜坡）。见[遥操](#遥操)。 |
-| `grasp(force_n=None, hold_s=0.0)` | 自适应闭合到堵转，然后按 `force_n × 0.1 Nm` 的纯力矩保持。`hold_s=0` 一直保到 `release()`、故障或 Ctrl+C。没咬住、越位护栏、堵转保护、保力中途通信失败均返回 `False`；接近段通信失败抛 `CommError`。 |
+| `grasp(force_n=None, hold_s=0.0)` | 自适应闭合到堵转，然后按 `force_n × 0.1 Nm` 的纯力矩保持。靠近闭合限位时，交接前会做一次短验证性再夹；仍能移动则判为自由空间静摩擦死区并返回 `False`。`hold_s=0` 一直保到 `release()`、故障或 Ctrl+C。没咬住、越位护栏、堵转保护、保力中途通信失败均返回 `False`；接近段通信失败抛 `CommError`。 |
 | `release(clearance_mm=10.0)` | 线程安全：结束进行中的夹取，并从**声明的夹持点**再张开 `clearance_mm`，夹到标定张开限位。`grasp(hold_s=0)` 阻塞在另一线程时也能调用。急停卸力请用 `disable()`。 |
 
 默认速度是 `MotionConfig.speed_mm_s`（50 mm/s）；任何速度参数传 `None` 都取它。
@@ -151,7 +151,7 @@ while running:
 行程更短时仍会被夹到自己的行程；行程不同时请由调用方先归一化。目标夹进标定行程。边界：kp 0–500、kd 0–5、`|dq| ≤ 10 rad/s`、`|tau| ≤ 3.5 Nm`；非法值在
 发帧前抛 `CommandError`，返回 `False` 只表示传输失败（原因在 `last_send_error`）。主手
 读取、循环节拍和看门狗由调用方负责：循环停下时请调用 `disable()` 或继续发保持帧 ——
-电机在静默约 900 ms 后会锁存通信丢失故障。
+电机在静默约 400 ms 后会锁存通信丢失故障（`TIMEOUT=8000` × 50 µs）；SDK 的阻塞等待会发 0xCC keepalive。
 
 **力反馈（默认关闭）。** 主手可以把从手的实测夹持力渲染成阻力：
 
@@ -214,6 +214,10 @@ while running:
 
 一份标定 = 两个限位 + 一个比例：`pos_closed_rad`、`pos_open_rad`、`rad_to_mm`。
 两个限位谁大谁小就声明了安装方向，反装不需要额外的开关。
+
+随包 `factory_calibration.json` 是**参考单元**，不是逐台/逐序列号标定。零点、行程和比例
+每台都有差异；在依赖绝对 mm 精度或 `open()`/`close()` 的限位判据之前，必须对每台执行
+`calibrate()`（或加载厂家提供的逐台标定文件）。
 
 1. 清空行程。
 2. `gripper.calibrate()` —— 低刚度探测两端，更新 `config`，写入
